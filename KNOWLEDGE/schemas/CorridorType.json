@@ -1,0 +1,548 @@
+{
+  "class": "CorridorType",
+  "extracted_at": "2026-06-03",
+  "properties": [
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AGVConditionalRule",
+      "name": "AGVConditionalRule",
+      "options": [
+        {
+          "name": "None",
+          "value": 0
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AGVConditionalRule",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "AGV",
+      "localized_name": "AGVConnections",
+      "name": "AGVConnections",
+      "path": "MAIN:/project/exec/globals/properties/AGVConnections",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AGVCustomPathCostMultiplier",
+      "name": "AGVCustomPathCostMultiplier",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AGVCustomPathCostMultiplier",
+      "source": "class",
+      "type": "NumberProperty",
+      "value_kind": "number"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AGVIsTwoWay",
+      "name": "AGVIsTwoWay",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AGVIsTwoWay",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AGVOrientation",
+      "name": "AGVOrientation",
+      "options": [
+        {
+          "name": "Any",
+          "value": 0
+        },
+        {
+          "name": "Forward Only",
+          "value": 1
+        },
+        {
+          "name": "Backward Only",
+          "value": 2
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AGVOrientation",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AStarConditionalRule",
+      "name": "AStarConditionalRule",
+      "options": [
+        {
+          "name": "None",
+          "value": 0
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AStarConditionalRule",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AStarCurveResolution",
+      "name": "AStarCurveResolution",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AStarCurveResolution",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AStarIsTwoWay",
+      "name": "AStarIsTwoWay",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AStarIsTwoWay",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AStarPathMode",
+      "name": "AStarPathMode",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AStarPathMode",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AStarPathWeight",
+      "name": "AStarPathWeight",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AStarPathWeight",
+      "source": "class",
+      "type": "NumberProperty",
+      "value_kind": "number"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "AccumulationType",
+      "name": "AccumulationType",
+      "options": [
+        {
+          "name": "No Accumulation",
+          "value": 0
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AccumulationType",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "AgentSystems",
+      "name": "AgentSystems",
+      "path": "MAIN:/project/exec/globals/properties/AgentSystems",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "AllGroups",
+      "name": "AllGroups",
+      "path": "MAIN:/project/exec/globals/properties/AllGroups",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "Overtaking",
+      "name": "AllowOvertaking",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/AllowOvertaking",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "BuildControlPoints",
+      "name": "BuildControlPoints",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/BuildControlPoints",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "CPDeallocationType",
+      "name": "CPDeallocationType",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/CPDeallocationType",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "localized_name": "MaxContent",
+      "name": "CPMaxAllocations",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/CPMaxAllocations",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Class",
+      "name": "Class",
+      "path": "MAIN:/project/exec/globals/properties/Class",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Classes",
+      "name": "Classes",
+      "path": "MAIN:/project/exec/globals/properties/Classes",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "components": [
+        "Red",
+        "Green",
+        "Blue",
+        "Alpha"
+      ],
+      "localized_name": "Color",
+      "name": "Color",
+      "path": "MAIN:/project/exec/globals/properties/Color",
+      "source": "global",
+      "type": "ColorProperty",
+      "value_kind": "color_rgba"
+    },
+    {
+      "category": "General",
+      "localized_name": "Container",
+      "name": "Container",
+      "path": "MAIN:/project/exec/globals/properties/Container",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Corridor>Spatial",
+      "localized_name": "ControlPointSpacing",
+      "name": "ControlPointSpacing",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/ControlPointSpacing",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "CopyPathProperitesDirection",
+      "name": "CopyPathProperitesDirection",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/CopyPathProperitesDirection",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "General",
+      "localized_name": "Groups",
+      "name": "Groups",
+      "path": "MAIN:/project/exec/globals/properties/Groups",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "IsSelected",
+      "name": "IsSelected",
+      "path": "MAIN:/project/exec/globals/properties/IsSelected",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "Labels",
+      "name": "Labels",
+      "path": "MAIN:/project/exec/globals/properties/Labels",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Location",
+      "name": "Location",
+      "path": "MAIN:/project/exec/globals/properties/Location",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General",
+      "localized_name": "Name",
+      "name": "Name",
+      "path": "MAIN:/project/exec/globals/properties/Name",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "Navigator",
+      "name": "Navigator",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/Navigator",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "NetworkIsTwoWay",
+      "name": "NetworkIsTwoWay",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/NetworkIsTwoWay",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "NoSelect",
+      "name": "NoSelect",
+      "path": "MAIN:/project/exec/globals/properties/NoSelect",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "PathClass",
+      "name": "PathClass",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/PathClass",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "RouteGraph>CorridorType",
+      "localized_name": "PathTable",
+      "name": "PathTable",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/PathTable",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlowVariables",
+      "name": "ProcessFlowVariables",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlowVariables",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlows",
+      "name": "ProcessFlows",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlows",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Protected",
+      "name": "Protected",
+      "path": "MAIN:/project/exec/globals/properties/Protected",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Spatial",
+      "localized_name": "ResetPosition",
+      "name": "ResetPosition",
+      "path": "MAIN:/project/exec/globals/properties/ResetPosition",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Rotation",
+      "name": "Rotation",
+      "path": "MAIN:/project/exec/globals/properties/Rotation",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ScaleContents",
+      "name": "ScaleContents",
+      "path": "MAIN:/project/exec/globals/properties/ScaleContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Shape",
+      "name": "Shape",
+      "path": "MAIN:/project/exec/globals/properties/Shape",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFactors",
+      "name": "ShapeFactors",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFactors",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFrames",
+      "name": "ShapeFrames",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFrames",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowContents",
+      "name": "ShowContents",
+      "path": "MAIN:/project/exec/globals/properties/ShowContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowName",
+      "name": "ShowName",
+      "path": "MAIN:/project/exec/globals/properties/ShowName",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowPorts",
+      "name": "ShowPorts",
+      "path": "MAIN:/project/exec/globals/properties/ShowPorts",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowShape",
+      "name": "ShowShape",
+      "path": "MAIN:/project/exec/globals/properties/ShowShape",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Size",
+      "name": "Size",
+      "path": "MAIN:/project/exec/globals/properties/Size",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General",
+      "localized_name": "Template",
+      "name": "Template",
+      "path": "MAIN:/project/exec/globals/properties/Template",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateInstances",
+      "name": "TemplateInstances",
+      "path": "MAIN:/project/exec/globals/properties/TemplateInstances",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateOverrides",
+      "name": "TemplateOverrides",
+      "path": "MAIN:/project/exec/globals/properties/TemplateOverrides",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Texture",
+      "name": "Texture",
+      "path": "MAIN:/project/exec/globals/properties/Texture",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "Triggers",
+      "name": "Triggers",
+      "path": "MAIN:/project/exec/globals/properties/Triggers",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Corridor>Spatial",
+      "localized_name": "Width",
+      "name": "Width",
+      "path": "MAIN:/project/library/RouteGraph/CorridorType>behaviour/properties/Width",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    }
+  ],
+  "property_count": 53,
+  "raw_path_count": 66
+}

@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{efc8b3e7-993d-465a-85e4-d6835e99951c}</UniqueIdentifier>
+      <Extensions>cpp</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{b1fc0ca5-7df4-4703-9851-1d186428c1df}</UniqueIdentifier>
+      <Extensions>h</Extensions>
+    </Filter>
+    <Filter Include="Header Files\flexsimcontent">
+      <UniqueIdentifier>{73441385-b1f7-4316-8590-8598c4e9acbc}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="bridge">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9001-bdbe11000001}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="agent">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9002-bdbe11000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="provider">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9003-bdbe11000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tree">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9004-bdbe11000004}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="kb">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9005-bdbe11000005}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="keystore">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9006-bdbe11000006}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9007-bdbe11000007}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\read">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9007-bdbe11000071}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\write">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9007-bdbe11000072}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="settings">
+      <UniqueIdentifier>{e7b7c1ba-2a17-4d8e-bf36-6b0b9d8e1f1a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="mainthread">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9009-bdbe11000009}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="commands">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-900a-bdbe1100000a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party">
+      <UniqueIdentifier>{1c2f5b0a-001b-4001-9008-bdbe11000008}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\cpp-httplib">
+      <UniqueIdentifier>{a5c9f2b1-8d34-4e7a-9c1e-b2f3a4e5d6c7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="remote">
+      <UniqueIdentifier>{c5d6e7f8-9012-4345-6789-abcdef012345}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="module.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="paths.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="abi.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="bootstrap.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="third_party\json.h"><Filter>third_party</Filter></ClInclude>
+    <ClInclude Include="third_party\thirdparty\nlohmann\json.hpp"><Filter>third_party</Filter></ClInclude>
+    <ClInclude Include="third_party\cpp-httplib\httplib.h"><Filter>third_party\cpp-httplib</Filter></ClInclude>
+    <ClInclude Include="bridge\protocol.h"><Filter>bridge</Filter></ClInclude>
+    <ClInclude Include="bridge\log.h"><Filter>bridge</Filter></ClInclude>
+    <ClInclude Include="bridge\diag.h"><Filter>bridge</Filter></ClInclude>
+    <ClInclude Include="bridge\bridge.h"><Filter>bridge</Filter></ClInclude>
+    <ClInclude Include="bridge\subscriber.h"><Filter>bridge</Filter></ClInclude>
+    <ClInclude Include="agent\message.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\prompt.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\agent.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\user_rules.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\slash.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\slash_remote.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="agent\session_store.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="provider\provider.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\sse_parser.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\http_client.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\anthropic.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\builtin_chat.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\gemini.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\openai_chat_helpers.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="provider\openai_compatible.h"><Filter>provider</Filter></ClInclude>
+    <ClInclude Include="tools\tool_registry.h"><Filter>tools</Filter></ClInclude>
+    <ClInclude Include="tools\read\ask_user_question.h"><Filter>tools</Filter></ClInclude>
+    <ClInclude Include="tools\read\flexsim_readonly_stubs.h"><Filter>tools\read</Filter></ClInclude>
+    <ClInclude Include="tools\read\kb_tools.h"><Filter>tools\read</Filter></ClInclude>
+    <ClInclude Include="tools\write\modelerai_call.h"><Filter>tools\write</Filter></ClInclude>
+    <ClInclude Include="tools\write\run_script.h"><Filter>tools\write</Filter></ClInclude>
+    <ClInclude Include="commands\commands.h"><Filter>commands</Filter></ClInclude>
+    <ClInclude Include="commands\antipattern.h"><Filter>commands</Filter></ClInclude>
+    <ClInclude Include="commands\export_tree_json.h"><Filter>commands</Filter></ClInclude>
+    <ClInclude Include="commands\schema_store.h"><Filter>commands</Filter></ClInclude>
+    <ClInclude Include="commands\identifier_validator.h"><Filter>commands</Filter></ClInclude>
+    <ClInclude Include="mainthread\mainthread.h"><Filter>mainthread</Filter></ClInclude>
+    <ClInclude Include="agent\user_interaction.h"><Filter>agent</Filter></ClInclude>
+    <ClInclude Include="settings\effective_settings.h"><Filter>settings</Filter></ClInclude>
+    <ClInclude Include="settings\global_settings.h"><Filter>settings</Filter></ClInclude>
+    <ClInclude Include="settings\project_settings.h"><Filter>settings</Filter></ClInclude>
+    <ClInclude Include="tree\condense.h"><Filter>tree</Filter></ClInclude>
+    <ClInclude Include="kb\kb_index.h"><Filter>kb</Filter></ClInclude>
+    <ClInclude Include="kb\kb_loader.h"><Filter>kb</Filter></ClInclude>
+    <ClInclude Include="keystore\keystore.h"><Filter>keystore</Filter></ClInclude>
+    <ClInclude Include="tools\tool_base.h"><Filter>tools</Filter></ClInclude>
+    <ClInclude Include="remote\asset_loader.h"><Filter>remote</Filter></ClInclude>
+    <ClInclude Include="remote\lan_iface.h"><Filter>remote</Filter></ClInclude>
+    <ClInclude Include="remote\qr_payload.h"><Filter>remote</Filter></ClInclude>
+    <ClInclude Include="remote\remote_server.h"><Filter>remote</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="module.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="paths.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="abi.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="bootstrap.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="bridge\protocol.cpp"><Filter>bridge</Filter></ClCompile>
+    <ClCompile Include="bridge\log.cpp"><Filter>bridge</Filter></ClCompile>
+    <ClCompile Include="bridge\diag.cpp"><Filter>bridge</Filter></ClCompile>
+    <ClCompile Include="bridge\bridge.cpp"><Filter>bridge</Filter></ClCompile>
+    <ClCompile Include="bridge\subscriber.cpp"><Filter>bridge</Filter></ClCompile>
+    <ClCompile Include="agent\prompt.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="agent\agent.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="agent\user_rules.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="agent\slash.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="agent\slash_remote.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="agent\session_store.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="tree\condense.cpp"><Filter>tree</Filter></ClCompile>
+    <ClCompile Include="kb\kb_loader.cpp"><Filter>kb</Filter></ClCompile>
+    <ClCompile Include="kb\kb_index.cpp"><Filter>kb</Filter></ClCompile>
+    <ClCompile Include="provider\sse_parser.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\http_client.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\anthropic.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\builtin_chat.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\gemini.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\openai_chat_helpers.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="provider\openai_compatible.cpp"><Filter>provider</Filter></ClCompile>
+    <ClCompile Include="keystore\keystore.cpp"><Filter>keystore</Filter></ClCompile>
+    <ClCompile Include="tools\tool_registry.cpp"><Filter>tools</Filter></ClCompile>
+    <ClCompile Include="tools\read\ask_user_question.cpp"><Filter>tools</Filter></ClCompile>
+    <ClCompile Include="tools\read\flexsim_readonly_stubs.cpp"><Filter>tools\read</Filter></ClCompile>
+    <ClCompile Include="tools\read\kb_tools.cpp"><Filter>tools\read</Filter></ClCompile>
+    <ClCompile Include="tools\write\modelerai_call.cpp"><Filter>tools\write</Filter></ClCompile>
+    <ClCompile Include="tools\write\run_script.cpp"><Filter>tools\write</Filter></ClCompile>
+    <ClCompile Include="commands\commands.cpp"><Filter>commands</Filter></ClCompile>
+    <ClCompile Include="commands\export_tree_json.cpp"><Filter>commands</Filter></ClCompile>
+    <ClCompile Include="commands\schema_store.cpp"><Filter>commands</Filter></ClCompile>
+    <ClCompile Include="commands\identifier_validator.cpp"><Filter>commands</Filter></ClCompile>
+    <ClCompile Include="mainthread\mainthread.cpp"><Filter>mainthread</Filter></ClCompile>
+    <ClCompile Include="agent\user_interaction.cpp"><Filter>agent</Filter></ClCompile>
+    <ClCompile Include="settings\effective_settings.cpp"><Filter>settings</Filter></ClCompile>
+    <ClCompile Include="settings\global_settings.cpp"><Filter>settings</Filter></ClCompile>
+    <ClCompile Include="settings\project_settings.cpp"><Filter>settings</Filter></ClCompile>
+    <ClCompile Include="remote\asset_loader.cpp"><Filter>remote</Filter></ClCompile>
+    <ClCompile Include="remote\lan_iface.cpp"><Filter>remote</Filter></ClCompile>
+    <ClCompile Include="remote\qr_payload.cpp"><Filter>remote</Filter></ClCompile>
+    <ClCompile Include="remote\remote_server.cpp"><Filter>remote</Filter></ClCompile>
+  </ItemGroup>
+</Project>

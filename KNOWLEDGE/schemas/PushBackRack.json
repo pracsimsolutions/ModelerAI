@@ -1,0 +1,883 @@
+{
+  "class": "PushBackRack",
+  "extracted_at": "2026-06-03",
+  "properties": [
+    {
+      "category": "AGV",
+      "localized_name": "AGVConnections",
+      "name": "AGVConnections",
+      "path": "MAIN:/project/exec/globals/properties/AGVConnections",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "AddressScheme",
+      "name": "AddressScheme",
+      "options": [
+        {
+          "name": "None",
+          "value": 0
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/AddressScheme",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "AgentSystems",
+      "name": "AgentSystems",
+      "path": "MAIN:/project/exec/globals/properties/AgentSystems",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "AisleID",
+      "name": "AisleID",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/AisleID",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "AllGroups",
+      "name": "AllGroups",
+      "path": "MAIN:/project/exec/globals/properties/AllGroups",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "BayProgression",
+      "name": "BayProgression",
+      "options": [
+        {
+          "name": "X+",
+          "value": 1
+        },
+        {
+          "name": "X-",
+          "value": -1
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/BayProgression",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "BaySize",
+      "name": "BaySize",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/BaySize",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "BayStride",
+      "name": "BayStride",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/BayStride",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "CenterObjects",
+      "name": "CenterObjects",
+      "path": "MAIN:/project/library/FlexSimEventHandler>behaviour/properties/CenterObjects",
+      "source": "class",
+      "type": "ConnectionsProperty",
+      "value_kind": "connections"
+    },
+    {
+      "category": "General",
+      "localized_name": "Class",
+      "name": "Class",
+      "path": "MAIN:/project/exec/globals/properties/Class",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Classes",
+      "name": "Classes",
+      "path": "MAIN:/project/exec/globals/properties/Classes",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "components": [
+        "Red",
+        "Green",
+        "Blue",
+        "Alpha"
+      ],
+      "localized_name": "Color",
+      "name": "Color",
+      "path": "MAIN:/project/exec/globals/properties/Color",
+      "source": "global",
+      "type": "ColorProperty",
+      "value_kind": "color_rgba"
+    },
+    {
+      "category": "General",
+      "localized_name": "Container",
+      "name": "Container",
+      "path": "MAIN:/project/exec/globals/properties/Container",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "Dimensions",
+      "name": "Dimensions",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/Dimensions",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>Rack",
+      "localized_name": "ExtendColumns",
+      "name": "ExtendColumns",
+      "path": "MAIN:/project/library/warehousing/Rack>behaviour/properties/ExtendColumns",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "Warehousing>Rack",
+      "localized_name": "FlowSpeed",
+      "name": "FlowSpeed",
+      "path": "MAIN:/project/library/warehousing/GravityFlowRack>behaviour/properties/FlowSpeed",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "General",
+      "localized_name": "Groups",
+      "name": "Groups",
+      "path": "MAIN:/project/exec/globals/properties/Groups",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "InObjects",
+      "name": "InObjects",
+      "path": "MAIN:/project/library/FlexSimEventHandler>behaviour/properties/InObjects",
+      "source": "class",
+      "type": "ConnectionsProperty",
+      "value_kind": "connections"
+    },
+    {
+      "category": "General",
+      "localized_name": "IsSelected",
+      "name": "IsSelected",
+      "path": "MAIN:/project/exec/globals/properties/IsSelected",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "Labels",
+      "name": "Labels",
+      "path": "MAIN:/project/exec/globals/properties/Labels",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "LevelProgression",
+      "name": "LevelProgression",
+      "options": [
+        {
+          "name": "Z+",
+          "value": 1
+        },
+        {
+          "name": "Z-",
+          "value": -1
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/LevelProgression",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "LevelSize",
+      "name": "LevelSize",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/LevelSize",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "LevelStride",
+      "name": "LevelStride",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/LevelStride",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Location",
+      "name": "Location",
+      "path": "MAIN:/project/exec/globals/properties/Location",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "MTBFMTTRs",
+      "name": "MTBFMTTRs",
+      "path": "MAIN:/project/library/FlexSimObject>behaviour/properties/MTBFMTTRs",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "MarkOutbound",
+      "name": "MarkOutbound",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/MarkOutbound",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "MaxContent",
+      "name": "MaxContent",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/MaxContent",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "MinimumDwellTime",
+      "name": "MinimumDwellTime",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/MinimumDwellTime",
+      "source": "class",
+      "type": "UnitUniversalProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "General",
+      "localized_name": "Name",
+      "name": "Name",
+      "path": "MAIN:/project/exec/globals/properties/Name",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "NetworkNodes",
+      "name": "NetworkNodes",
+      "path": "MAIN:/project/library/FlexSimObject>behaviour/properties/NetworkNodes",
+      "source": "class",
+      "type": "ConnectionsProperty",
+      "value_kind": "connections"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "NoSelect",
+      "name": "NoSelect",
+      "path": "MAIN:/project/exec/globals/properties/NoSelect",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "NumBays",
+      "name": "NumBays",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/NumBays",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "NumLevels",
+      "name": "NumLevels",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/NumLevels",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "OutObjects",
+      "name": "OutObjects",
+      "path": "MAIN:/project/library/FlexSimEventHandler>behaviour/properties/OutObjects",
+      "source": "class",
+      "type": "ConnectionsProperty",
+      "value_kind": "connections"
+    },
+    {
+      "category": "Warehousing>Rack",
+      "localized_name": "PickPlaceYOffset",
+      "name": "PickPlaceYOffset",
+      "path": "MAIN:/project/library/warehousing/Rack>behaviour/properties/PickPlaceYOffset",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlowVariables",
+      "name": "ProcessFlowVariables",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlowVariables",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlows",
+      "name": "ProcessFlows",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlows",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Protected",
+      "name": "Protected",
+      "path": "MAIN:/project/exec/globals/properties/Protected",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "Pull",
+      "name": "Pull",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/Pull",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "PullRequirement",
+      "name": "PullRequirement",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/PullRequirement",
+      "source": "class",
+      "type": "UniversalProperty",
+      "value_kind": "any"
+    },
+    {
+      "localized_name": "PullStrategy",
+      "name": "PullStrategy",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/PullStrategy",
+      "source": "class",
+      "type": "UniversalProperty",
+      "value_kind": "any"
+    },
+    {
+      "category": "General>Spatial",
+      "localized_name": "ResetPosition",
+      "name": "ResetPosition",
+      "path": "MAIN:/project/exec/globals/properties/ResetPosition",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Rotation",
+      "name": "Rotation",
+      "path": "MAIN:/project/exec/globals/properties/Rotation",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ScaleContents",
+      "name": "ScaleContents",
+      "path": "MAIN:/project/exec/globals/properties/ScaleContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "SendToPort",
+      "name": "SendToPort",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/SendToPort",
+      "source": "class",
+      "type": "UniversalProperty",
+      "value_kind": "any"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Shape",
+      "name": "Shape",
+      "path": "MAIN:/project/exec/globals/properties/Shape",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFactors",
+      "name": "ShapeFactors",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFactors",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFrames",
+      "name": "ShapeFrames",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFrames",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>Rack",
+      "localized_name": "ShelfTilt",
+      "name": "ShelfTilt",
+      "path": "MAIN:/project/library/warehousing/Rack>behaviour/properties/ShelfTilt",
+      "source": "class",
+      "type": "UnitValueProperty",
+      "value_kind": "number_with_unit"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowContents",
+      "name": "ShowContents",
+      "path": "MAIN:/project/exec/globals/properties/ShowContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowName",
+      "name": "ShowName",
+      "path": "MAIN:/project/exec/globals/properties/ShowName",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowPorts",
+      "name": "ShowPorts",
+      "path": "MAIN:/project/exec/globals/properties/ShowPorts",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowShape",
+      "name": "ShowShape",
+      "path": "MAIN:/project/exec/globals/properties/ShowShape",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Size",
+      "name": "Size",
+      "path": "MAIN:/project/exec/globals/properties/Size",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotAssignmentStrategy",
+      "name": "SlotAssignmentStrategy",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotAssignmentStrategy",
+      "source": "class",
+      "type": "UniversalProperty",
+      "value_kind": "any"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingBack",
+      "name": "SlotPaddingBack",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingBack",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingBottom",
+      "name": "SlotPaddingBottom",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingBottom",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingFront",
+      "name": "SlotPaddingFront",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingFront",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingLeft",
+      "name": "SlotPaddingLeft",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingLeft",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingRight",
+      "name": "SlotPaddingRight",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingRight",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotPaddingTop",
+      "name": "SlotPaddingTop",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotPaddingTop",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotProgression",
+      "name": "SlotProgression",
+      "options": [
+        {
+          "name": "X+",
+          "value": 1
+        },
+        {
+          "name": "X-",
+          "value": -1
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotProgression",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotSize",
+      "name": "SlotSize",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotSize",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotStackingAxis1",
+      "name": "SlotStackingAxis1",
+      "options": [
+        {
+          "name": "None",
+          "value": 0
+        },
+        {
+          "name": "X+",
+          "value": 1
+        },
+        {
+          "name": "X-",
+          "value": 2
+        },
+        {
+          "name": "Y+",
+          "value": 3
+        },
+        {
+          "name": "Y-",
+          "value": 4
+        },
+        {
+          "name": "Z+",
+          "value": 5
+        },
+        {
+          "name": "Z-",
+          "value": 6
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotStackingAxis1",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotStackingAxis2",
+      "name": "SlotStackingAxis2",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotStackingAxis2",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotStackingAxis3",
+      "name": "SlotStackingAxis3",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotStackingAxis3",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotStride",
+      "name": "SlotStride",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotStride",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "SlotsPerBay",
+      "name": "SlotsPerBay",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/SlotsPerBay",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "StartBay",
+      "name": "StartBay",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/StartBay",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "StartLevel",
+      "name": "StartLevel",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/StartLevel",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "StartSlot",
+      "name": "StartSlot",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/StartSlot",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "StorableSlots",
+      "name": "StorableSlots",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/StorableSlots",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "Template",
+      "name": "Template",
+      "path": "MAIN:/project/exec/globals/properties/Template",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateInstances",
+      "name": "TemplateInstances",
+      "path": "MAIN:/project/exec/globals/properties/TemplateInstances",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateOverrides",
+      "name": "TemplateOverrides",
+      "path": "MAIN:/project/exec/globals/properties/TemplateOverrides",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Texture",
+      "name": "Texture",
+      "path": "MAIN:/project/exec/globals/properties/Texture",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "TimeTables",
+      "name": "TimeTables",
+      "path": "MAIN:/project/library/FlexSimObject>behaviour/properties/TimeTables",
+      "source": "class",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "localized_name": "TransportPreempt",
+      "name": "TransportPreempt",
+      "options": [
+        {
+          "name": "Do Not Preempt",
+          "value": 0
+        },
+        {
+          "name": "Preempt Only",
+          "value": 1
+        },
+        {
+          "name": "Preempt and Abort Active",
+          "value": 2
+        },
+        {
+          "name": "Preempt and Abort All",
+          "value": 3
+        }
+      ],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/TransportPreempt",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "localized_name": "TransportPriority",
+      "name": "TransportPriority",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/TransportPriority",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "TransportRef",
+      "name": "TransportRef",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/TransportRef",
+      "source": "class",
+      "type": "UniversalProperty",
+      "value_kind": "any"
+    },
+    {
+      "localized_name": "Triggers",
+      "name": "Triggers",
+      "path": "MAIN:/project/exec/globals/properties/Triggers",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "UseAsFixedResource",
+      "name": "UseAsFixedResource",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/UseAsFixedResource",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "localized_name": "UseTransport",
+      "name": "UseTransport",
+      "path": "MAIN:/project/library/FixedResource>behaviour/properties/UseTransport",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "VirtualizeItems",
+      "name": "VirtualizeItems",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/VirtualizeItems",
+      "source": "class",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "Visualization",
+      "name": "Visualization",
+      "options": [],
+      "options_kind": "static",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/Visualization",
+      "source": "class",
+      "type": "ComboProperty",
+      "value_kind": "enum"
+    },
+    {
+      "category": "Warehousing>StorageObject",
+      "localized_name": "ZoneID",
+      "name": "ZoneID",
+      "path": "MAIN:/project/library/warehousing/StorageObject>behaviour/properties/ZoneID",
+      "source": "class",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    }
+  ],
+  "property_count": 86,
+  "raw_path_count": 99
+}

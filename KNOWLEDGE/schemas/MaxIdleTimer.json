@@ -1,0 +1,315 @@
+{
+  "class": "MaxIdleTimer",
+  "extracted_at": "2026-06-03",
+  "properties": [
+    {
+      "category": "AGV",
+      "localized_name": "AGVConnections",
+      "name": "AGVConnections",
+      "path": "MAIN:/project/exec/globals/properties/AGVConnections",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "AgentSystems",
+      "name": "AgentSystems",
+      "path": "MAIN:/project/exec/globals/properties/AgentSystems",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "AllGroups",
+      "name": "AllGroups",
+      "path": "MAIN:/project/exec/globals/properties/AllGroups",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Class",
+      "name": "Class",
+      "path": "MAIN:/project/exec/globals/properties/Class",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Classes",
+      "name": "Classes",
+      "path": "MAIN:/project/exec/globals/properties/Classes",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "components": [
+        "Red",
+        "Green",
+        "Blue",
+        "Alpha"
+      ],
+      "localized_name": "Color",
+      "name": "Color",
+      "path": "MAIN:/project/exec/globals/properties/Color",
+      "source": "global",
+      "type": "ColorProperty",
+      "value_kind": "color_rgba"
+    },
+    {
+      "category": "General",
+      "localized_name": "Container",
+      "name": "Container",
+      "path": "MAIN:/project/exec/globals/properties/Container",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "Groups",
+      "name": "Groups",
+      "path": "MAIN:/project/exec/globals/properties/Groups",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "IsSelected",
+      "name": "IsSelected",
+      "path": "MAIN:/project/exec/globals/properties/IsSelected",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "Labels",
+      "name": "Labels",
+      "path": "MAIN:/project/exec/globals/properties/Labels",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Location",
+      "name": "Location",
+      "path": "MAIN:/project/exec/globals/properties/Location",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General",
+      "localized_name": "Name",
+      "name": "Name",
+      "path": "MAIN:/project/exec/globals/properties/Name",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "NoSelect",
+      "name": "NoSelect",
+      "path": "MAIN:/project/exec/globals/properties/NoSelect",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlowVariables",
+      "name": "ProcessFlowVariables",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlowVariables",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Tools",
+      "localized_name": "ProcessFlows",
+      "name": "ProcessFlows",
+      "path": "MAIN:/project/exec/globals/properties/ProcessFlows",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Protected",
+      "name": "Protected",
+      "path": "MAIN:/project/exec/globals/properties/Protected",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Spatial",
+      "localized_name": "ResetPosition",
+      "name": "ResetPosition",
+      "path": "MAIN:/project/exec/globals/properties/ResetPosition",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Rotation",
+      "name": "Rotation",
+      "path": "MAIN:/project/exec/globals/properties/Rotation",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ScaleContents",
+      "name": "ScaleContents",
+      "path": "MAIN:/project/exec/globals/properties/ScaleContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Shape",
+      "name": "Shape",
+      "path": "MAIN:/project/exec/globals/properties/Shape",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFactors",
+      "name": "ShapeFactors",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFactors",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShapeFrames",
+      "name": "ShapeFrames",
+      "path": "MAIN:/project/exec/globals/properties/ShapeFrames",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowContents",
+      "name": "ShowContents",
+      "path": "MAIN:/project/exec/globals/properties/ShowContents",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowName",
+      "name": "ShowName",
+      "path": "MAIN:/project/exec/globals/properties/ShowName",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowPorts",
+      "name": "ShowPorts",
+      "path": "MAIN:/project/exec/globals/properties/ShowPorts",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "ShowShape",
+      "name": "ShowShape",
+      "path": "MAIN:/project/exec/globals/properties/ShowShape",
+      "source": "global",
+      "type": "CheckboxProperty",
+      "value_kind": "boolean"
+    },
+    {
+      "category": "General>Spatial",
+      "components": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "localized_name": "Size",
+      "name": "Size",
+      "path": "MAIN:/project/exec/globals/properties/Size",
+      "source": "global",
+      "type": "Vec3Property",
+      "value_kind": "vec3"
+    },
+    {
+      "category": "General",
+      "localized_name": "Template",
+      "name": "Template",
+      "path": "MAIN:/project/exec/globals/properties/Template",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateInstances",
+      "name": "TemplateInstances",
+      "path": "MAIN:/project/exec/globals/properties/TemplateInstances",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General",
+      "localized_name": "TemplateOverrides",
+      "name": "TemplateOverrides",
+      "path": "MAIN:/project/exec/globals/properties/TemplateOverrides",
+      "source": "global",
+      "type": "ArrayProperty",
+      "value_kind": "array"
+    },
+    {
+      "category": "General>Visual",
+      "localized_name": "Texture",
+      "name": "Texture",
+      "path": "MAIN:/project/exec/globals/properties/Texture",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    },
+    {
+      "localized_name": "Triggers",
+      "name": "Triggers",
+      "path": "MAIN:/project/exec/globals/properties/Triggers",
+      "source": "global",
+      "type": "BaseProperty",
+      "value_kind": "unknown"
+    }
+  ],
+  "property_count": 32,
+  "raw_path_count": 45
+}

@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{1DD065E6-F2F7-4522-AEC4-4F0D0DFBB78F}</ProjectGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>ModelerAI</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(SolutionDir)..\</OutDir>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(SolutionDir)..\</OutDir>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(SolutionDir)..\</OutDir>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(SolutionDir)..\</OutDir>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <PrecompiledHeader>
+      </PrecompiledHeader>
+      <WarningLevel>Level2</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;COMPILING_MODULE_DLL;_DEBUG;_WINDOWS;_USRDLL;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)flexsimcontent;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4005;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>opengl32.lib;flexsimcontent\flexsimcontent_x86.lib;flexsimcontent\flexsim_x86.lib;gdiplus.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>false</IgnoreAllDefaultLibraries>
+      <OutputFile>$(OutDir)$(TargetName)_x86$(TargetExt)</OutputFile>
+    </Link>
+    <BuildLog>
+      <Path>$(Platform)\$(Configuration)\$(MSBuildProjectName).log</Path>
+    </BuildLog>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PrecompiledHeader>
+      </PrecompiledHeader>
+      <WarningLevel>Level2</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;COMPILING_MODULE_DLL;_DEBUG;_WINDOWS;_USRDLL;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)flexsimcontent;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4005;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>opengl32.lib;flexsimcontent\flexsimcontent.lib;flexsimcontent\flexsim.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>false</IgnoreAllDefaultLibraries>
+    </Link>
+    <BuildLog>
+      <Path>$(Platform)\$(Configuration)\$(MSBuildProjectName).log</Path>
+    </BuildLog>
+    <PreBuildEvent>
+      <Command>call "$(ProjectDir)copyheaders.bat"</Command>
+      <WorkingDirectory>$(ProjectDir)</WorkingDirectory>
+    </PreBuildEvent>
+    <PreBuildEvent>
+      <Message>Copies Required Headers</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level2</WarningLevel>
+      <PrecompiledHeader>
+      </PrecompiledHeader>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;COMPILING_MODULE_DLL;NDEBUG;_WINDOWS;_USRDLL;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)flexsimcontent;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4005;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>opengl32.lib;flexsimcontent\flexsimcontent_x86.lib;flexsimcontent\flexsim_x86.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>false</IgnoreAllDefaultLibraries>
+      <OutputFile>$(OutDir)$(TargetName)_x86$(TargetExt)</OutputFile>
+    </Link>
+    <BuildLog>
+      <Path>$(Platform)\$(Configuration)\$(MSBuildProjectName).log</Path>
+    </BuildLog>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level2</WarningLevel>
+      <PrecompiledHeader>
+      </PrecompiledHeader>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;COMPILING_MODULE_DLL;NDEBUG;_WINDOWS;_USRDLL;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)flexsimcontent;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4005;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>opengl32.lib;flexsimcontent\flexsimcontent.lib;flexsimcontent\flexsim.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>false</IgnoreAllDefaultLibraries>
+    </Link>
+    <BuildLog>
+      <Path>$(Platform)\$(Configuration)\$(MSBuildProjectName).log</Path>
+    </BuildLog>
+    <PreBuildEvent>
+      <Command>call "$(ProjectDir)copyheaders.bat"</Command>
+      <WorkingDirectory>$(ProjectDir)</WorkingDirectory>
+      <Message>Copies Required Headers</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="module.h" />
+    <ClInclude Include="targetver.h" />
+    <ClInclude Include="paths.h" />
+    <ClInclude Include="abi.h" />
+    <ClInclude Include="bootstrap.h" />
+    <ClInclude Include="third_party\json.h" />
+    <ClInclude Include="third_party\thirdparty\nlohmann\json.hpp" />
+    <ClInclude Include="third_party\cpp-httplib\httplib.h" />
+    <ClInclude Include="bridge\protocol.h" />
+    <ClInclude Include="bridge\log.h" />
+    <ClInclude Include="bridge\diag.h" />
+    <ClInclude Include="bridge\bridge.h" />
+    <ClInclude Include="bridge\subscriber.h" />
+    <ClInclude Include="agent\message.h" />
+    <ClInclude Include="agent\prompt.h" />
+    <ClInclude Include="agent\agent.h" />
+    <ClInclude Include="agent\user_rules.h" />
+    <ClInclude Include="agent\slash.h" />
+    <ClInclude Include="agent\slash_remote.h" />
+    <ClInclude Include="agent\session_store.h" />
+    <ClInclude Include="tree\condense.h" />
+    <ClInclude Include="kb\kb_index.h" />
+    <ClInclude Include="kb\kb_loader.h" />
+    <ClInclude Include="keystore\keystore.h" />
+    <ClInclude Include="tools\tool_base.h" />
+    <ClInclude Include="provider\provider.h" />
+    <ClInclude Include="provider\sse_parser.h" />
+    <ClInclude Include="provider\http_client.h" />
+    <ClInclude Include="provider\anthropic.h" />
+    <ClInclude Include="provider\builtin_chat.h" />
+    <ClInclude Include="provider\gemini.h" />
+    <ClInclude Include="provider\openai_chat_helpers.h" />
+    <ClInclude Include="provider\openai_compatible.h" />
+    <ClInclude Include="tools\tool_registry.h" />
+    <ClInclude Include="tools\read\ask_user_question.h" />
+    <ClInclude Include="tools\read\flexsim_readonly_stubs.h" />
+    <ClInclude Include="tools\read\kb_tools.h" />
+    <ClInclude Include="tools\write\modelerai_call.h" />
+    <ClInclude Include="tools\write\run_script.h" />
+    <ClInclude Include="commands\commands.h" />
+    <ClInclude Include="commands\antipattern.h" />
+    <ClInclude Include="commands\export_tree_json.h" />
+    <ClInclude Include="commands\schema_store.h" />
+    <ClInclude Include="commands\identifier_validator.h" />
+    <ClInclude Include="agent\user_interaction.h" />
+    <ClInclude Include="mainthread\mainthread.h" />
+    <ClInclude Include="settings\effective_settings.h" />
+    <ClInclude Include="settings\global_settings.h" />
+    <ClInclude Include="settings\project_settings.h" />
+    <ClInclude Include="remote\asset_loader.h" />
+    <ClInclude Include="remote\lan_iface.h" />
+    <ClInclude Include="remote\qr_payload.h" />
+    <ClInclude Include="remote\remote_server.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="module.cpp" />
+    <ClCompile Include="paths.cpp" />
+    <ClCompile Include="abi.cpp" />
+    <ClCompile Include="bootstrap.cpp" />
+    <ClCompile Include="bridge\protocol.cpp" />
+    <ClCompile Include="bridge\log.cpp" />
+    <ClCompile Include="bridge\diag.cpp" />
+    <ClCompile Include="bridge\bridge.cpp" />
+    <ClCompile Include="bridge\subscriber.cpp" />
+    <ClCompile Include="agent\prompt.cpp" />
+    <ClCompile Include="agent\agent.cpp" />
+    <ClCompile Include="agent\user_rules.cpp" />
+    <ClCompile Include="agent\slash.cpp" />
+    <ClCompile Include="agent\slash_remote.cpp" />
+    <ClCompile Include="agent\session_store.cpp" />
+    <ClCompile Include="tree\condense.cpp" />
+    <ClCompile Include="kb\kb_loader.cpp" />
+    <ClCompile Include="kb\kb_index.cpp" />
+    <ClCompile Include="provider\sse_parser.cpp" />
+    <ClCompile Include="provider\http_client.cpp" />
+    <ClCompile Include="provider\anthropic.cpp" />
+    <ClCompile Include="provider\builtin_chat.cpp" />
+    <ClCompile Include="provider\gemini.cpp" />
+    <ClCompile Include="provider\openai_chat_helpers.cpp" />
+    <ClCompile Include="provider\openai_compatible.cpp" />
+    <ClCompile Include="keystore\keystore.cpp" />
+    <ClCompile Include="tools\tool_registry.cpp" />
+    <ClCompile Include="tools\read\ask_user_question.cpp" />
+    <ClCompile Include="tools\read\flexsim_readonly_stubs.cpp" />
+    <ClCompile Include="tools\read\kb_tools.cpp" />
+    <ClCompile Include="tools\write\modelerai_call.cpp" />
+    <ClCompile Include="tools\write\run_script.cpp" />
+    <ClCompile Include="commands\commands.cpp" />
+    <ClCompile Include="commands\export_tree_json.cpp" />
+    <ClCompile Include="commands\schema_store.cpp" />
+    <ClCompile Include="commands\identifier_validator.cpp" />
+    <ClCompile Include="agent\user_interaction.cpp" />
+    <ClCompile Include="mainthread\mainthread.cpp" />
+    <ClCompile Include="settings\effective_settings.cpp" />
+    <ClCompile Include="settings\global_settings.cpp" />
+    <ClCompile Include="settings\project_settings.cpp" />
+    <ClCompile Include="remote\asset_loader.cpp" />
+    <ClCompile Include="remote\lan_iface.cpp" />
+    <ClCompile Include="remote\qr_payload.cpp" />
+    <ClCompile Include="remote\remote_server.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

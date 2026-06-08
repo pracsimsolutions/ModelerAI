@@ -1,0 +1,80 @@
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editors / IDEs / agent tooling
+.vscode/
+.idea/
+.vs/
+.claude/
+.superpowers/
+*.swp
+*.swo
+*~
+
+# FlexSim working/backup files
+*.fsm.bak
+*.fsm.lock
+*.fsm.tmp
+
+# Local-only reference dumps (devs drop FlexSim library .fsx or other
+# large reference material here for iteration sessions)
+Reference Nodes/
+
+# Secrets — defense in depth. Real keys live in the user's environment
+# (Anthropic, OpenAI, etc.) or the DPAPI keystore, never in the repo.
+.env
+.env.*
+*.env
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+keys.dat
+keys.json
+ModelerAI/keys.dat
+set-key.*
+set-env.*
+load-env.*
+
+# Build artifacts — produced by Visual Studio, never committed.
+# Clone, build, ship is the distribution model.
+ModelerAI.dll
+ModelerAI.t
+ModelerAI.exp
+ModelerAI.lib
+ModelerAI.pdb
+ModelerAI.ipdb
+ModelerAI.iobj
+ModelerAiDLL/x64/
+ModelerAiDLL/Win32/
+ModelerAiDLL/Debug/
+ModelerAiDLL/Release/
+ModelerAiDLL/ModelerAI/
+ModelerAiDLL/flexsimcontent/
+ModelerAiDLL/*.vcxproj.user
+dist/
+
+# WiX local extension cache (created if `wix extension add` runs without --global)
+.wix/
+
+# Auto-generated knowledge base — regenerated locally by `setup.bat` /
+# `node tools/build-kb.js` from the user's own FlexSim install.
+# Nothing FlexSim-derived ships in this repo.
+KNOWLEDGE/INDEX.json
+KNOWLEDGE/catalog/
+KNOWLEDGE/topics/classes/
+KNOWLEDGE/topics/commands/
+KNOWLEDGE/topics/manual/
+
+# Local-only sample models / example pickups
+Examples/
+
+# Internal-only dev docs, plans, audits — not shipped publicly
+docs/
+CLAUDE.md
+AUDIT-PRE-MIT-RELEASE.md
+
+# Scratch / personal workflow — anything in here is local only
+_local/
