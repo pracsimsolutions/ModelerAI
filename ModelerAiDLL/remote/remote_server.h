@@ -21,6 +21,7 @@
 #pragma once
 
 #include "remote/qr_payload.h"
+#include "share/tunnel/tunnel.h"
 
 #include <string>
 
@@ -42,6 +43,24 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
 void stop();
 
 bool isRunning();
+
+// Start tunneled mode: spawn cloudflared, wait briefly for its URL,
+// then start the local server bound to 127.0.0.1 ONLY. The LAN cannot
+// reach the server when tunnel mode is active — cloudflared connects
+// loopback; everyone else goes through the *.trycloudflare.com URL.
+StartResult startTunneled(tunnel::Mode mode);
+
+// Stop tunneled mode: stop the server, kill cloudflared, rotate the
+// token. Idempotent. After this call, both isRunning() and
+// tunnel::isRunning() return false.
+void stopTunneled();
+
+// Current tunnel mode (None when not tunneled).
+tunnel::Mode tunnelMode();
+
+// Public tunnel URL (empty if no tunnel active OR Quick mode hasn't
+// scraped the URL yet — caller may want to retry after a short delay).
+std::string tunnelPublicUrl();
 
 // Snapshot for /remote status + Settings panel. enabled=false when
 // stopped.

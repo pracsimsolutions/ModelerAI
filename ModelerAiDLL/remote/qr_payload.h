@@ -33,6 +33,8 @@ struct RemoteStatusInputs {
     std::vector<LanIface>         interfaces;        // detectLanInterfaces() output
     std::vector<ConnectedClient>  clients;           // snapshot
     long long                     uptime_seconds = 0;
+    std::string                   tunnel_public_url; // empty when not tunneled
+    std::string                   tunnel_mode = "none"; // "none" | "quick" | "named"
 };
 
 // Build the JSON for the `remote_status` state_update.

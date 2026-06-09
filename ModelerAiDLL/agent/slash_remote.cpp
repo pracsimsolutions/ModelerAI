@@ -9,6 +9,7 @@
 #include "mainthread/mainthread.h"
 #include "remote/remote_server.h"
 #include "remote/qr_payload.h"
+#include "share/tunnel/tunnel.h"
 #include "third_party/json.h"
 
 #include <chrono>
@@ -47,6 +48,13 @@ void pushSystemBubble(const std::string& turnId,
 void pushRemoteStatus(const std::string& turnId)
 {
     auto in = remote::status();
+    // Fill tunnel fields.
+    in.tunnel_public_url = remote::tunnelPublicUrl();
+    switch (remote::tunnelMode()) {
+        case tunnel::Mode::None:  in.tunnel_mode = "none";  break;
+        case tunnel::Mode::Quick: in.tunnel_mode = "quick"; break;
+        case tunnel::Mode::Named: in.tunnel_mode = "named"; break;
+    }
     // Fill clients from the subscriber snapshot.
     auto subs = bridge::snapshotSubscribers();
     auto now = std::chrono::steady_clock::now();
@@ -305,6 +313,52 @@ bool dispatchRemote(Agent* /*agent*/,
     else if (sub == "rotate") { handleRotate(turnId); return true; }
     else if (sub == "diag")   { handleDiag(turnId); return true; }
     else if (sub == "trace")  { handleTrace(turnId, rest); return true; }
+    else if (sub == "tunnel") {
+        // Parse second token: "on" | "off"
+        std::string sub2;
+        std::string rest2(rest);
+        while (!rest2.empty() && rest2.front() == ' ') rest2.erase(0, 1);
+        auto sp2 = rest2.find(' ');
+        sub2 = (sp2 == std::string::npos) ? rest2 : rest2.substr(0, sp2);
+
+        if (sub2 == "on") {
+            if (remote::isRunning()) {
+                pushSystemBubble(turnId,
+                    "Remote server already running. Use `/remote off` or "
+                    "`/remote tunnel off` first.", false);
+                pushRemoteStatus(turnId);
+                return true;
+            }
+            // Mode A (quick tunnel) — no config required. Named mode lands
+            // in Task 2.5 with mode=named arg.
+            auto r = remote::startTunneled(tunnel::Mode::Quick);
+            if (!r.ok) {
+                pushSystemBubble(turnId,
+                    "Tunnel start failed: " + r.error_message + ".", false);
+                return true;
+            }
+            pushSystemBubble(turnId,
+                "Cloudflare Tunnel active. Scan the QR or visit the URL on "
+                "any device — works across networks. Use `/remote tunnel off` "
+                "to stop.", true);
+            pushRemoteStatus(turnId);
+            return true;
+        }
+        if (sub2 == "off") {
+            if (!remote::isRunning() && remote::tunnelMode() == tunnel::Mode::None) {
+                pushSystemBubble(turnId, "No tunnel is running.", false);
+                return true;
+            }
+            remote::stopTunneled();
+            pushSystemBubble(turnId, "Tunnel stopped.", false);
+            pushRemoteStatus(turnId);
+            return true;
+        }
+        pushSystemBubble(turnId,
+            "Usage: `/remote tunnel on` or `/remote tunnel off`. "
+            "(Mode B / named tunnel coming in next task.)", false);
+        return true;
+    }
     return false;
 }
 

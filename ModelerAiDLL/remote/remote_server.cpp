@@ -10,6 +10,7 @@
 #include "remote/asset_loader.h"
 #include "remote/lan_iface.h"
 #include "remote/qr_payload.h"
+#include "share/tunnel/tunnel.h"
 #include "third_party/cpp-httplib/httplib.h"
 #include "bridge/log.h"
 #include "bridge/diag.h"
@@ -509,5 +510,70 @@ void broadcastRemoteStatus()
     if (!g_lastBroadcastMs.compare_exchange_strong(last, nowMs)) return;
     bridge::pushEvent(buildRemoteStatusEnvelopeJson("remote-status-lifecycle"));
 }
+
+StartResult startTunneled(tunnel::Mode mode)
+{
+    StartResult r;
+
+    // 1. Pick a port — use the same default as LAN mode for now (12350).
+    //    The settings UI in a future task will let the user override.
+    constexpr int kDefaultPort = 12350;
+    int port = kDefaultPort;
+
+    // 2. Start cloudflared FIRST so we have a URL to publish before
+    //    accepting traffic. Tunnels can take 1–10s to register with
+    //    the edge.
+    auto t = tunnel::start(mode, port);
+    if (!t.ok) {
+        r.error_message = "tunnel_start_failed: " + t.error_message;
+        return r;
+    }
+
+    // 3. For Quick mode, poll publicUrl() with a 15s timeout. For
+    //    Named mode, the URL is the user-configured hostname — we
+    //    leave that hookup to Task 2.5 (read from share/cloudflared/config.yml).
+    if (mode == tunnel::Mode::Quick) {
+        auto deadline = std::chrono::steady_clock::now()
+                       + std::chrono::seconds(15);
+        while (tunnel::publicUrl().empty()
+            && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (tunnel::publicUrl().empty()) {
+            tunnel::stop();
+            r.error_message = "tunnel_url_timeout: cloudflared did not "
+                              "publish a URL within 15s";
+            return r;
+        }
+    }
+
+    // 4. Start the local server bound to 127.0.0.1 ONLY. Critical
+    //    security boundary: cloudflared connects loopback; LAN cannot
+    //    reach the server during tunnel mode.
+    auto token = generateToken();
+    if (token.empty()) {
+        tunnel::stop();
+        r.error_message = "rng_failed";
+        return r;
+    }
+    auto sr = start(port, token, "127.0.0.1");
+    if (!sr.ok) {
+        tunnel::stop();
+        return sr;
+    }
+
+    r.ok = true;
+    r.actual_port = port;
+    return r;
+}
+
+void stopTunneled()
+{
+    stop();
+    tunnel::stop();
+}
+
+tunnel::Mode tunnelMode() { return tunnel::currentMode(); }
+std::string  tunnelPublicUrl() { return tunnel::publicUrl(); }
 
 } // namespace ModelerAi::remote

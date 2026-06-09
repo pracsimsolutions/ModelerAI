@@ -57,6 +57,12 @@
     <Filter Include="remote">
       <UniqueIdentifier>{c5d6e7f8-9012-4345-6789-abcdef012345}</UniqueIdentifier>
     </Filter>
+    <Filter Include="share">
+      <UniqueIdentifier>{d6e7f8a9-1234-5678-9abc-def012345678}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="share\tunnel">
+      <UniqueIdentifier>{e7f8a9b0-2345-6789-abcd-ef0123456789}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
@@ -112,6 +118,7 @@
     <ClInclude Include="remote\lan_iface.h"><Filter>remote</Filter></ClInclude>
     <ClInclude Include="remote\qr_payload.h"><Filter>remote</Filter></ClInclude>
     <ClInclude Include="remote\remote_server.h"><Filter>remote</Filter></ClInclude>
+    <ClInclude Include="share\tunnel\tunnel.h"><Filter>share\tunnel</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="module.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -159,5 +166,6 @@
     <ClCompile Include="remote\lan_iface.cpp"><Filter>remote</Filter></ClCompile>
     <ClCompile Include="remote\qr_payload.cpp"><Filter>remote</Filter></ClCompile>
     <ClCompile Include="remote\remote_server.cpp"><Filter>remote</Filter></ClCompile>
+    <ClCompile Include="share\tunnel\tunnel.cpp"><Filter>share\tunnel</Filter></ClCompile>
   </ItemGroup>
 </Project>

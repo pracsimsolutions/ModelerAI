@@ -239,6 +239,7 @@
     <ClInclude Include="remote\lan_iface.h" />
     <ClInclude Include="remote\qr_payload.h" />
     <ClInclude Include="remote\remote_server.h" />
+    <ClInclude Include="share\tunnel\tunnel.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="module.cpp" />
@@ -286,6 +287,7 @@
     <ClCompile Include="remote\lan_iface.cpp" />
     <ClCompile Include="remote\qr_payload.cpp" />
     <ClCompile Include="remote\remote_server.cpp" />
+    <ClCompile Include="share\tunnel\tunnel.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
