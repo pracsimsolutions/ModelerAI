@@ -160,8 +160,12 @@ TestKeyResult BuiltinChatCompletions::test_key()
     }
 
     nlohmann::json req;
-    req["model"]      = testModel;
-    req["max_tokens"] = 1;
+    req["model"] = testModel;
+    // Reasoning models (o1, o3, ...) require max_completion_tokens.
+    bool isReasoningModel = (testModel.size() >= 2
+                             && testModel[0] == 'o'
+                             && testModel[1] >= '0' && testModel[1] <= '9');
+    req[isReasoningModel ? "max_completion_tokens" : "max_tokens"] = 1;
     req["messages"]   = nlohmann::json::array({
         nlohmann::json{{"role", "user"}, {"content", "."}}
     });
@@ -279,7 +283,13 @@ void BuiltinChatCompletions::stream_turn(
     });
 
     bridge::consolePrint(("[ModelerAI] POST " + url + " (streaming)\n"));
+    // Capture raw body alongside the SSE parser so 4xx/5xx error JSON
+    // (which isn't SSE and gets silently dropped by the parser) is
+    // visible in the error message + system console.
+    std::string rawBody;
+    rawBody.reserve(2048);
     int status = streamPostUrl(url, headers, body, [&](std::string_view chunk) {
+        rawBody.append(chunk.data(), chunk.size());
         parser.feed(chunk);
     }, cancel);
     parser.flush();
@@ -296,6 +306,10 @@ void BuiltinChatCompletions::stream_turn(
         return;
     }
     if (status < 200 || status >= 300) {
+        std::string detail = rawBody;
+        if (detail.size() > 800) detail = detail.substr(0, 800) + "…";
+        bridge::consolePrint("[" + cfg_.display_name + "] HTTP "
+                             + std::to_string(status) + " body: " + rawBody + "\n");
         if (onError) {
             std::string msg;
             if (status == 401 || status == 403) {
@@ -303,7 +317,8 @@ void BuiltinChatCompletions::stream_turn(
             } else if (status == 429) {
                 msg = cfg_.display_name + " is rate-limiting requests. Wait a minute and try again.";
             } else {
-                msg = cfg_.display_name + " returned HTTP " + std::to_string(status);
+                msg = cfg_.display_name + " returned HTTP " + std::to_string(status)
+                    + (detail.empty() ? "." : ". Response:\n" + detail);
             }
             onError(ProviderError{ "http_" + std::to_string(status), msg, status == 429 || status >= 500 });
         }

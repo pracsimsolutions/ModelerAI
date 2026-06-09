@@ -95,8 +95,15 @@ nlohmann::json buildRequest(
     const std::string&                 reasoning_effort)
 {
     nlohmann::json req;
-    req["model"]      = model_id;
-    req["max_tokens"] = max_tokens;
+    req["model"] = model_id;
+    // OpenAI's reasoning models (o1, o3, o4, ...) reject `max_tokens` —
+    // they require `max_completion_tokens` instead. Detect by the
+    // model-id prefix "o" + digit. Non-reasoning models (gpt-*) keep
+    // the legacy field name.
+    bool isReasoningModel = (model_id.size() >= 2
+                             && model_id[0] == 'o'
+                             && model_id[1] >= '0' && model_id[1] <= '9');
+    req[isReasoningModel ? "max_completion_tokens" : "max_tokens"] = max_tokens;
     req["stream"]     = true;
     // Newer OpenAI supports "stream_options": {"include_usage": true} for a
     // final usage chunk. Harmless on providers that ignore it.
