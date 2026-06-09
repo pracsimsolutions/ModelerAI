@@ -239,6 +239,7 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
     g_bindIp    = bind_ip.empty() ? std::string("0.0.0.0") : bind_ip;
     g_startTime = std::chrono::steady_clock::now();
     g_server    = std::make_unique<httplib::Server>();
+    g_server->set_payload_max_length(64 * 1024);
 
     // Health route — no auth.
     g_server->Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
@@ -376,6 +377,10 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
             res.set_content("Viewer asset not found. Check install dir.", "text/plain");
             return;
         }
+        res.set_header("Cache-Control",          "no-store, no-cache, must-revalidate, private");
+        res.set_header("Pragma",                 "no-cache");
+        res.set_header("X-Content-Type-Options", "nosniff");
+        res.set_header("Referrer-Policy",        "no-referrer");
         res.set_content(html, "text/html; charset=utf-8");
     });
 
