@@ -34,6 +34,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 namespace ModelerAi::bridge {
 
@@ -714,6 +715,37 @@ std::string handleEnvelope(std::string_view envelopeJson,
                                : std::string{};
 
     BridgeMsgType t = parseType(typeName);
+
+    // Host-only envelope guard. The phone-mode UI hides settings/provider/
+    // session controls when IS_REMOTE, but a guest who pokes browser
+    // DevTools could still POST these envelope types directly. Reject
+    // them server-side when the requesting subscriber isn't the local
+    // CEF. The originator gets an error envelope back via enqueueTo.
+    static const std::unordered_set<std::string> kHostOnlyTypes = {
+        "save_api_key",
+        "forget_api_key",
+        "provider_switch",
+        "add_custom_provider",
+        "remove_custom_provider",
+        "set_setting",
+        "clear_history",
+        "delete_session",
+        "delete_all_sessions",
+        "export_conversation",
+    };
+    if (requesting_sid != kLocalFlexsimSubscriberId
+        && kHostOnlyTypes.count(typeName)) {
+        consolePrint("[ModelerAI] host_only rejected: type=" + typeName
+                     + " from sid=" + std::string(requesting_sid) + "\n");
+        nlohmann::json err;
+        err["t"]  = "error";
+        err["id"] = turnId;
+        err["p"]  = {{"code","host_only"},
+                     {"message","This action can only be performed from the host UI."}};
+        enqueueTo(requesting_sid, err.dump());
+        return "host_only";
+    }
+
     if (t == BridgeMsgType::UserMessage) {
         if (!env.contains("p") || !env["p"].is_object()) {
             consolePrint("[ModelerAI] ERR: user_message missing payload\n");
