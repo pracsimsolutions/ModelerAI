@@ -1865,6 +1865,57 @@
         padding: 0 12px;
       }
     }
+
+    /* ============================================================
+       Phone-mode UI gate (?mode=phone)
+       Stripped view served to remote phone clients via Cloudflare
+       Tunnel. Same JS app — body.phone-mode hides host-only controls.
+       C++ side rejects host-only envelopes from non-local subscribers
+       separately (see bridge::handleEnvelope, Task 1.10).
+
+       Always visible on phone: transcript (#messages), compose textarea
+       (#input), Send + Stop (#composer-actions-right), reconnect overlay
+       (#remote-disconnect-overlay).
+       ============================================================ */
+
+    /* Hide the entire tabbar (Chat/Settings tabs + hamburger + remote
+       badge). Phone clients are always in chat view; Settings is not
+       accessible on phone, so the tab strip serves no purpose. */
+    body.phone-mode #tabbar {
+      display: none !important;
+    }
+
+    /* Hide the settings pane. Hides provider picker, model picker (in
+       Settings → Model), mode selector (Settings → General), cost meter
+       (Settings → Usage), session export/clear (Settings → Sessions),
+       and remote-panel sharing controls (Settings → Remote) all at once. */
+    body.phone-mode #pane-settings {
+      display: none !important;
+    }
+
+    /* Hide the composer toolbar-left strip:
+       - #attach-btn  (attachment / image upload)
+       - #slash-btn   (slash command shortcut button)
+       - #model-btn   (model picker pill)
+       - #mode-btn    (Ask / Plan / Apply mode switch)
+       Hiding the container is safe because #composer-actions-right
+       (Send + Stop) is a sibling, not a child, and stays visible. */
+    body.phone-mode #composer-actions-left {
+      display: none !important;
+    }
+
+    /* Tighten layout on small screens. 16px is the iOS Safari magic
+       value that prevents auto-zoom on input focus. */
+    body.phone-mode #input,
+    body.phone-mode textarea,
+    body.phone-mode input[type="text"] {
+      font-size: 16px;
+    }
+
+    body.phone-mode #composer-wrap {
+      padding-top: 0;
+    }
+
   </style>
   <script>
     // qrcode-generator vendored (v1.4.4) — see webview/vendor/qrcode-generator.js
@@ -5052,6 +5103,19 @@ var qrcode = function() {
       // "we are remote" signal. MUST run BEFORE the mock-shim install below,
       // since that shim assigns fireFlexsimEvent and would falsify the check.
       var IS_REMOTE = typeof fireFlexsimEvent !== 'function';
+
+      // ---- phone-mode detection ----
+      // ?mode=phone is how Cloudflare Tunnel serves the UI to remote phone
+      // clients (Task 1.9). Adding the class here — synchronously, before any
+      // other init — means the CSS display:none rules take effect before the
+      // first paint, so host-only controls never flash then disappear.
+      // body already exists because this <script> is at end of <body>.
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('mode') === 'phone') {
+          document.body.classList.add('phone-mode');
+        }
+      })();
 
       // On remote first load, the token comes in via URL fragment
       // (preferred — never reaches a server) or query string (fallback).
