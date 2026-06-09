@@ -19,6 +19,7 @@
 #include "paths.h"
 
 #include <windows.h>   // GetCurrentThreadId for /api/send trace
+#include <bcrypt.h>
 
 #include <atomic>
 #include <chrono>
@@ -56,6 +57,17 @@ std::string extractToken(const httplib::Request& req)
     }
     if (req.has_param("token")) return req.get_param_value("token");
     return "";
+}
+
+// Resolve the real client IP. cloudflared puts itself between us and the
+// world, so req.remote_addr is always 127.0.0.1 in tunnel mode. The
+// real client IP rides in CF-Connecting-IP. Falls back to remote_addr
+// for LAN/direct mode.
+std::string clientIp(const httplib::Request& req)
+{
+    auto cf = req.get_header_value("CF-Connecting-IP");
+    if (!cf.empty()) return cf;
+    return req.remote_addr;
 }
 
 bool authOk(const httplib::Request& req)
@@ -136,18 +148,65 @@ bool checkSendRate(const std::string& sid)
     return true;
 }
 
+// Per-IP auth-failure tracking. Without this, an internet attacker can
+// hammer /api/poll?token=X at any rate trying tokens. We cap auth failures
+// per source IP at 10/min, then 5-min ban (429). Keyed by clientIp() so
+// per-guest accounting survives the cloudflared loopback termination.
+struct AuthFailState {
+    std::chrono::steady_clock::time_point window_start;
+    int   count = 0;
+    std::chrono::steady_clock::time_point banned_until;  // zero = not banned
+};
+std::mutex                                       g_authFailMu;
+std::unordered_map<std::string, AuthFailState>   g_authFail;
+
+// Returns true if the IP is currently banned (caller should 429 immediately).
+bool isAuthBanned(const std::string& ip)
+{
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(g_authFailMu);
+    auto it = g_authFail.find(ip);
+    if (it == g_authFail.end()) return false;
+    return now < it->second.banned_until;
+}
+
+// Record one auth failure; promotes to a 5-minute ban after 10 failures
+// in 60 seconds. Bookkeeping is per-IP; tunneled clients all share the
+// cloudflared loopback IP from req.remote_addr but we use CF-Connecting-IP
+// via clientIp() so per-guest accounting works in tunnel mode.
+void recordAuthFail(const std::string& ip)
+{
+    constexpr int  kMaxFailsPerWindow = 10;
+    constexpr auto kWindow            = std::chrono::seconds(60);
+    constexpr auto kBan               = std::chrono::minutes(5);
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(g_authFailMu);
+    auto& st = g_authFail[ip];
+    if (now - st.window_start > kWindow) {
+        st.window_start = now;
+        st.count        = 0;
+    }
+    ++st.count;
+    if (st.count >= kMaxFailsPerWindow) {
+        st.banned_until = now + kBan;
+        diag::info("auth-fail ban: ip=" + ip
+                   + " for " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(kBan).count())
+                   + "s");
+    }
+}
+
 } // namespace
 
 std::string generateToken()
 {
-    // 18 random bytes = 24-char base64. Use mt19937_64 — we don't need
-    // cryptographic strength on the LAN-trust posture, just unpredictability.
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<uint64_t> dist;
+    // CSPRNG so tunnel-mode tokens (publicly-visible URL) aren't predictable.
     uint8_t bytes[18];
-    for (int i = 0; i < 18; i += 8) {
-        uint64_t v = dist(rng);
-        for (int j = 0; j < 8 && i + j < 18; ++j) bytes[i + j] = (v >> (j * 8)) & 0xFF;
+    NTSTATUS s = BCryptGenRandom(nullptr, bytes, sizeof(bytes),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (s != 0) {
+        // Defense in depth: if CSPRNG fails (shouldn't), refuse to start.
+        // The caller (slash::on, settings panel) will surface the error.
+        return "";
     }
     static const char kAlphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -171,6 +230,10 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
         r.error_message = "already_running";
         return r;
     }
+    if (token.empty()) {
+        r.error_message = "rng_failed";
+        return r;
+    }
     g_token     = token;
     g_port      = port;
     g_bindIp    = bind_ip.empty() ? std::string("0.0.0.0") : bind_ip;
@@ -183,7 +246,17 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
     });
 
     g_server->Get("/api/poll", [](const httplib::Request& req, httplib::Response& res) {
-        if (!authOk(req)) return writeAuthError(res);
+        auto ip = clientIp(req);
+        if (isAuthBanned(ip)) {
+            res.status = 429;
+            res.set_content("{\"error\":\"rate_limited\",\"message\":\"Too many auth failures; try again later.\"}",
+                            "application/json");
+            return;
+        }
+        if (!authOk(req)) {
+            recordAuthFail(ip);
+            return writeAuthError(res);
+        }
         std::string sid = resolveSid(req);
         bool        registered_now = false;
         if (sid.empty()) {
@@ -191,7 +264,7 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
             // both as a cookie (for any client that honors them) AND in
             // X-Mraisid response header (so JS can pin it into localStorage
             // and bypass cookies entirely thereafter).
-            auto remoteIp = req.remote_addr;
+            auto remoteIp = clientIp(req);
             auto ua       = req.get_header_value("User-Agent");
             sid = bridge::registerRemoteSubscriber(remoteIp, ua);
             registered_now = true;
@@ -200,7 +273,7 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
             // generate its own (UUID-ish) and present it on first request,
             // so the same id survives server restarts AND browser refreshes
             // without us having to issue + persist anything.
-            auto remoteIp = req.remote_addr;
+            auto remoteIp = clientIp(req);
             auto ua       = req.get_header_value("User-Agent");
             bridge::adoptRemoteSubscriber(sid, remoteIp, ua);
             registered_now = true;
@@ -230,7 +303,15 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
                    + " body_len=" + std::to_string(req.body.size())
                    + " remote_ip=" + req.remote_addr);
 
+        auto ip = clientIp(req);
+        if (isAuthBanned(ip)) {
+            res.status = 429;
+            res.set_content("{\"error\":\"rate_limited\",\"message\":\"Too many auth failures; try again later.\"}",
+                            "application/json");
+            return;
+        }
         if (!authOk(req)) {
+            recordAuthFail(ip);
             diag::info("/api/send: AUTH_FAIL ip=" + req.remote_addr);
             return writeAuthError(res);
         }
@@ -248,7 +329,7 @@ StartResult start(int port, const std::string& token, const std::string& bind_ip
             // it (restart). Same accept-the-id-the-client-claims policy as
             // /api/poll. Token-bearer auth gates who can claim ids at all.
             auto ua = req.get_header_value("User-Agent");
-            bridge::adoptRemoteSubscriber(sid, req.remote_addr, ua);
+            bridge::adoptRemoteSubscriber(sid, clientIp(req), ua);
             diag::info("/api/send: adopted unknown sid=" + sid);
         }
         bridge::touchSubscriber(sid);
