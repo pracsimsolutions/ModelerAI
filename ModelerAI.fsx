@@ -767,6 +767,34 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
       color: var(--accent-fg);
       align-self: flex-end;
     }
+    /* Fixed top-right build version marker. Bumped by .0000001 on every
+       source change so smoke tests can verify "am I running the new code?"
+       at a glance. Visible in both host and phone mode (not nested in
+       #tabbar or #pane-settings). */
+    #app-version {
+      position: fixed;
+      top: 4px;
+      right: 8px;
+      z-index: 9999;
+      font: 10px/1 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      color: var(--text-muted);
+      opacity: 0.6;
+      pointer-events: none;     /* clicks pass through to underlying UI */
+      user-select: text;        /* but the version can still be copied */
+      letter-spacing: 0.3px;
+    }
+
+    /* Author attribution for shared-chat user_message_broadcast bubbles.
+       Sits above the message text; smaller + translucent so it doesn't
+       compete with the message content. */
+    .bubble-author {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      opacity: 0.65;
+      margin-bottom: 3px;
+    }
     .bubble-assistant {
       background: var(--bg-elevated);
       border: 1px solid var(--border);
@@ -1936,6 +1964,80 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
         padding: 0 12px;
       }
     }
+
+    /* ============================================================
+       Phone-mode UI gate (?mode=phone)
+       Stripped view served to remote phone clients via Cloudflare
+       Tunnel. Same JS app — body.phone-mode hides host-only controls.
+       C++ side rejects host-only envelopes from non-local subscribers
+       separately (see bridge::handleEnvelope, Task 1.10).
+
+       Always visible on phone: transcript (#messages), compose textarea
+       (#input), Send + Stop (#composer-actions-right), reconnect overlay
+       (#remote-disconnect-overlay).
+       ============================================================ */
+
+    /* Hide the entire tabbar (Chat/Settings tabs + hamburger + remote
+       badge). Phone clients are always in chat view; Settings is not
+       accessible on phone, so the tab strip serves no purpose. */
+    body.phone-mode #tabbar {
+      display: none !important;
+    }
+
+    /* Hide the settings pane. Hides provider picker, model picker (in
+       Settings → Model), mode selector (Settings → General), cost meter
+       (Settings → Usage), session export/clear (Settings → Sessions),
+       and remote-panel sharing controls (Settings → Remote) all at once. */
+    body.phone-mode #pane-settings {
+      display: none !important;
+    }
+
+    /* Composer-actions-left (attach / slash / model / mode picker buttons)
+       stays VISIBLE on phones — Josh wants the same chat affordances as
+       the host UI. Only Settings (full pane) is host-only. */
+
+    /* Restructure the composer for phone mode so Send (the enter button)
+       sits to the SIDE of the textarea instead of below it. Default
+       host layout is column-stacked (textarea row 1, actions row 2).
+       Phone layout via grid:
+            [textarea ........................] [Send/Stop]
+            [+  /  Model  Mode]
+       display:contents on #composer-actions lets its children participate
+       in the parent grid without touching the HTML. */
+    body.phone-mode #composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-rows: auto auto auto;
+      grid-template-areas:
+        "atts  atts"
+        "input send"
+        "left  left";
+      gap: 6px;
+      padding: 8px 10px 10px;
+      align-items: end;
+    }
+    body.phone-mode #composer #attachments-row     { grid-area: atts; }
+    body.phone-mode #composer #attach-input        { grid-area: atts; }
+    body.phone-mode #composer textarea#input       { grid-area: input; }
+    body.phone-mode #composer #composer-actions    { display: contents; }
+    body.phone-mode #composer #composer-actions-left  { grid-area: left;
+                                                         height: 34px; }
+    body.phone-mode #composer #composer-actions-right { grid-area: send;
+                                                         align-self: end;
+                                                         height: 34px; }
+
+    /* Tighten layout on small screens. 16px is the iOS Safari magic
+       value that prevents auto-zoom on input focus. */
+    body.phone-mode #input,
+    body.phone-mode textarea,
+    body.phone-mode input[type="text"] {
+      font-size: 16px;
+    }
+
+    body.phone-mode #composer-wrap {
+      padding-top: 0;
+    }
+
   &lt;/style&gt;
   &lt;script&gt;
     // qrcode-generator vendored (v1.4.4) — see webview/vendor/qrcode-generator.js
@@ -4242,6 +4344,11 @@ var qrcode = function() {
   &lt;/script&gt;
 &lt;/head&gt;
 &lt;body&gt;
+  &lt;!-- Build version marker. Bumped by .0000001 on every source change so
+       smoke tests can verify which build is running. Starting from .1000001
+       on 2026-06-09. --&gt;
+  &lt;div id="app-version"&gt;.1000003&lt;/div&gt;
+
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
     &lt;button id="mobile-settings-toggle" class="header-mobile-only" aria-label="Open settings"&gt;&amp;#9776;&lt;/button&gt;
@@ -5123,6 +5230,25 @@ var qrcode = function() {
       // "we are remote" signal. MUST run BEFORE the mock-shim install below,
       // since that shim assigns fireFlexsimEvent and would falsify the check.
       var IS_REMOTE = typeof fireFlexsimEvent !== 'function';
+
+      // ---- phone-mode detection ----
+      // Phone-mode = stripped UI (transcript + compose + Stop, no settings,
+      // no model picker, no provider picker). It's applied:
+      //   1. Automatically when IS_REMOTE — any non-local-CEF client (phone,
+      //      browser tab) gets the stripped view; they have no business
+      //      configuring host settings anyway (server-side guards already
+      //      reject host-only envelopes from remote subscribers).
+      //   2. Explicitly when ?mode=phone is in the URL — lets us test phone-
+      //      mode in the FlexSim CEF panel too without standing up a remote
+      //      client.
+      // Done synchronously before first paint so display:none takes effect
+      // before host-only controls have a chance to render.
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        if (IS_REMOTE || params.get('mode') === 'phone') {
+          document.body.classList.add('phone-mode');
+        }
+      })();
 
       // On remote first load, the token comes in via URL fragment
       // (preferred — never reaches a server) or query string (fallback).
@@ -7004,9 +7130,10 @@ var qrcode = function() {
           // The heartbeat is already started unconditionally at viewer
           // init (see bottom of script). No-op here — kept the call so the
           // intent is visible: we never want the drain heartbeat to stop
-          // while the local viewer is alive, since the server can be
-          // running independently of any state_update arriving.
-          if (!IS_REMOTE) startRemoteHeartbeat();
+          // while the viewer is alive, since other subscribers can send
+          // broadcasts (user_message_broadcast etc.) at any time and we
+          // need to drain our queue to render them.
+          startRemoteHeartbeat();
         }
       }
 
@@ -7327,6 +7454,23 @@ var qrcode = function() {
           finishTurn();
         } else if (env.t === 'state_update') {
           if (env.p &amp;&amp; env.p.key) applyStateUpdate(env.p.key, env.p.value || {});
+        } else if (env.t === 'user_message_broadcast') {
+          // Another subscriber sent this message. Render it as a user bubble
+          // with an author label so every device sees who said what.
+          var ubp    = env.p || {};
+          var ubText = ubp.text   || '';
+          var ubAuth = ubp.author || 'Guest';
+          if (ubText) {
+            var ubEl = appendBubble('user', ubText);
+            // Inject the author label before the text content.
+            var ubContent = ubEl.querySelector('.bubble-content');
+            if (ubContent) {
+              var authSpan = document.createElement('span');
+              authSpan.className   = 'bubble-author';
+              authSpan.textContent = ubAuth + ':';
+              ubContent.insertBefore(authSpan, ubContent.firstChild);
+            }
+          }
         } else if (env.t === 'error') {
           appendBubble('error', (env.p &amp;&amp; env.p.message) || 'Unknown error');
           activeBubble = null;
@@ -8366,14 +8510,18 @@ var qrcode = function() {
       // Pre-fetch the session list so it's ready when the user flips to manual.
       refreshManualSessionList();
 
-      // Always-on slow heartbeat for the LOCAL viewer (never for IS_REMOTE,
-      // since /api/poll doesn't drain mainthread tasks). This guarantees
-      // ModelerAi_bridgePoll → mainthread::drainQueue runs at ≥1Hz so phone-
-      // initiated /api/send requests (which block on runAndWait) get serviced
-      // even when the local viewer's fast 50ms poll is idle between turns.
-      // Critical after a panel reload: state_update for remote_status is NOT
-      // replayed on reconnect, so we can't gate this on _remoteStatus.enabled.
-      if (!IS_REMOTE) startRemoteHeartbeat();
+      // Always-on slow heartbeat for ALL viewers (local CEF + remote phones).
+      // For the local viewer, this guarantees ModelerAi_bridgePoll →
+      // mainthread::drainQueue runs at ≥1Hz so phone-initiated /api/send
+      // requests (which block on runAndWait) get serviced even when the
+      // local fast 50ms poll is idle between turns.
+      // For remote phones, this is how they receive cross-subscriber
+      // broadcasts (user_message_broadcast, assistant streams from a turn
+      // started by someone else, etc.) when they're not in their own turn.
+      // Without this, phone queues accumulate envelopes that only get
+      // drained when the phone next sends — which is the bug we hit on
+      // 2026-06-09 where remote viewers only updated after their own prompt.
+      startRemoteHeartbeat();
     })();
   &lt;/script&gt;
 &lt;/body&gt;
@@ -8476,15 +8624,13 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_run_to_end</name><data>dll:"module:ModelerAI" func:"ModelerAi_runToEnd"</data></node>
       <node f="1000042" dt="2"><name>modelerai_run_until</name><data>dll:"module:ModelerAI" func:"ModelerAi_runUntil"</data></node>
       <node f="1000042" dt="2"><name>modelerai_run</name><data>dll:"module:ModelerAI" func:"ModelerAi_run"</data></node>
-      <node f="1000042" dt="2"><name>modelerai_wait_for_stop</name><data>dll:"module:ModelerAI" func:"ModelerAi_waitForStop"</data></node>
       <node f="1000042" dt="2"><name>modelerai_stop_model</name><data>dll:"module:ModelerAI" func:"ModelerAi_stopModel"</data></node>
       <node f="1000042" dt="2"><name>modelerai_step_model</name><data>dll:"module:ModelerAI" func:"ModelerAi_stepModel"</data></node>
       <node f="1000042" dt="2"><name>modelerai_get_run_state</name><data>dll:"module:ModelerAI" func:"ModelerAi_getRunState"</data></node>
       <node f="1000042" dt="2"><name>modelerai_add_stop_time</name><data>dll:"module:ModelerAI" func:"ModelerAi_addStopTime"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_remove_stop_time</name><data>dll:"module:ModelerAI" func:"ModelerAi_removeStopTime"</data></node>
       <node f="1000042" dt="2"><name>modelerai_set_warmup_time</name><data>dll:"module:ModelerAI" func:"ModelerAi_setWarmupTime"</data></node>
       <node f="1000042" dt="2"><name>modelerai_set_run_speed</name><data>dll:"module:ModelerAI" func:"ModelerAi_setRunSpeed"</data></node>
-      <node f="1000042" dt="2"><name>modelerai_install_run_hooks</name><data>dll:"module:ModelerAI" func:"ModelerAi_installRunHooks"</data></node>
-      <node f="1000042" dt="2"><name>modelerai_uninstall_run_hooks</name><data>dll:"module:ModelerAI" func:"ModelerAi_uninstallRunHooks"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_performance_measure</name><data>dll:"module:ModelerAI" func:"ModelerAi_createPerformanceMeasure"</data></node>
       <node f="1000042" dt="2"><name>modelerai_delete_performance_measure</name><data>dll:"module:ModelerAI" func:"ModelerAi_deletePerformanceMeasure"</data></node>
       <node f="1000042" dt="2"><name>modelerai_list_performance_measures</name><data>dll:"module:ModelerAI" func:"ModelerAi_listPerformanceMeasures"</data></node>

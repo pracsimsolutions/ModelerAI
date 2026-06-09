@@ -99,6 +99,14 @@ Three artifacts get produced from source. Each has its own pipeline:
 
 If the linker fails with `LNK1104 cannot open file 'ModelerAI.dll'`, FlexSim is running and holding the old DLL. Close FlexSim and rebuild.
 
+### Version marker — "did the change reach me?"
+
+The chat viewer renders a small build version (e.g. `.1000001`) in the top-right corner. It exists for one purpose: at a glance, confirm the running UI is the build you just made. If you edit `webview/index.html` and forget `node tools/embed.js`, or edit C++ and forget to rebuild + restart FlexSim, the corner number stays at the old value — you see immediately.
+
+**Rule:** every source change (C++, HTML, JS, CSS, FlexScript, anything that requires a rebuild or re-embed to take effect) bumps the version by `.0000001`. So `.1000001` → `.1000002` → `.1000003` etc. Bump in the same commit as the change.
+
+The version lives in `webview/index.html` (grep `app-version`). It's deliberately not nested inside `#tabbar` or `#pane-settings` so it stays visible in both host mode and `body.phone-mode`. Bumping it counts as an HTML change → run `node tools/embed.js` to push it into `ModelerAI.fsx` so the FlexSim local panel picks it up too.
+
 ## How information flows at runtime
 
 ```

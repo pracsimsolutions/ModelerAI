@@ -19,6 +19,12 @@ For *how the source is laid out and how to add new functionality without breakin
 
 If the linker fails with `LNK1104 cannot open file 'ModelerAI.dll'`, FlexSim is running and holding the old DLL. Close FlexSim and rebuild.
 
+## Version marker — bump on every change
+
+The chat viewer renders a tiny build version (e.g. `.1000001`) in the top-right corner. It's a "did the change reach me?" diagnostic — if you edit `webview/index.html` and forget `node tools/embed.js`, or edit C++ and don't rebuild + restart FlexSim, the number in the corner stays the same and you know immediately.
+
+**Bump the version by `.0000001` in the same commit as your change.** So `.1000001` → `.1000002` → `.1000003`. Applies to any source edit that requires a rebuild or re-embed to take effect (C++, HTML, JS, CSS, FlexScript inside the .fsx). Grep `webview/index.html` for `app-version` to find the element, edit the literal, run `node tools/embed.js`. See [`AGENTS.md`](AGENTS.md#version-marker--did-the-change-reach-me) for more detail.
+
 ## Code style
 
 - **Conventional commits.** Subjects like `feat(viewer): add X`, `fix(remote): Y`, `docs: Z`, `diag: …`. The history at `git log --oneline` shows the established pattern — match it.

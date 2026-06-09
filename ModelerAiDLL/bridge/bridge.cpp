@@ -104,6 +104,22 @@ provider::EffortLevel effortFromStr(const std::string& s)
     return provider::EffortLevel::Off;
 }
 
+// Author label for the shared-chat user_message_broadcast envelope.
+// Local CEF (kLocalFlexsimSubscriberId) is "Host". Remote subscribers
+// get a short readable label derived from their subscriber id so
+// participants can tell who said what without a real display-name
+// system (deferred to v2).
+std::string deriveAuthor(std::string_view sid)
+{
+    if (sid == kLocalFlexsimSubscriberId) return "Host";
+    // Take the first 6 chars of the sid. Subscriber ids are random 24-char
+    // base64 strings, so 6 chars is enough entropy for human disambiguation
+    // in a typical 1-10 guest demo while staying readable.
+    std::string s(sid);
+    if (s.size() > 6) s.resize(6);
+    return "Guest-" + s;
+}
+
 // Push the user's persisted settings into runtime state (Agent + active
 // provider). Called on viewer_ready and after any set_setting so the
 // running session always matches the saved EffectiveSettings.
@@ -774,6 +790,35 @@ std::string handleEnvelope(std::string_view envelopeJson,
         }
         a->startTurn(turnId, std::move(text), std::move(condensed), std::move(attachments));
         consolePrint("[ModelerAI] startTurn dispatched\n");
+
+        // Broadcast the user message to all OTHER subscribers so they see what
+        // was just sent (shared-chat fan-out). The originator already shows
+        // the message locally when they pressed Send.
+        {
+            // text was std::move'd into startTurn. Re-read from the original
+            // env payload: env and p are both still valid here (not moved).
+            const auto& pRef = env["p"];
+            std::string origText;
+            if (pRef.contains("text") && pRef["text"].is_string())
+                origText = pRef["text"].get<std::string>();
+
+            nlohmann::json echoP;
+            echoP["text"]   = origText;
+            echoP["author"] = deriveAuthor(requesting_sid);
+
+            nlohmann::json echoEnv;
+            echoEnv["t"]  = "user_message_broadcast";
+            echoEnv["id"] = turnId;
+            echoEnv["p"]  = std::move(echoP);
+            std::string echoStr = echoEnv.dump();
+
+            auto subs = snapshotSubscribers();
+            for (const auto& s : subs) {
+                if (s.id == std::string(requesting_sid)) continue;  // skip originator
+                enqueueTo(s.id, echoStr);
+            }
+        }
+
         return "ok";
     }
 

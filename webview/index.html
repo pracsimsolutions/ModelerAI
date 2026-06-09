@@ -696,6 +696,34 @@
       color: var(--accent-fg);
       align-self: flex-end;
     }
+    /* Fixed top-right build version marker. Bumped by .0000001 on every
+       source change so smoke tests can verify "am I running the new code?"
+       at a glance. Visible in both host and phone mode (not nested in
+       #tabbar or #pane-settings). */
+    #app-version {
+      position: fixed;
+      top: 4px;
+      right: 8px;
+      z-index: 9999;
+      font: 10px/1 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      color: var(--text-muted);
+      opacity: 0.6;
+      pointer-events: none;     /* clicks pass through to underlying UI */
+      user-select: text;        /* but the version can still be copied */
+      letter-spacing: 0.3px;
+    }
+
+    /* Author attribution for shared-chat user_message_broadcast bubbles.
+       Sits above the message text; smaller + translucent so it doesn't
+       compete with the message content. */
+    .bubble-author {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      opacity: 0.65;
+      margin-bottom: 3px;
+    }
     .bubble-assistant {
       background: var(--bg-elevated);
       border: 1px solid var(--border);
@@ -1893,16 +1921,39 @@
       display: none !important;
     }
 
-    /* Hide the composer toolbar-left strip:
-       - #attach-btn  (attachment / image upload)
-       - #slash-btn   (slash command shortcut button)
-       - #model-btn   (model picker pill)
-       - #mode-btn    (Ask / Plan / Apply mode switch)
-       Hiding the container is safe because #composer-actions-right
-       (Send + Stop) is a sibling, not a child, and stays visible. */
-    body.phone-mode #composer-actions-left {
-      display: none !important;
+    /* Composer-actions-left (attach / slash / model / mode picker buttons)
+       stays VISIBLE on phones — Josh wants the same chat affordances as
+       the host UI. Only Settings (full pane) is host-only. */
+
+    /* Restructure the composer for phone mode so Send (the enter button)
+       sits to the SIDE of the textarea instead of below it. Default
+       host layout is column-stacked (textarea row 1, actions row 2).
+       Phone layout via grid:
+            [textarea ........................] [Send/Stop]
+            [+  /  Model  Mode]
+       display:contents on #composer-actions lets its children participate
+       in the parent grid without touching the HTML. */
+    body.phone-mode #composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-rows: auto auto auto;
+      grid-template-areas:
+        "atts  atts"
+        "input send"
+        "left  left";
+      gap: 6px;
+      padding: 8px 10px 10px;
+      align-items: end;
     }
+    body.phone-mode #composer #attachments-row     { grid-area: atts; }
+    body.phone-mode #composer #attach-input        { grid-area: atts; }
+    body.phone-mode #composer textarea#input       { grid-area: input; }
+    body.phone-mode #composer #composer-actions    { display: contents; }
+    body.phone-mode #composer #composer-actions-left  { grid-area: left;
+                                                         height: 34px; }
+    body.phone-mode #composer #composer-actions-right { grid-area: send;
+                                                         align-self: end;
+                                                         height: 34px; }
 
     /* Tighten layout on small screens. 16px is the iOS Safari magic
        value that prevents auto-zoom on input focus. */
@@ -4222,6 +4273,11 @@ var qrcode = function() {
   </script>
 </head>
 <body>
+  <!-- Build version marker. Bumped by .0000001 on every source change so
+       smoke tests can verify which build is running. Starting from .1000001
+       on 2026-06-09. -->
+  <div id="app-version">.1000003</div>
+
   <!-- tabs -->
   <div id="tabbar">
     <button id="mobile-settings-toggle" class="header-mobile-only" aria-label="Open settings">&#9776;</button>
@@ -5105,14 +5161,20 @@ var qrcode = function() {
       var IS_REMOTE = typeof fireFlexsimEvent !== 'function';
 
       // ---- phone-mode detection ----
-      // ?mode=phone is how Cloudflare Tunnel serves the UI to remote phone
-      // clients (Task 1.9). Adding the class here — synchronously, before any
-      // other init — means the CSS display:none rules take effect before the
-      // first paint, so host-only controls never flash then disappear.
-      // body already exists because this <script> is at end of <body>.
+      // Phone-mode = stripped UI (transcript + compose + Stop, no settings,
+      // no model picker, no provider picker). It's applied:
+      //   1. Automatically when IS_REMOTE — any non-local-CEF client (phone,
+      //      browser tab) gets the stripped view; they have no business
+      //      configuring host settings anyway (server-side guards already
+      //      reject host-only envelopes from remote subscribers).
+      //   2. Explicitly when ?mode=phone is in the URL — lets us test phone-
+      //      mode in the FlexSim CEF panel too without standing up a remote
+      //      client.
+      // Done synchronously before first paint so display:none takes effect
+      // before host-only controls have a chance to render.
       (function () {
         var params = new URLSearchParams(window.location.search);
-        if (params.get('mode') === 'phone') {
+        if (IS_REMOTE || params.get('mode') === 'phone') {
           document.body.classList.add('phone-mode');
         }
       })();
@@ -6997,9 +7059,10 @@ var qrcode = function() {
           // The heartbeat is already started unconditionally at viewer
           // init (see bottom of script). No-op here — kept the call so the
           // intent is visible: we never want the drain heartbeat to stop
-          // while the local viewer is alive, since the server can be
-          // running independently of any state_update arriving.
-          if (!IS_REMOTE) startRemoteHeartbeat();
+          // while the viewer is alive, since other subscribers can send
+          // broadcasts (user_message_broadcast etc.) at any time and we
+          // need to drain our queue to render them.
+          startRemoteHeartbeat();
         }
       }
 
@@ -7320,6 +7383,23 @@ var qrcode = function() {
           finishTurn();
         } else if (env.t === 'state_update') {
           if (env.p && env.p.key) applyStateUpdate(env.p.key, env.p.value || {});
+        } else if (env.t === 'user_message_broadcast') {
+          // Another subscriber sent this message. Render it as a user bubble
+          // with an author label so every device sees who said what.
+          var ubp    = env.p || {};
+          var ubText = ubp.text   || '';
+          var ubAuth = ubp.author || 'Guest';
+          if (ubText) {
+            var ubEl = appendBubble('user', ubText);
+            // Inject the author label before the text content.
+            var ubContent = ubEl.querySelector('.bubble-content');
+            if (ubContent) {
+              var authSpan = document.createElement('span');
+              authSpan.className   = 'bubble-author';
+              authSpan.textContent = ubAuth + ':';
+              ubContent.insertBefore(authSpan, ubContent.firstChild);
+            }
+          }
         } else if (env.t === 'error') {
           appendBubble('error', (env.p && env.p.message) || 'Unknown error');
           activeBubble = null;
@@ -8359,14 +8439,18 @@ var qrcode = function() {
       // Pre-fetch the session list so it's ready when the user flips to manual.
       refreshManualSessionList();
 
-      // Always-on slow heartbeat for the LOCAL viewer (never for IS_REMOTE,
-      // since /api/poll doesn't drain mainthread tasks). This guarantees
-      // ModelerAi_bridgePoll → mainthread::drainQueue runs at ≥1Hz so phone-
-      // initiated /api/send requests (which block on runAndWait) get serviced
-      // even when the local viewer's fast 50ms poll is idle between turns.
-      // Critical after a panel reload: state_update for remote_status is NOT
-      // replayed on reconnect, so we can't gate this on _remoteStatus.enabled.
-      if (!IS_REMOTE) startRemoteHeartbeat();
+      // Always-on slow heartbeat for ALL viewers (local CEF + remote phones).
+      // For the local viewer, this guarantees ModelerAi_bridgePoll →
+      // mainthread::drainQueue runs at ≥1Hz so phone-initiated /api/send
+      // requests (which block on runAndWait) get serviced even when the
+      // local fast 50ms poll is idle between turns.
+      // For remote phones, this is how they receive cross-subscriber
+      // broadcasts (user_message_broadcast, assistant streams from a turn
+      // started by someone else, etc.) when they're not in their own turn.
+      // Without this, phone queues accumulate envelopes that only get
+      // drained when the phone next sends — which is the bug we hit on
+      // 2026-06-09 where remote viewers only updated after their own prompt.
+      startRemoteHeartbeat();
     })();
   </script>
 </body>

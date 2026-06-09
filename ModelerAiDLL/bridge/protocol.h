@@ -60,6 +60,7 @@ enum class BridgeMsgType {
     ExportConversation,      // p: {} — write current in-memory conversation to a Markdown file under %APPDATA%/PRACSIM/ModelerAI/exports/; DLL replies via state_update { key: "conversation_export", value: { path, ok, ... } }
 
     // ---- DLL → JS ----
+    UserMessageBroadcast, // p: { text: string, author: string }  — fan-out to all-except-originator
     AssistantChunk,     // p: { turn_id: string, text: string }
     AssistantDone,      // p: { turn_id: string, message_id: string }
     ToolCallStart,      // p: { turn_id: string, call_id: string, name: string, args_summary: string }

@@ -39,6 +39,7 @@ constexpr NameEntry kNames[] = {
     { BridgeMsgType::ResetSettings,           "reset_settings"            },
     { BridgeMsgType::ExportConversation,      "export_conversation"       },
     // DLL -> JS
+    { BridgeMsgType::UserMessageBroadcast, "user_message_broadcast" },
     { BridgeMsgType::AssistantChunk,  "assistant_chunk"   },
     { BridgeMsgType::AssistantDone,   "assistant_done"    },
     { BridgeMsgType::ToolCallStart,   "tool_call_start"   },
