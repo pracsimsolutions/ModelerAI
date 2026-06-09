@@ -21,6 +21,61 @@ namespace {
 constexpr const char* kDefaultModel = "gemini-2.5-flash";
 constexpr const char* kBaseUrl      = "https://generativelanguage.googleapis.com/v1beta";
 
+// Gemini's function-declaration parameters schema is an OpenAPI 3.0
+// SUBSET, not full JSON Schema. Adapters that ship JSON-Schema-shaped
+// tool params (which is what Anthropic / OpenAI accept) need to strip
+// fields Gemini doesn't recognize and normalize a few it parses
+// differently. Without this we get HTTP 400 INVALID_ARGUMENT with
+// messages like:
+//   Unknown name "additionalProperties" at 'tools[0].function_declarations[N].parameters'
+//   Unknown name "type" ... 'any_of[N].items': Proto field is not repeating
+// Recursive walk; modifies in place.
+void sanitizeSchemaForGemini(nlohmann::json& node)
+{
+    if (node.is_object()) {
+        // JSON-Schema keywords Gemini rejects outright. additionalProperties
+        // is the most common offender; the rest are defensive.
+        static const char* kStrip[] = {
+            "additionalProperties",
+            "$schema", "$id", "$ref", "$comment", "$defs",
+            "definitions", "patternProperties",
+            "examples", "default",
+            "unevaluatedProperties", "unevaluatedItems",
+            nullptr
+        };
+        for (const char** k = kStrip; *k; ++k) node.erase(*k);
+
+        // Normalize "type": [list] to a single type. OpenAPI 3.0 doesn't
+        // allow type arrays; if "null" was in the list, promote to
+        // nullable:true (which Gemini accepts).
+        if (node.contains("type") && node["type"].is_array()) {
+            std::string primary;
+            bool nullable = false;
+            for (const auto& t : node["type"]) {
+                if (!t.is_string()) continue;
+                std::string ts = t.get<std::string>();
+                if (ts == "null") nullable = true;
+                else if (primary.empty()) primary = ts;
+            }
+            if (!primary.empty()) {
+                node["type"] = primary;
+                if (nullable) node["nullable"] = true;
+            } else {
+                node.erase("type");
+            }
+        }
+
+        // Recurse into remaining children. We only ever erased keys
+        // above; the iteration below doesn't add/remove keys, only
+        // mutates values, so it's safe.
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            sanitizeSchemaForGemini(it.value());
+        }
+    } else if (node.is_array()) {
+        for (auto& el : node) sanitizeSchemaForGemini(el);
+    }
+}
+
 // Gemini-side thinking budget. 0 = thinking off. Matches the Anthropic
 // mapping in spirit: Low/Medium/High get the same token budgets so the
 // user's effort slider behaves the same way across providers.
@@ -180,20 +235,11 @@ std::vector<ModelInfo> Gemini::models() const
 {
     // Pricing snapshot as of 2026-05-27. Re-verify against
     // ai.google.dev/pricing before relying on cost numbers for billing.
+    //
+    // gemini-2.0-flash dropped 2026-06-09 — Google now returns
+    // 404 "This model models/gemini-2.0-flash is no longer available."
+    // for generateContent calls. 2.5 Flash supersedes it.
     return {
-        ModelInfo{
-            /*id*/                       "gemini-2.0-flash",
-            /*display_name*/             "Gemini 2.0 Flash",
-            /*context_tokens*/           1000000,
-            /*supports_tools*/           true,
-            /*supports_vision*/          true,
-            /*supports_thinking*/        false,
-            /*accepts_temperature*/      true,
-            /*input_usd_per_mtok*/       0.10,
-            /*output_usd_per_mtok*/      0.40,
-            /*cache_write_usd_per_mtok*/ 0.00,
-            /*cache_read_usd_per_mtok*/  0.025,
-        },
         ModelInfo{
             /*id*/                       "gemini-2.5-flash",
             /*display_name*/             "Gemini 2.5 Flash",
@@ -277,11 +323,14 @@ TestKeyResult Gemini::test_key()
         return r;
     }
 
-    // 1-token call against the cheapest model.
-    std::string url = std::string(kBaseUrl) + "/models/gemini-2.0-flash:generateContent";
-    std::vector<HttpHeader> headers = {
-        {"x-goog-api-key", apiKey},
-    };
+    // 1-token validation call against the cheapest currently-supported
+    // model. Uses ?key=<api-key> query-param auth (Google's most-documented
+    // method) instead of the x-goog-api-key header — the header path was
+    // returning 404 on the generateContent endpoint in WinHTTP on some
+    // Windows builds, and the query-param path works uniformly. The same
+    // approach is used by their official cURL / JS examples.
+    std::string url = std::string(kBaseUrl) + "/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+    std::vector<HttpHeader> headers = {};
 
     nlohmann::json req;
     req["contents"] = nlohmann::json::array({
@@ -350,10 +399,13 @@ void Gemini::stream_turn(
         return;
     }
 
+    // Use ?key=<api-key> query-param auth instead of the x-goog-api-key
+    // header — matches what test_key() does (the header path 404s/400s
+    // on some WinHTTP+endpoint combos). Append &key= to the existing
+    // ?alt=sse query so the URL stays well-formed.
     std::string url = std::string(kBaseUrl) + "/models/" + modelId
-                    + ":streamGenerateContent?alt=sse";
+                    + ":streamGenerateContent?alt=sse&key=" + apiKey;
     std::vector<HttpHeader> headers = {
-        {"x-goog-api-key", apiKey},
         {"accept",         "text/event-stream"},
     };
 
@@ -397,6 +449,8 @@ void Gemini::stream_turn(
                                       + "' has invalid params_schema_json; using empty\n"));
                 decl["parameters"] = {{"type","object"},{"properties", nlohmann::json::object()}};
             }
+            // Strip JSON-Schema-isms Gemini doesn't understand.
+            sanitizeSchemaForGemini(decl["parameters"]);
             decls.push_back(std::move(decl));
         }
         req["tools"] = nlohmann::json::array({{{"functionDeclarations", std::move(decls)}}});
@@ -406,13 +460,18 @@ void Gemini::stream_turn(
     nlohmann::json genConfig;
     genConfig["maxOutputTokens"] = defaultMaxOutputTokens(modelId);
     int budget = thinkingBudgetTokens(effortLevel);
+    // Some Gemini models REQUIRE thinking (gemini-2.5-pro returns
+    // 400 "Budget 0 is invalid. This model only works in thinking
+    // mode." when budget==0). For those, use -1 (dynamic / let the
+    // model decide) when the user hasn't opted in to a specific
+    // budget. Others (Flash) accept 0 to fully disable thinking.
+    bool requiresThinking = (modelId == "gemini-2.5-pro");
     if (budget > 0 && modelInfo.supports_thinking) {
         genConfig["thinkingConfig"] = {{"thinkingBudget", budget}};
         bridge::consolePrint(("[ModelerAI] Gemini thinking budget=" + std::to_string(budget) + "\n"));
     } else if (modelInfo.supports_thinking) {
-        // Explicitly disable thinking on 2.5 models when the user hasn't
-        // opted in — saves output tokens vs. Gemini's dynamic default.
-        genConfig["thinkingConfig"] = {{"thinkingBudget", 0}};
+        int b = requiresThinking ? -1 : 0;  // -1 = dynamic thinking
+        genConfig["thinkingConfig"] = {{"thinkingBudget", b}};
     }
     req["generationConfig"] = std::move(genConfig);
 
@@ -481,7 +540,14 @@ void Gemini::stream_turn(
     });
 
     bridge::consolePrint(("[ModelerAI] POST " + url + " (streaming)\n"));
+    // Capture the raw response body alongside the SSE parser. On error
+    // (4xx/5xx) Google returns plain JSON, not SSE, so the parser sees
+    // nothing useful — but we need that JSON to tell the user what went
+    // wrong (e.g. tool schema mismatch, invalid model id, etc.).
+    std::string rawBody;
+    rawBody.reserve(2048);
     int status = streamPostUrl(url, headers, body, [&](std::string_view chunk) {
+        rawBody.append(chunk.data(), chunk.size());
         parser.feed(chunk);
     }, cancel);
     parser.flush();
@@ -505,11 +571,19 @@ void Gemini::stream_turn(
             } else if (status == 429) {
                 msg = "Gemini is rate-limiting requests. Wait a minute and try again.";
             } else if (status == 400) {
-                msg = "Gemini returned HTTP 400 — usually means a malformed request "
-                      "(check tool schema or model id).";
+                // Surface Google's actual error JSON so the cause is
+                // visible (tool schema mismatch, invalid model id, etc.).
+                std::string detail = rawBody;
+                if (detail.size() > 800) detail = detail.substr(0, 800) + "…";
+                msg = "Gemini returned HTTP 400. Response:\n" + detail;
             } else {
-                msg = "Gemini returned HTTP " + std::to_string(status);
+                std::string detail = rawBody;
+                if (detail.size() > 800) detail = detail.substr(0, 800) + "…";
+                msg = "Gemini returned HTTP " + std::to_string(status)
+                    + (detail.empty() ? "" : ".\nResponse:\n" + detail);
             }
+            bridge::consolePrint("[Gemini] HTTP " + std::to_string(status)
+                                 + " body: " + rawBody + "\n");
             onError(ProviderError{ "http_" + std::to_string(status), msg, status == 429 || status >= 500 });
         }
         return;
