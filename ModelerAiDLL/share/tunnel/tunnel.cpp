@@ -143,14 +143,59 @@ StartResult start(Mode mode, int localPort)
         return r;
     }
 
+    // I3 — Resolve cloudflared.exe to an absolute path before spawning.
+    // Using nullptr as lpApplicationName with a bare "cloudflared" in the
+    // cmdline lets Windows search PATH, which includes user-writable dirs
+    // (current dir, user-local bin). Resolving once via SearchPathW gives
+    // the user an auditable log line and prevents PATH-shadow attacks.
+    auto resolveCloudflared = []() -> std::wstring {
+        wchar_t buf[MAX_PATH] = {0};
+        DWORD n = SearchPathW(nullptr, L"cloudflared", L".exe",
+                               MAX_PATH, buf, nullptr);
+        if (n == 0 || n >= MAX_PATH) return L"";
+        return std::wstring(buf, n);
+    };
+    std::wstring cfExe = resolveCloudflared();
+    if (cfExe.empty()) {
+        r.error_message = "cloudflared_not_found: install via "
+                          "`winget install Cloudflare.cloudflared` then restart FlexSim";
+        return r;
+    }
+    // Log the resolved path so the user can audit it.
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, cfExe.c_str(), -1,
+                                     nullptr, 0, nullptr, nullptr);
+        std::string narrow(n - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, cfExe.c_str(), -1,
+                            narrow.data(), n, nullptr, nullptr);
+        diag::info("[tunnel] spawning cloudflared from: " + narrow);
+    }
+
+    // I2 — Token validation. Reject tokens containing characters outside
+    // [A-Za-z0-9+/=._-] to prevent CLI-flag injection in Named mode.
+    auto isValidToken = [](const std::string& t) {
+        if (t.empty()) return false;
+        for (char c : t) {
+            bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                   || (c >= '0' && c <= '9') || c == '+' || c == '/'
+                   || c == '=' || c == '.' || c == '_' || c == '-';
+            if (!ok) return false;
+        }
+        return true;
+    };
+
     // Build command line per mode.
+    // I2 — Named mode: token is NOT placed on the cmdline; it is passed via
+    // TUNNEL_TOKEN env var in the child's environment block instead.
     std::wstring cmdline;
+    std::string tok;  // Named mode token (narrow); empty for Quick
     if (mode == Mode::Quick) {
-        cmdline = L"cloudflared tunnel --url http://127.0.0.1:"
+        // I3 — Use quoted absolute path as the executable prefix.
+        cmdline = L"\"" + cfExe + L"\" tunnel --url http://127.0.0.1:"
                  + std::to_wstring(localPort)
                  + L" --no-autoupdate";
     } else if (mode == Mode::Named) {
-        auto tok = readCfTunnelTokenFromEnvFile();
+        tok = readCfTunnelTokenFromEnvFile();
         if (tok.empty()) {
             // Also check environment (allows users to set externally).
             char buf[2048];
@@ -161,12 +206,40 @@ StartResult start(Mode mode, int localPort)
             r.error_message = "missing_cf_tunnel_token";
             return r;
         }
-        std::wstring wtok(tok.begin(), tok.end());
-        cmdline = L"cloudflared tunnel run --token " + wtok
-                 + L" --no-autoupdate";
+        if (!isValidToken(tok)) {
+            r.error_message = "invalid_cf_tunnel_token: contains unexpected characters";
+            return r;
+        }
+        // I2 — Token on cmdline removed; passed via TUNNEL_TOKEN env var below.
+        // I3 — Use quoted absolute path as the executable prefix.
+        cmdline = L"\"" + cfExe + L"\" tunnel run --no-autoupdate";
     } else {
         r.error_message = "mode_none";
         return r;
+    }
+
+    // I2 — Build a child environment block: parent env + TUNNEL_TOKEN for
+    // Named mode. This avoids placing the token in the cmdline where it
+    // would be visible in process listings and could be CLI-injected.
+    std::wstring envBlock;
+    {
+        LPWCH parentEnv = GetEnvironmentStringsW();
+        if (parentEnv) {
+            LPWCH p = parentEnv;
+            while (*p) {
+                std::wstring var(p);
+                envBlock += var;
+                envBlock.push_back(L'\0');
+                p += var.size() + 1;
+            }
+            FreeEnvironmentStringsW(parentEnv);
+        }
+        if (mode == Mode::Named && !tok.empty()) {
+            std::wstring wtok(tok.begin(), tok.end());
+            envBlock += L"TUNNEL_TOKEN=" + wtok;
+            envBlock.push_back(L'\0');
+        }
+        envBlock.push_back(L'\0');  // double-null terminator
     }
 
     // Build the Job Object FIRST so the child enters it atomically.
@@ -195,15 +268,20 @@ StartResult start(Mode mode, int localPort)
     std::vector<wchar_t> cmd(cmdline.begin(), cmdline.end());
     cmd.push_back(L'\0');
 
+    // I3 — Pass cfExe.c_str() as lpApplicationName (absolute path) to
+    // eliminate the current-directory and PATH-shadow attack vectors.
+    // I2 — Pass CREATE_UNICODE_ENVIRONMENT and the custom env block so
+    // TUNNEL_TOKEN reaches the child without appearing on the cmdline.
     // CREATE_NEW_PROCESS_GROUP so we can later send Ctrl-Break to the
     // tree without affecting our own process.
     BOOL ok = CreateProcessW(
-        nullptr,
-        cmd.data(),
+        cfExe.c_str(),       // lpApplicationName — absolute resolved path (I3)
+        cmd.data(),          // lpCommandLine — still needed for args
         nullptr, nullptr,
         TRUE,
-        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-        nullptr, nullptr,
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        envBlock.data(),     // lpEnvironment — parent env + TUNNEL_TOKEN (I2)
+        nullptr,
         &si, &g_pi);
 
     CloseHandle(stderrWrite);   // we keep the read end

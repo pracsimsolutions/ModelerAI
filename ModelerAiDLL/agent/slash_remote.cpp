@@ -239,12 +239,13 @@ void handleRotate(const std::string& turnId)
             "Remote server isn't running — nothing to rotate.", false);
         return;
     }
-    auto newToken = remote::generateToken();
-    remote::stop();
-    auto r = remote::start(/*port*/12350, newToken, /*bind*/"");
-    if (!r.ok) {
+    // C3 — Use rotateToken() which preserves the existing port and bind IP.
+    // The old code passed port=12350 and bind="" (defaulting to 0.0.0.0),
+    // which broke the loopback-only invariant when running in tunneled mode.
+    auto newToken = remote::rotateToken();
+    if (newToken.empty()) {
         pushSystemBubble(turnId,
-            "Token rotation failed: " + r.error_message + ".", false);
+            "Token rotation failed.", false);
         return;
     }
     pushSystemBubble(turnId,

@@ -64,10 +64,17 @@ std::string extractToken(const httplib::Request& req)
 // world, so req.remote_addr is always 127.0.0.1 in tunnel mode. The
 // real client IP rides in CF-Connecting-IP. Falls back to remote_addr
 // for LAN/direct mode.
+//
+// I1 — Trust CF-Connecting-IP only when the tunnel is actually running
+// and the server is bound to loopback. In direct LAN mode any client can
+// set this header arbitrarily to spoof their IP and bypass per-IP rate
+// limiting.
 std::string clientIp(const httplib::Request& req)
 {
-    auto cf = req.get_header_value("CF-Connecting-IP");
-    if (!cf.empty()) return cf;
+    if (tunnel::isRunning() && g_bindIp == "127.0.0.1") {
+        auto cf = req.get_header_value("CF-Connecting-IP");
+        if (!cf.empty()) return cf;
+    }
     return req.remote_addr;
 }
 
@@ -119,11 +126,22 @@ std::string readCookie(const httplib::Request& req, const std::string& name)
 //
 // Empty string means "no identity provided"; the route handler decides
 // whether to issue a fresh one.
+//
+// C1 — Reject the well-known local-flexsim subscriber id from HTTP
+// clients. It is a reserved identity; allowing a remote client to claim
+// it would let them bypass the host-only envelope guard in
+// bridge::handleEnvelope. Return empty so the route handler issues a
+// fresh remote-XXXX id instead.
 std::string resolveSid(const httplib::Request& req)
 {
     auto hdr = req.get_header_value("X-Mraisid");
+    auto cookie = readCookie(req, "mraisid");
+    if (hdr == bridge::kLocalFlexsimSubscriberId
+        || cookie == bridge::kLocalFlexsimSubscriberId) {
+        return "";  // reserved — caller will issue a fresh remote-XXXX sid
+    }
     if (!hdr.empty()) return hdr;
-    return readCookie(req, "mraisid");
+    return cookie;
 }
 
 struct RateState {

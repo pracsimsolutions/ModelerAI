@@ -711,7 +711,12 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
     .mode-btn:disabled:hover { color: var(--text-muted); }
 
     #messages {
-      flex: 1; overflow-y: auto; padding: 16px;
+      /* `overflow-y: scroll` (not `auto`) so the scrollbar gutter is
+         always reserved — gives a visible affordance that there's
+         history to scroll through even when the messages currently
+         fit. The custom *::-webkit-scrollbar styling above paints it
+         to match the theme. */
+      flex: 1; overflow-y: scroll; padding: 16px;
       display: flex; flex-direction: column; gap: 10px;
     }
     .bubble {
@@ -4347,7 +4352,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000016&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000018&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;

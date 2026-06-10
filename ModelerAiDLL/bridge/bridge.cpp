@@ -732,6 +732,16 @@ std::string handleEnvelope(std::string_view envelopeJson,
         "delete_session",
         "delete_all_sessions",
         "export_conversation",
+        // C2 additions — privilege-escalation / DoS / budget-burn vectors.
+        // Verified present in protocol.cpp kNames:
+        "tool_approval_response",    // remote guest approves tool call → effective RCE
+        "ask_user_question_response",// same interaction-broker threat surface
+        "cancel_turn",               // guest DoS: cancels host's in-flight turn
+        "load_history",              // history disclosure / session reload
+        "list_sessions",             // enumerates persisted sessions
+        "mode_change",               // guest swaps Ask/Plan/Apply mid-conversation
+        "effort_change",             // guest spikes effort → burns host API budget
+        "test_provider",             // guest burns host API quota via test calls
     };
     if (requesting_sid != kLocalFlexsimSubscriberId
         && kHostOnlyTypes.count(typeName)) {

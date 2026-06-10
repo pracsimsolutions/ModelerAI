@@ -105,6 +105,10 @@ void adoptRemoteSubscriber(const std::string& id,
                             const std::string& client_ip,
                             const std::string& user_agent)
 {
+    // C1 — Defense-in-depth: refuse the reserved local id even if
+    // resolveSid() is the only caller today. Prevents any future caller
+    // from accidentally privileging a remote client with the host identity.
+    if (id == kLocalFlexsimSubscriberId) return;
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_subs.count(id)) return;     // already known — no-op
     Subscriber s;
