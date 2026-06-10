@@ -87,6 +87,16 @@ In the chat input:
 
 Scan the QR code with a device on the same Wi-Fi. Same chat surface opens there; desktop and mobile stay in sync. `/remote off` to stop, `/remote diag` to inspect. Plain HTTP on LAN — fine on home/office Wi-Fi, **not** appropriate for hostile or guest networks. Don't expose to the public internet.
 
+### Share a demo
+
+```
+/remote tunnel on
+```
+
+Exposes your live chat session to phones over Cloudflare Tunnel — no router config, works across networks. A random `*.trycloudflare.com` URL is issued for the session and dies when you type `/remote tunnel off`. For a stable named URL (Mode B), see [`share/README.md`](share/README.md).
+
+See [`share/README.md`](share/README.md) for the full setup walkthrough, Mode A vs Mode B, security model, and troubleshooting.
+
 ---
 
 ## Slash commands

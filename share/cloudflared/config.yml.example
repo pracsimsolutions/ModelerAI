@@ -1,0 +1,16 @@
+# Mode B (Named Cloudflare Tunnel) hostname config.
+#
+# Steps:
+#   1. In the Cloudflare dashboard, edit your tunnel and add a
+#      Public Hostname pointing at http://127.0.0.1:12350.
+#   2. cp share/cloudflared/config.yml.example share/cloudflared/config.yml
+#   3. Replace the hostname below with the one you configured.
+#
+# share/cloudflared/config.yml is gitignored (see .gitignore).
+# Quick-tunnel mode does NOT use this file.
+
+hostname: demo.your-domain.com
+
+# cloudflared itself reads this from where you launched it — ModelerAI
+# only uses the hostname line above to populate the QR display.
+service: http://127.0.0.1:12350

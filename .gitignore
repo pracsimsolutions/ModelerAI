@@ -27,6 +27,16 @@ Reference Nodes/
 .env
 .env.*
 *.env
+# But DO commit the *.env.example template files — they're shipped
+# for documentation. Any real `.env` stays caught by the rules above.
+!*.env.example
+!share/.env.example
+
+# Mode B (named Cloudflare Tunnel) user config — never committed.
+# share/.env is already caught by the *.env wildcard above; these
+# two lines add hostname + log paths under share/cloudflared/.
+share/cloudflared/config.yml
+share/cloudflared/*.log
 secrets.json
 secrets.yaml
 secrets.yml

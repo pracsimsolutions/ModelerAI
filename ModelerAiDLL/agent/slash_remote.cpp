@@ -314,49 +314,73 @@ bool dispatchRemote(Agent* /*agent*/,
     else if (sub == "diag")   { handleDiag(turnId); return true; }
     else if (sub == "trace")  { handleTrace(turnId, rest); return true; }
     else if (sub == "tunnel") {
-        // Parse second token: "on" | "off"
-        std::string sub2;
+        // `/remote tunnel` is a toggle: off → start (Quick by default),
+        // on → stop. Mode can be selected explicitly via
+        // `/remote tunnel mode=named` — if a tunnel is already running
+        // when a mode is specified, we stop+restart with the new mode.
         std::string rest2(rest);
         while (!rest2.empty() && rest2.front() == ' ') rest2.erase(0, 1);
-        auto sp2 = rest2.find(' ');
-        sub2 = (sp2 == std::string::npos) ? rest2 : rest2.substr(0, sp2);
 
-        if (sub2 == "on") {
-            if (remote::isRunning()) {
-                pushSystemBubble(turnId,
-                    "Remote server already running. Use `/remote off` or "
-                    "`/remote tunnel off` first.", false);
-                pushRemoteStatus(turnId);
-                return true;
-            }
-            // Mode A (quick tunnel) — no config required. Named mode lands
-            // in Task 2.5 with mode=named arg.
-            auto r = remote::startTunneled(tunnel::Mode::Quick);
-            if (!r.ok) {
-                pushSystemBubble(turnId,
-                    "Tunnel start failed: " + r.error_message + ".", false);
-                return true;
-            }
-            pushSystemBubble(turnId,
-                "Cloudflare Tunnel active. Scan the QR or visit the URL on "
-                "any device — works across networks. Use `/remote tunnel off` "
-                "to stop.", true);
-            pushRemoteStatus(turnId);
-            return true;
+        // Detect explicit mode= arg (overrides toggle semantics by
+        // forcing a start in the named mode; restarts if already up).
+        tunnel::Mode requestedMode = tunnel::Mode::Quick;
+        bool modeExplicit = false;
+        if (rest2.find("mode=named") != std::string::npos) {
+            requestedMode = tunnel::Mode::Named;
+            modeExplicit  = true;
+        } else if (rest2.find("mode=quick") != std::string::npos) {
+            requestedMode = tunnel::Mode::Quick;
+            modeExplicit  = true;
         }
-        if (sub2 == "off") {
-            if (!remote::isRunning() && remote::tunnelMode() == tunnel::Mode::None) {
-                pushSystemBubble(turnId, "No tunnel is running.", false);
-                return true;
-            }
+
+        // If tunnel is currently up:
+        //   - No mode= arg → toggle off
+        //   - mode= arg AND mode differs from current → stop then restart
+        //   - mode= arg AND mode matches current → no-op (announce)
+        bool currentlyTunneled = (remote::tunnelMode() != tunnel::Mode::None);
+        if (currentlyTunneled && !modeExplicit) {
             remote::stopTunneled();
             pushSystemBubble(turnId, "Tunnel stopped.", false);
             pushRemoteStatus(turnId);
             return true;
         }
+        if (currentlyTunneled && modeExplicit
+            && remote::tunnelMode() == requestedMode) {
+            pushSystemBubble(turnId,
+                std::string("Tunnel already running (")
+                + (requestedMode == tunnel::Mode::Named ? "named" : "quick")
+                + "). Run `/remote tunnel` to stop.", false);
+            pushRemoteStatus(turnId);
+            return true;
+        }
+        if (currentlyTunneled && modeExplicit) {
+            // Mode switch: stop the current tunnel before starting the new one.
+            remote::stopTunneled();
+        }
+
+        // If LAN-only server is running (no tunnel), refuse — user has to
+        // explicitly stop it first to avoid surprise port rebinding.
+        if (remote::isRunning()) {
+            pushSystemBubble(turnId,
+                "LAN server is running. Use `/remote off` first, then "
+                "`/remote tunnel` to start the tunnel.", false);
+            pushRemoteStatus(turnId);
+            return true;
+        }
+
+        auto r = remote::startTunneled(requestedMode);
+        if (!r.ok) {
+            pushSystemBubble(turnId,
+                "Tunnel start failed: " + r.error_message + ".", false);
+            return true;
+        }
         pushSystemBubble(turnId,
-            "Usage: `/remote tunnel on` or `/remote tunnel off`. "
-            "(Mode B / named tunnel coming in next task.)", false);
+            std::string("Cloudflare Tunnel active (")
+            + (requestedMode == tunnel::Mode::Named ? "named, stable URL" : "quick, ephemeral URL")
+            + "). Scan the QR or visit the URL on any device — works across networks. "
+              "Run `/remote tunnel` again to stop.",
+            true);
+        pushRemoteStatus(turnId);
         return true;
     }
     return false;

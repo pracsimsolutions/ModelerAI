@@ -523,7 +523,7 @@ ArgSpec remoteArgSpec()
         { "off",    "off",    "Stop the server, kick clients." },
         { "status", "status", "Print current state + QR." },
         { "rotate", "rotate", "Regenerate the token (kicks current clients)." },
-        { "tunnel", "tunnel on|off", "Cloudflare Tunnel (cross-network access). Type 'on' or 'off' after." },
+        { "tunnel", "tunnel (toggle)", "Cloudflare Tunnel (cross-network access). Toggles on/off. Add `mode=named` for stable hostname (see share/README.md)." },
         { "diag",   "diag",   "Dump live state (server, subscribers, queues)." },
         { "trace",  "trace",  "Toggle verbose diagnostic logging (on|off)." },
     };
@@ -629,7 +629,7 @@ const std::vector<CommandInfo>& commandCatalog()
                 "Start/stop/inspect the HTTP server that lets phones on the "
                 "same LAN connect to this chat. Tokens regenerate on every "
                 "start; lifecycle ends with the panel.",
-                "/remote on | off | status | rotate | tunnel on|off | diag | trace",
+                "/remote on | off | status | rotate | tunnel | diag | trace",
                 remoteArgSpec(),
                 /*hasArgs*/ true),
     };

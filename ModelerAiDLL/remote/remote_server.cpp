@@ -529,20 +529,23 @@ StartResult startTunneled(tunnel::Mode mode)
         return r;
     }
 
-    // 3. For Quick mode, poll publicUrl() with a 15s timeout. For
-    //    Named mode, the URL is the user-configured hostname — we
-    //    leave that hookup to Task 2.5 (read from share/cloudflared/config.yml).
-    if (mode == tunnel::Mode::Quick) {
-        auto deadline = std::chrono::steady_clock::now()
-                       + std::chrono::seconds(15);
+    // 3. Poll publicUrl() with a 15s timeout regardless of mode.
+    //    For Quick mode, cloudflared emits the URL on stderr and the
+    //    reader thread populates it asynchronously.
+    //    For Named mode, tunnel::start() reads it synchronously from
+    //    share/cloudflared/config.yml before returning, so the first
+    //    check below will succeed immediately.
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
         while (tunnel::publicUrl().empty()
             && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         if (tunnel::publicUrl().empty()) {
             tunnel::stop();
-            r.error_message = "tunnel_url_timeout: cloudflared did not "
-                              "publish a URL within 15s";
+            r.error_message = (mode == tunnel::Mode::Named)
+                ? "tunnel_url_timeout: configure hostname in share/cloudflared/config.yml"
+                : "tunnel_url_timeout: cloudflared did not publish a URL within 15s";
             return r;
         }
     }

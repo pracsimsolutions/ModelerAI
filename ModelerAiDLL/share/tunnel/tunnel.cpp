@@ -47,6 +47,28 @@ HANDLE createJob()
     return job;
 }
 
+// Best-effort YAML scan for `hostname:` line in
+// <moduleDir>/share/cloudflared/config.yml. Returns empty on failure.
+std::string readHostnameFromConfigYml()
+{
+    auto installDir = paths::moduleInstallDir();
+    if (installDir.empty()) return "";
+    std::ifstream f(installDir + "\\share\\cloudflared\\config.yml");
+    if (!f) return "";
+    std::string line;
+    while (std::getline(f, line)) {
+        const std::string key = "hostname:";
+        auto pos = line.find(key);
+        if (pos == std::string::npos) continue;
+        auto v = line.substr(pos + key.size());
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0, 1);
+        while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+        if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+        return v;
+    }
+    return "";
+}
+
 // Best-effort .env loader. Looks at <moduleDir>/share/.env. Returns
 // the value of CF_TUNNEL_TOKEN if found, empty otherwise. Used for
 // Mode::Named.
@@ -213,8 +235,24 @@ StartResult start(Mode mode, int localPort)
     g_running.store(true);
     g_readerThread = std::make_unique<std::thread>(readerLoop);
 
+    // For Named mode: read the user-configured hostname from
+    // share/cloudflared/config.yml and populate g_publicUrl NOW, before
+    // returning, so the caller's publicUrl() poll finds it on the first
+    // check.  g_mu is already held here — no re-lock needed.
+    if (mode == Mode::Named) {
+        auto host = readHostnameFromConfigYml();
+        if (!host.empty()) {
+            g_publicUrl = (host.find("://") == std::string::npos)
+                          ? "https://" + host
+                          : host;
+            diag::info("[tunnel] named-mode public URL: " + g_publicUrl);
+        }
+        // If empty, the caller's poll loop will time out with a clear
+        // error pointing at share/cloudflared/config.yml.
+    }
+
     r.ok = true;
-    r.public_url = "";   // filled by reader; caller polls publicUrl() with a timeout
+    r.public_url = "";   // filled by reader (Quick) or above (Named); caller polls publicUrl()
     return r;
 }
 
