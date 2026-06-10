@@ -1,0 +1,31 @@
+[product]
+name           = "ModelerAI"
+display_name   = "PracSim ModelerAI"
+description    = "AI assistant that lives inside FlexSim. Chat in plain English about your model; reads model state, edits with permission, and shares chat sessions over Cloudflare Tunnel for cross-network demos."
+url            = "https://github.com/pracsimsolutions/ModelerAI"
+
+[wix]
+# FIXED FOREVER. Ported from the pre-MIT-cleanup bundle. Changing either
+# GUID breaks MSI upgrade behaviour for users on prior installs.
+upgrade_code         = "0247D13E-9A35-40A0-80DF-BAD224809F49"
+component_guid_prefix = "EF04C8EF-BC82-468D-9766-000000000"
+
+[flexsim]
+default_version_dir = "FlexSim 2026"
+
+[payload]
+# APPEND ONLY. Each entry maps to one WiX <Component>.
+files = [
+    "ModelerAI.t",
+    "ModelerAI.fsx",
+    "ModelerAI.dll",
+    "LICENSE.txt",
+    "README.md",
+]
+# Recursively included. KNOWLEDGE/ holds the hand-written agent KB
+# (schemas + topics); webview/index.html is read at runtime by the
+# remote HTTP server (asset_loader.cpp). share/ contains the
+# Cloudflare Tunnel templates + walkthrough; tools/ ships embed.js
+# and build-kb.js so users can regenerate the KB / re-embed the
+# viewer after editing.
+subdirs = ["KNOWLEDGE", "webview", "share", "tools"]
