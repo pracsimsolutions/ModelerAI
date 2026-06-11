@@ -4,11 +4,16 @@
 #include "module.h"   // FlexSim SDK — must precede json.h
 #include "tools/write/modelerai_call.h"
 #include "mainthread/mainthread.h"
+#include "commands/commands.h"   // ModelerAi_* exports (the dispatcher resolves them by name)
+#include "agent/agent.h"         // ModelerAi::agent::Agent::cancelRequested
+#include "bootstrap.h"           // ModelerAi::bootstrap::agent()
 #include "third_party/json.h"
 #include "tree/condense.h"
 
+#include <chrono>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 namespace ModelerAi::tools {
@@ -229,14 +234,273 @@ ToolResult ModelerAiCallTool::run(std::string_view args_json)
         "modelerai_get_model_summary",
         "modelerai_get_run_state",
         "modelerai_export_tree_json",
+        "modelerai_list_processflows",
+        "modelerai_list_activities",
+        "modelerai_get_activity_info",
+        "modelerai_get_activity_variable",
     };
     if (!kReadOnly.count(commandName)) {
         ModelerAi::tree::invalidateCondenseCache();
     }
 
+    // ---- Special path: modelerai_run_to_time -----------------------------
+    //
+    // We tried two architectures before this one and both failed:
+    //   1. Sync C++ on main thread with `MsgWaitForMultipleObjects` +
+    //      message pump → sim never advanced (`time()==0` every poll).
+    //   2. C++20 coroutine on main thread with `co_await Delay::realTime(.1)`
+    //      → sim ran to the target but the coroutine never resumed after
+    //      its first yield. Suspect: under `runspeed(INT_MAX)` FlexSim is
+    //      processing events so aggressively it never serves the
+    //      wall-clock Delay timer; when sim hits the stop time, FlexSim
+    //      halts but may not service queued wall-clock timers anymore.
+    //      The coroutine's resume never gets called.
+    //
+    // What works here: keep the wait on the WORKER thread, drive each
+    // small main-thread operation through `runAndWait`. The main thread
+    // owns FlexSim's event loop for the long stretches between our polls,
+    // sim advances normally, and the worker stays responsive (cancel +
+    // timeout safety).
+    //
+    // Diagnostics from this code path land in System Console as
+    // `[runToTime] …` via FlexScript `print(...)` inside the runAndWait
+    // closures (worker-thread consolePrint isn't safe).
+    if (commandName == "modelerai_run_to_time") {
+        // Extract target_sim_time from args.
+        double target = -1.0;
+        if (!args.empty()) {
+            const auto& a = args[0];
+            if (a.is_number()) {
+                target = a.get<double>();
+            } else if (a.is_object()) {
+                for (const char* k : { "target_sim_time", "target", "time", "sim_time" }) {
+                    if (a.contains(k) && a[k].is_number()) {
+                        target = a[k].get<double>();
+                        break;
+                    }
+                }
+            } else if (a.is_string()) {
+                try {
+                    auto j = nlohmann::json::parse(a.get<std::string>());
+                    if (j.is_object()) {
+                        for (const char* k : { "target_sim_time", "target", "time", "sim_time" }) {
+                            if (j.contains(k) && j[k].is_number()) {
+                                target = j[k].get<double>();
+                                break;
+                            }
+                        }
+                    } else if (j.is_number()) {
+                        target = j.get<double>();
+                    }
+                } catch (...) {}
+            }
+        }
+        if (target <= 0.0) {
+            r.ok = false;
+            r.error_code = "bad_target";
+            r.error_message = "modelerai_run_to_time expects a numeric "
+                              "target_sim_time > 0. Shapes: bare number "
+                              "100000, or JSON {\"target_sim_time\": 100000}.";
+            return r;
+        }
+
+        // Unique marker so cleanup finds OUR temp stop, even if a prior
+        // crashed run left a stale one behind.
+        long long stamp = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        std::string marker = "modelerai-rtt:" + std::to_string(stamp);
+
+        // -- Phase 1: install + go (single main-thread incursion).
+        std::string installScript;
+        installScript += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
+        installScript += "if (!stopTimes) { print(\"[runToTime] STOP_TIME_NODE not found\"); return 0; }\n";
+        installScript += "treenode newStop = createcopy(stopTimes.last, stopTimes, 1);\n";
+        installScript += "setsdtvalue(newStop, \"enabled\", 1);\n";
+        installScript += "function_s(newStop, \"setModelTime\", "
+                       + std::to_string(target) + ");\n";
+        installScript += "setsdtvalue(newStop, \"dateString\", \"" + marker + "\");\n";
+        installScript += "stoptime(0, 0);\n";
+        installScript += "resetmodel(1);\n";
+        installScript += "applicationcommand(\"switchRunning\", 0);\n";
+        installScript += "runspeed(INT_MAX);\n";
+        installScript += "go();\n";
+        installScript += "print(\"[runToTime] INSTALL ok target=" + std::to_string(target)
+                       + " nextStop=\", Model.nextStopTime);\n";
+        installScript += "return Model.nextStopTime;\n";
+
+        double nextStopTime = target;
+        std::string installErr;
+        ModelerAi::mainthread::runAndWait([&]() {
+            try {
+                Variant v = executestring(installScript.c_str(),
+                                          nullptr, nullptr, Variant());
+                if (v.type == VariantType::Number) nextStopTime = double(v);
+            } catch (const std::exception& e) {
+                installErr = e.what();
+            }
+        });
+        if (!installErr.empty()) {
+            r.ok = false;
+            r.error_code = "install_failed";
+            r.error_message = "Install script threw: " + installErr;
+            return r;
+        }
+
+        // -- Phase 2: poll until exit condition fires.
+        ModelerAi::agent::Agent* agent = ModelerAi::bootstrap::agent();
+        double lastCheckTime = 0.0;
+        int    earlyBreak    = 0;  // 0=target, 1=drained, 2=stall, 3=canceled, 4=timeout
+        int    iter          = 0;
+        auto   wallStart     = std::chrono::steady_clock::now();
+        constexpr auto kHardTimeout   = std::chrono::minutes(10);
+        constexpr auto kPollInterval  = std::chrono::milliseconds(100);
+
+        while (true) {
+            std::this_thread::sleep_for(kPollInterval);
+            ++iter;
+
+            if (agent && agent->cancelRequested()) {
+                earlyBreak = 3;
+                break;
+            }
+            if (std::chrono::steady_clock::now() - wallStart >= kHardTimeout) {
+                earlyBreak = 4;
+                break;
+            }
+
+            double currentTime = 0.0;
+            int    eventQty    = 0;
+            int    runState    = 0;
+            bool   readOk      = false;
+            ModelerAi::mainthread::runAndWait([&]() {
+                try {
+                    Variant tv = executestring("return time();", nullptr, nullptr, Variant());
+                    if (tv.type == VariantType::Number) currentTime = double(tv);
+                    Variant ev = executestring("return eventqty();", nullptr, nullptr, Variant());
+                    if (ev.type == VariantType::Number) eventQty = (int)double(ev);
+                    Variant rs = executestring("return getrunstate();", nullptr, nullptr, Variant());
+                    if (rs.type == VariantType::Number) runState = (int)double(rs);
+                    readOk = true;
+                } catch (...) {}
+            });
+
+            if (iter == 1 || iter % 10 == 0) {
+                ModelerAi::mainthread::runAndWait([&]() {
+                    std::string msg = "print(\"[runToTime] POLL iter="
+                                    + std::to_string(iter)
+                                    + " time=\", time(), \" events=\", eventqty(),"
+                                    + " \" runState=\", getrunstate());";
+                    try { executestring(msg.c_str(), nullptr, nullptr, Variant()); }
+                    catch (...) {}
+                });
+            }
+
+            if (!readOk) continue;  // transient SDK hiccup; try again next tick
+
+            if (currentTime == target) {
+                break;  // target reached
+            }
+
+            if ((currentTime - lastCheckTime) < 1.0) {
+                if (eventQty == 0) {
+                    earlyBreak = 1;
+                    break;
+                }
+                if (currentTime == nextStopTime && runState == 0) {
+                    // Multi-stop continuation: advance past a user stop time.
+                    ModelerAi::mainthread::runAndWait([&]() {
+                        try {
+                            Variant nv = executestring("return Model.nextStopTime;",
+                                                       nullptr, nullptr, Variant());
+                            if (nv.type == VariantType::Number) nextStopTime = double(nv);
+                            executestring("go();", nullptr, nullptr, Variant());
+                        } catch (...) {}
+                    });
+                } else {
+                    earlyBreak = 2;
+                    break;
+                }
+            }
+            lastCheckTime = currentTime;
+        }
+
+        // -- Phase 3: cleanup (single main-thread incursion).
+        std::string cleanupScript;
+        if (earlyBreak == 3 || earlyBreak == 4) {
+            cleanupScript += "stop(1);\n";
+        }
+        cleanupScript += "applicationcommand(\"switchRunning\", 0);\n";
+        cleanupScript += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
+        cleanupScript += "if (stopTimes && stopTimes.subnodes.length > 1) {\n";
+        cleanupScript += "    for (int i = stopTimes.subnodes.length; i >= 1; i--) {\n";
+        cleanupScript += "        treenode n = stopTimes.subnodes[i];\n";
+        cleanupScript += "        if (string(getsdtvalue(n, \"dateString\")) == \""
+                       + marker + "\") {\n";
+        cleanupScript += "            n.destroy();\n";
+        cleanupScript += "            break;\n";
+        cleanupScript += "        }\n";
+        cleanupScript += "    }\n";
+        cleanupScript += "}\n";
+        cleanupScript += "stoptime(0, 0);\n";
+        cleanupScript += "print(\"[runToTime] CLEANUP ok finalTime=\", time());\n";
+        cleanupScript += "return time();\n";
+
+        double finalTime = target;
+        ModelerAi::mainthread::runAndWait([&]() {
+            try {
+                Variant v = executestring(cleanupScript.c_str(),
+                                          nullptr, nullptr, Variant());
+                if (v.type == VariantType::Number) finalTime = double(v);
+            } catch (...) {}
+        });
+
+        // -- Phase 4: build result.
+        nlohmann::json result;
+        std::string reason;
+        bool completed = false;
+        switch (earlyBreak) {
+            case 0: reason = "target_reached"; completed = true; break;
+            case 1: reason = "events_drained"; break;
+            case 2: reason = "stall_detected"; break;
+            case 3: reason = "canceled";        break;
+            case 4: reason = "wall_timeout";    break;
+        }
+        result["ok"]              = true;
+        result["completed"]       = completed;
+        result["reason"]          = reason;
+        result["target_sim_time"] = target;
+        result["final_sim_time"]  = finalTime;
+        if (earlyBreak == 1) {
+            result["note"] = "Event queue drained before reaching target. "
+                             "Model ran out of work (e.g. ArrivalSchedule "
+                             "exhausted, all items reached Sink).";
+        } else if (earlyBreak == 2) {
+            result["note"] = "Sim time stopped advancing between 100ms polls. "
+                             "Likely a runaway trigger body or zero-time event "
+                             "storm.";
+        } else if (earlyBreak == 3) {
+            result["note"] = "Run canceled by the chat's Stop button or the agent.";
+        } else if (earlyBreak == 4) {
+            result["note"] = "Hard 10-minute wall-clock timeout reached. Sim may "
+                             "still be running in FlexSim — check the toolbar.";
+        }
+
+        nlohmann::json out;
+        out["command"] = commandName;
+        out["result"]  = result;
+        r.ok           = true;
+        r.result_json  = out.dump();
+        return r;
+    }
+
     // Build the FlexScript that calls applicationcommand with the marshalled
     // args. Using executestring instead of a direct variadic C++ call sidesteps
     // the FlexSim SDK's lack of a clean variadic applicationcommand binding.
+    //
+    // Tools that need long-running waits (e.g. modelerai_run_to_time) take
+    // a special path above — see kSpecialCommands logic. Everything else
+    // follows the normal executestring → applicationcommand → DLL chain.
     std::string script;
     script.reserve(64 + commandName.size() + args.size() * 16);
     script += "return applicationcommand(\"" + fsEscape(commandName) + "\"";

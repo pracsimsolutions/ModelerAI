@@ -88,15 +88,39 @@ modelerai_export Variant ModelerAi_runToTime           (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_runToEnd            (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_runUntil            (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_run                 (FLEXSIMINTERFACE);
-modelerai_export Variant ModelerAi_waitForStop         (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_stopModel           (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_stepModel           (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_getRunState         (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_addStopTime         (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_removeStopTime      (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_setWarmupTime       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_setRunSpeed         (FLEXSIMINTERFACE);
-modelerai_export Variant ModelerAi_installRunHooks     (FLEXSIMINTERFACE);
-modelerai_export Variant ModelerAi_uninstallRunHooks   (FLEXSIMINTERFACE);
+
+// ProcessFlow lifecycle — create/list/delete the ProcessFlow tools that live
+// under Tools/Toolbox/ProcessFlow in the model tree.
+modelerai_export Variant ModelerAi_createProcessFlow       (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_listProcessFlows        (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_deleteProcessFlow       (FLEXSIMINTERFACE);
+
+// ProcessFlow activities — add/delete/connect activities within a ProcessFlow,
+// and set/read variables on an existing activity.  Activities are created
+// through the ProcessFlowView internal callbacks (openprocessflowview /
+// createActivity) so the connector wiring and placement logic that lives in
+// the view is reused.
+// NOTE: ProcessFlows live at /Tools/ProcessFlow/<name> — a FLAT list under
+// one node, NOT at the model root and NOT at /Tools/Toolbox/ProcessFlow/...
+// (the toolbox subtree is the UI coupling shortcut, not storage).
+// Model.find("<name>") alone returns null. All tools below walk the storage
+// location internally so callers should NEVER need run_script for PF work.
+modelerai_export Variant ModelerAi_addActivity             (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_connectActivities       (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_deleteActivity          (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_setActivityVariable     (FLEXSIMINTERFACE);
+// Read-side mirrors — added so the agent never needs run_script to inspect
+// PF state (where it has historically hallucinated wrong tree paths).
+modelerai_export Variant ModelerAi_listActivities          (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_getActivityInfo         (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_getActivityVariable     (FLEXSIMINTERFACE);
 
 // Output domain — performance measures, object stats, model summary.
 // PerformanceMeasures live inside PerformanceMeasureTables. Each PM has a

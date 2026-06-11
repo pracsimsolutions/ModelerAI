@@ -10,6 +10,12 @@ url            = "https://github.com/pracsimsolutions/ModelerAI"
 upgrade_code         = "0247D13E-9A35-40A0-80DF-BAD224809F49"
 component_guid_prefix = "EF04C8EF-BC82-468D-9766-000000000"
 
+[brand]
+icon_svg     = "modelerai.svg"
+banner_svg   = "installer/modelerai-banner.svg"
+dialog_svg   = "installer/modelerai-dialog.svg"
+toolbox_png  = "bitmaps/modelerai.png"
+
 [flexsim]
 default_version_dir = "FlexSim 2026"
 

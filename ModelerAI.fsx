@@ -70,13 +70,47 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
         <node f="42"><name>variables</name>
          <node f="40"><name></name></node>
          <node f="42" dt="2"><name>html</name><data>&lt;!DOCTYPE html&gt;
-&lt;html class="dark"&gt;
+&lt;html class="dark preload"&gt;
 &lt;head&gt;
   &lt;meta charset="utf-8" /&gt;
   &lt;meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"&gt;
   &lt;title&gt;PracSim ModelerAI&lt;/title&gt;
+  &lt;script&gt;
+    // Anti-flash theme bootstrap. Runs BEFORE any CSS/variables paint so
+    // the first frame already has the correct theme — no white-to-dark
+    // transition flash on cold open. localStorage is synchronous; OK to
+    // read inline here.
+    (function () {
+      try {
+        var saved = localStorage.getItem('modelerai_theme');
+        // Valid values: 'dark' (default), 'light', 'system'.
+        var theme = (saved === 'light' || saved === 'system') ? saved : 'dark';
+        document.documentElement.className = theme + ' preload';
+      } catch (e) {
+        // Storage unavailable — stay on the default `dark preload` we set in the tag.
+      }
+      // Drop the .preload class after the first paint so runtime theme
+      // switches animate smoothly (the transition is wanted for THEME
+      // changes, just not for initial render).
+      window.addEventListener('DOMContentLoaded', function () {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () {
+            document.documentElement.classList.remove('preload');
+          });
+        });
+      });
+    })();
+  &lt;/script&gt;
   &lt;script src="flexsimweb/common.js"&gt;&lt;/script&gt;
   &lt;style&gt;
+    /* Suppress the 120ms color transition during initial render — otherwise
+       the browser's default white body animates into the saved theme on
+       first paint and looks like a "light → dark" flash. The .preload class
+       is removed by JS on DOMContentLoaded after one animation frame, so
+       runtime theme switches still animate smoothly. */
+    .preload, .preload *, .preload *::before, .preload *::after {
+      transition: none !important;
+    }
     /* ============================================================
        Theme — CSS variables. Default is dark; html.light overrides;
        html.system follows prefers-color-scheme. Fallback to dark if
@@ -4352,7 +4386,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000018&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000040&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -8652,6 +8686,16 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_validate_model</name><data>dll:"module:ModelerAI" func:"ModelerAi_validateModel"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_statistics_collector</name><data>dll:"module:ModelerAI" func:"ModelerAi_createStatisticsCollector"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_tracked_variable</name><data>dll:"module:ModelerAI" func:"ModelerAi_createTrackedVariable"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_create_processflow</name><data>dll:"module:ModelerAI" func:"ModelerAi_createProcessFlow"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_list_processflows</name><data>dll:"module:ModelerAI" func:"ModelerAi_listProcessFlows"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_delete_processflow</name><data>dll:"module:ModelerAI" func:"ModelerAi_deleteProcessFlow"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_add_activity</name><data>dll:"module:ModelerAI" func:"ModelerAi_addActivity"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_connect_activities</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectActivities"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_delete_activity</name><data>dll:"module:ModelerAI" func:"ModelerAi_deleteActivity"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_set_activity_variable</name><data>dll:"module:ModelerAI" func:"ModelerAi_setActivityVariable"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_list_activities</name><data>dll:"module:ModelerAI" func:"ModelerAi_listActivities"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_get_activity_info</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityInfo"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_get_activity_variable</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityVariable"</data></node>
      </node>
     </node>
    </node>

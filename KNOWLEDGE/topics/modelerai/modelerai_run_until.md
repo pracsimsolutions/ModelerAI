@@ -1,122 +1,101 @@
 ---
 title: modelerai_run_until
-status: v1 — step()-driven; ignores user-defined stop times
+status: v2 — step-loop, FlexScript condition only, required safety cap
 ---
 
 # `modelerai_run_until`
 
-Run the model **one event at a time** (`step()` loop) until a condition becomes true. Two condition shapes — a FlexScript expression OR a structured PerformanceMeasure check.
+Run the model one event at a time (`step()` loop) until a FlexScript condition becomes true.
+
+## When NOT to use this
+
+- "Run to sim time 10000" / "run for 10000 seconds" / "advance to time X" → use **`modelerai_run_to_time`** instead. Do not synthesize `condition: "time() >= 10000"` here; that's much slower and ignores stop times.
+- "Run until the queue is empty" / "run until events drain" → use **`modelerai_run_to_end`** instead.
 
 ## When to use
 
-- The modeler asks "run until 100 items reach the sink" / "until average wait time exceeds 10s" / "until OperatorA is busy".
-- You need to check a condition that depends on running state (a stat, a label value, a PM result) — something you can't precompute as a sim-time target.
-- You want fine-grained control: every event boundary is a checkpoint.
+- The modeler asks "run until 100 items reach the sink" / "until Queue1 has 5 items" / "until OperatorA is busy".
+- The exit criterion is a state condition you can express as a FlexScript expression, NOT a sim-time target.
 
-**Important:** `step()` ignores user-defined stop times. If the modeler has stop times in the model, this tool will blow through them silently. Use [`modelerai_run_to_time`](modelerai_run_to_time.md) when stop times matter.
+**`step()` ignores user-defined stop times.** Stop-time entries in the model are silently blown through. Use `modelerai_run_to_time` if stop times matter.
 
-## Arguments — two condition shapes
+## Arguments
 
-**Shape A: raw FlexScript expression.** Most flexible.
 ```json
 {
-  "expression": "Model.find(\"Sink1\").stats.input.value >= 100",
-  "timeout_seconds": 300
+  "condition":           "Model.find(\"Sink1\").stats.input.value >= 100",
+  "safety_sim_seconds":  259200
 }
 ```
-The expression is wrapped as `return (<expr>) ? 1 : 0;` and evaluated after each step. Non-zero result = condition met. If the expression throws, that step's evaluation is treated as false (soft-fail).
 
-**Shape B: structured PerformanceMeasure check.** Safer when a PM already exists.
-```json
-{
-  "pm": "SinkThroughput",
-  "op": ">=",
-  "value": 100,
-  "timeout_seconds": 300
-}
-```
-`op` ∈ `">="`, `">"`, `"<="`, `"<"`, `"=="`, `"!="`.
-The PM is resolved once at start; if it doesn't exist, the call errors with `pm_not_found` before any stepping.
+Both fields **required.**
 
-| Field | Default | Purpose |
+| Field | Type | Purpose |
 |---|---|---|
-| `timeout_seconds` | `300` | Real-world budget. Pass a larger value for slow models; pass `-1` to disable. |
+| `condition` | string | FlexScript expression. Wrapped at compile site as `if ((<your expression>)) { … }`. Should evaluate to truthy when the modeler wants to stop. |
+| `safety_sim_seconds` | number | Sim-time cap. The loop bails if `time() > safety_sim_seconds`, returning `reason: "safety_capped"`. Pick a budget the run shouldn't exceed (e.g. `259200` = 3 days). NO default — omitting returns `missing_safety_cap`. |
 
-**You must supply EXACTLY ONE shape — not both.** Mixing them returns `bad_condition_shape`.
+The model is **reset automatically** before the loop starts.
 
 ## Returns
 
 ```json
 {
   "ok":                    true,
-  "completed":             true,
-  "user_stopped":          false,
-  "timed_out":             false,
-  "stalled":               false,
+  "reason":                "condition_met",
   "final_sim_time":        432.1,
   "steps_taken":           4811,
-  "final_condition_value": 100,
-  "reason":                "condition_met"
+  "safety_sim_seconds":    259200,
+  "condition_value":       true
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `completed` | `true` only when `reason == "condition_met"`. |
-| `final_condition_value` | The last evaluated value of the condition. For Shape A: the expression's numeric result (1.0 for true, 0.0 for false, or whatever the expression returned). For Shape B: the final PM value. |
-| `steps_taken` | Number of `step()` calls fired during the loop. |
-
 ### Exit reasons
 
-| `reason` | `completed` | Meaning |
-|---|---|---|
-| `condition_met` | `true` | **Normal terminal state.** Condition evaluated truthy. |
-| `events_drained_before_condition` | `false` | Event queue emptied before the condition turned true. Model finished without reaching the target. |
-| `user_stopped` | `false` | Modeler clicked Stop in the viewer. |
-| `wall_timeout` | `false` | `timeout_seconds` elapsed. |
-| `stalled` | `false` | Sim time didn't advance by 5 sec in any 5 wall-sec window. |
+| `reason` | Meaning |
+|---|---|
+| `condition_met` | The FlexScript condition turned truthy. Normal exit. |
+| `events_drained` | `eventqty() == 0` before the condition turned true. Model finished without reaching target. |
+| `safety_capped` | Sim time exceeded `safety_sim_seconds` before the condition turned true. Either raise the cap or check that the condition is achievable. |
 
 ## Examples
 
-**Run until the sink has processed 100 items (Shape A).**
+**Run until the sink has processed 100 items, with a 3-day safety cap.**
 ```json
-{ "expression": "Model.find(\"Sink1\").stats.input.value >= 100" }
+{
+  "condition": "Model.find(\"Sink1\").stats.input.value >= 100",
+  "safety_sim_seconds": 259200
+}
 ```
 
-**Run until average wait time in Queue1 exceeds 10 seconds (Shape A).**
+**Run until average wait time in Queue1 exceeds 10 seconds.**
 ```json
-{ "expression": "Model.find(\"Queue1\").stats.staytime.average() > 10" }
+{
+  "condition": "Model.find(\"Queue1\").stats.staytime.average() > 10",
+  "safety_sim_seconds": 259200
+}
 ```
 
-**Run until a PerformanceMeasure crosses a threshold (Shape B).**
+**Run until a label crosses a threshold.**
 ```json
-{ "pm": "SinkThroughput", "op": ">=", "value": 100 }
-```
-
-**Run until a label value is reached on a specific object (Shape A).**
-```json
-{ "expression": "Model.find(\"Tracker\").labels[\"alert_count\"].value >= 5" }
+{
+  "condition": "Model.find(\"Tracker\").labels[\"alert_count\"].value >= 5",
+  "safety_sim_seconds": 28800
+}
 ```
 
 ## Errors
 
 | Code | Cause |
 |---|---|
-| `missing_condition` | Neither `expression` nor `pm`+`op`+`value` supplied. |
-| `bad_condition_shape` | Both shapes supplied in one call. Pick one. |
-| `bad_operator` | `op` is not in `>=`, `>`, `<=`, `<`, `==`, `!=`. |
-| `pm_not_found` | Shape B: `pm` doesn't resolve to a PerformanceMeasure. Call `modelerai_list_performance_measures` to see what exists. |
-| `expression_eval_failed` | Shape A: the expression failed to evaluate on EVERY step. Likely a typo, missing object reference, or wrong field name. The error includes the offending expression. |
-| `step_failed` | `step()` threw mid-loop. Model state may be invalid. |
-
-## Sim-time-progress watchdog
-
-Same safety net as `run_to_end` and `run_to_time`: if sim time fails to advance by at least 5 sec across any 5 wall-second window, the call exits with `stalled: true`. Common cause is a runaway trigger body that the modeler added recently.
-
-When `stalled` fires, the response includes a `stalled_note` pointing at likely culprits (most recently-set triggers and FlexScript-valued properties).
+| `missing_args` | Args weren't a JSON object. |
+| `missing_condition` | `condition` field missing or empty. |
+| `missing_safety_cap` | `safety_sim_seconds` field missing. The cap is required. |
+| `bad_safety_cap` | `safety_sim_seconds` ≤ 0. |
+| `run_until_failed` | The step-loop threw — most likely a typo in the condition expression. The error message includes the offending expression. |
+| `loop_returned_wrong_type` | The condition compiled but didn't evaluate to a number on the test. Check the expression syntax. |
 
 ## See also
 
-- [`modelerai_run_to_time`](modelerai_run_to_time.md) — when a sim-time target matters and you want stop times honored.
-- [`modelerai_run_to_end`](modelerai_run_to_end.md) — when "play to completion" is the goal.
-- [`modelerai_create_performance_measure`](modelerai_create_performance_measure.md) — Shape B requires a registered PM.
+- [`modelerai_run_to_time`](modelerai_run_to_time.md) — for sim-time targets like "advance to time 10000". Faster (`go()` + message-pump waits, not `step()`), honors user stop times.
+- [`modelerai_run_to_end`](modelerai_run_to_end.md) — for "run to completion" without a condition.

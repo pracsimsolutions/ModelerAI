@@ -247,429 +247,17 @@ bool parseParamType(const std::string& s, ParamType& out)
 }
 
 // ============================================================================
-// EXECUTION DOMAIN — run-state event machinery + hook install/uninstall.
+// EXECUTION DOMAIN — gutted 2026-06-08 during run-tool clean-slate redesign.
 // ============================================================================
 //
-// FlexSim fires three ModelTriggers as the model changes state: OnRunStart,
-// OnRunStop, OnModelReset. We install a tiny block at the bottom of each
-// trigger that calls applicationcommand("modelerai_notify_run_state", ...).
-// That call hits ModelerAi_notifyRunState in this DLL, which records the
-// new state and signals a Win32 event. Run commands (run_to_time, run,
-// wait_for_stop) wait on that event when they need to know "the model
-// stopped" — works regardless of WHY it stopped (target reached, user stop
-// time, user click, error).
-//
-// Hook code is marker-wrapped so we can find and remove it cleanly later.
-// Stop-time mutations done for run_to_time are similarly marked via the
-// dateString field so a stale entry from a crashed run can be swept on the
-// next attempt (self-healing).
-
-// Win32 event signaled when OnRunStop / OnModelReset fires. Manual-reset
-// so multiple waiters could in theory pick it up (though in practice we
-// have at most one).
-HANDLE g_runStopEvent = nullptr;
-
-// Last recorded state from the trigger callback. Read by waiters AFTER
-// the event signals. Guarded by g_runStateMutex.
-std::mutex g_runStateMutex;
-std::string g_lastRunState = "Unknown";  // "Started" / "Stopped" / "Reset"
-double      g_lastSimTime  = 0.0;
-
-// Has the install pass run in this session? Cheap memoization — we still
-// verify the marker is present in the trigger body before assuming it's
-// installed, but this lets us skip the disk/tree walk after the first
-// successful install.
-std::atomic<bool> g_hooksInstallScanDone{false};
-
-void ensureRunStopEvent()
-{
-    if (!g_runStopEvent) {
-        // Manual-reset, initially non-signaled, anonymous.
-        g_runStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    }
-}
-
-// Hook block. The marker pair is what we search for to detect / remove.
-// Bump kHookVersion when the body changes so the install pass replaces an
-// older version cleanly.
-constexpr const char* kHookBeginMarker = "// === BEGIN MODELERAI HOOK (auto-managed by PracSim ModelerAI) ===";
-constexpr const char* kHookEndMarker   = "// === END MODELERAI HOOK ===";
-constexpr int kHookVersion = 1;
-
-std::string hookBlockFor(const char* stateName)
-{
-    std::string out;
-    out += kHookBeginMarker;
-    out += "\n// Hook version: ";
-    out += std::to_string(kHookVersion);
-    out += "\n// To remove: delete from BEGIN to END (inclusive) and rebuild the node.\n";
-    out += "applicationcommand(\"modelerai_notify_run_state\", \"";
-    out += stateName;
-    out += "\", time());\n";
-    out += kHookEndMarker;
-    out += "\n";
-    return out;
-}
-
-// Find [begin, end] indices spanning a hook block (begin..endMarker+len),
-// or return false if no hook present. body is searched as plain text.
-bool findHookSpan(const std::string& body, std::size_t& outBegin, std::size_t& outEnd)
-{
-    auto b = body.find(kHookBeginMarker);
-    if (b == std::string::npos) return false;
-    auto e = body.find(kHookEndMarker, b);
-    if (e == std::string::npos) return false;
-    outBegin = b;
-    outEnd   = e + std::strlen(kHookEndMarker);
-    // Sweep one trailing newline if present to keep the file tidy.
-    if (outEnd < body.size() && body[outEnd] == '\n') ++outEnd;
-    return true;
-}
-
-// Install / replace the hook in a ModelTrigger by name. Creates the trigger
-// via Tools.create if missing. Always builds the code node so FlexSim
-// compiles the new body. The actual tree mutation is done via executestring
-// so we can use the full FlexScript API (Tools.create, enablecode, etc.).
-//
-// stateName: "Started" / "Stopped" / "Reset" — the value passed to the
-// notify callback so it knows which event fired.
-// triggerName: "OnRunStart" / "OnRunStop" / "OnModelReset".
-bool installHookInTrigger(const char* triggerName, const char* stateName,
-                          std::string& errOut)
-{
-    // First read the existing code body, if any.
-    std::string readScript;
-    readScript += "treenode t = Tools.get(\"ModelTrigger\", \"";
-    readScript += triggerName;
-    readScript += "\");\n";
-    readScript += "if (!t) return \"\";\n";
-    readScript += "treenode c = t.find(\"code\");\n";
-    readScript += "if (!c) return \"\";\n";
-    readScript += "return c.value;\n";
-
-    std::string existing;
-    try {
-        Variant v = executestring(readScript.c_str(), nullptr, nullptr, Variant());
-        if (v.type == VariantType::String) existing = std::string(v);
-    } catch (...) { /* trigger may not exist yet — treated as empty */ }
-
-    // Compute the new body: existing (with any old hook stripped), then
-    // our current-version hook appended.
-    std::string newBody = existing;
-    std::size_t hb = 0, he = 0;
-    if (findHookSpan(newBody, hb, he)) {
-        newBody.erase(hb, he - hb);
-    }
-    // Trim a trailing newline run so the appended block sits cleanly.
-    while (!newBody.empty() && (newBody.back() == '\n' || newBody.back() == ' ' || newBody.back() == '\t' || newBody.back() == '\r')) {
-        newBody.pop_back();
-    }
-    if (!newBody.empty()) newBody += "\n\n";
-    newBody += hookBlockFor(stateName);
-
-    // Write it back. Tools.create only creates if missing (assert-style); we
-    // always then write the code, enablecode, buildnodeflexscript.
-    std::string writeScript;
-    writeScript += "treenode t = Tools.get(\"ModelTrigger\", \"";
-    writeScript += triggerName;
-    writeScript += "\");\n";
-    writeScript += "if (!t) t = Tools.create(\"ModelTrigger\", \"";
-    writeScript += triggerName;
-    writeScript += "\");\n";
-    writeScript += "if (!t) { print(\"installHook: failed to create ";
-    writeScript += triggerName;
-    writeScript += "\"); return 0; }\n";
-    writeScript += "treenode c = t.subnodes.assert(\"code\");\n";
-    writeScript += "c.value = \"";
-    writeScript += fsEscape(newBody);
-    writeScript += "\";\n";
-    writeScript += "enablecode(c);\n";
-    writeScript += "buildnodeflexscript(c);\n";
-    writeScript += "return t;\n";
-
-    try {
-        Variant v = executestring(writeScript.c_str(), nullptr, nullptr, Variant());
-        return v.type == VariantType::TreeNode && static_cast<treenode>(v) != nullptr;
-    } catch (const std::exception& e) {
-        errOut = e.what();
-        return false;
-    } catch (...) {
-        errOut = "unknown exception during hook install";
-        return false;
-    }
-}
-
-bool uninstallHookFromTrigger(const char* triggerName, std::string& errOut)
-{
-    std::string readScript;
-    readScript += "treenode t = Tools.get(\"ModelTrigger\", \"";
-    readScript += triggerName;
-    readScript += "\");\n";
-    readScript += "if (!t) return \"\";\n";
-    readScript += "treenode c = t.find(\"code\");\n";
-    readScript += "if (!c) return \"\";\n";
-    readScript += "return c.value;\n";
-
-    std::string existing;
-    try {
-        Variant v = executestring(readScript.c_str(), nullptr, nullptr, Variant());
-        if (v.type == VariantType::String) existing = std::string(v);
-    } catch (...) { return true; /* nothing to uninstall */ }
-
-    std::size_t hb = 0, he = 0;
-    if (!findHookSpan(existing, hb, he)) return true;  // already gone
-    std::string newBody = existing;
-    newBody.erase(hb, he - hb);
-
-    std::string writeScript;
-    writeScript += "treenode t = Tools.get(\"ModelTrigger\", \"";
-    writeScript += triggerName;
-    writeScript += "\");\n";
-    writeScript += "if (!t) return 0;\n";
-    writeScript += "treenode c = t.subnodes.assert(\"code\");\n";
-    writeScript += "c.value = \"";
-    writeScript += fsEscape(newBody);
-    writeScript += "\";\n";
-    writeScript += "enablecode(c);\n";
-    writeScript += "buildnodeflexscript(c);\n";
-    writeScript += "return t;\n";
-
-    try {
-        executestring(writeScript.c_str(), nullptr, nullptr, Variant());
-        return true;
-    } catch (const std::exception& e) {
-        errOut = e.what();
-        return false;
-    } catch (...) {
-        errOut = "unknown exception during hook uninstall";
-        return false;
-    }
-}
-
-// Install all three hooks. Returns count of triggers successfully installed.
-int ensureAllHooksInstalled(std::string& errOut)
-{
-    struct H { const char* trigger; const char* state; };
-    H hooks[] = {
-        { "OnRunStart",   "Started" },
-        { "OnRunStop",    "Stopped" },
-        { "OnModelReset", "Reset"   },
-    };
-    int ok = 0;
-    for (auto& h : hooks) {
-        std::string e;
-        if (installHookInTrigger(h.trigger, h.state, e)) ok++;
-        else if (!e.empty()) errOut += std::string(h.trigger) + ": " + e + "; ";
-    }
-    if (ok == 3) g_hooksInstallScanDone.store(true);
-    return ok;
-}
-
-// Temp stop time marker — written into the dateString field. Sweep on each
-// run_to_time call to clean up any stale entries from a crashed prior run.
-constexpr const char* kTempStopPrefix = "modelerai-temp:";
-
-// Adds a temporary stop time at the given model time. Returns the path of
-// the new SDT node on success, empty string on failure.
-std::string addTempStopTime(double modelTime, std::string& errOut)
-{
-    long long stamp = static_cast<long long>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-
-    std::string script;
-    script += "treenode stopTimes = Model.find(\"Tools/ModelUnits/ModelDateTimes/stopTimes\");\n";
-    script += "if (!stopTimes) { print(\"addTempStopTime: stopTimes container not found\"); return 0; }\n";
-    // We need a template SDT to copy from — use the last existing entry. If
-    // none, fall back to creating one via the SDT template path.
-    script += "treenode template = stopTimes.last;\n";
-    script += "if (!template) { print(\"addTempStopTime: no template SDT to copy from\"); return 0; }\n";
-    script += "treenode newStop = createcopy(template, stopTimes, 1);\n";
-    script += "setsdtvalue(newStop, \"enabled\", 1);\n";
-    script += "function_s(newStop, \"setModelTime\", "; script += std::to_string(modelTime); script += ");\n";
-    // Marker in dateString — user-display only, doesn't affect sim semantics.
-    script += "setsdtvalue(newStop, \"dateString\", \"";
-    script += kTempStopPrefix;
-    script += "run_to_time:";
-    script += std::to_string(stamp);
-    script += "\");\n";
-    script += "return newStop;\n";
-
-    try {
-        Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-        if (v.type == VariantType::TreeNode) {
-            treenode n = static_cast<treenode>(v);
-            if (n) {
-                try { return std::string(nodetomodelpath(n, 1).c_str()); } catch (...) {}
-            }
-        }
-    } catch (const std::exception& e) { errOut = e.what(); }
-      catch (...)                     { errOut = "unknown exception"; }
-    return "";
-}
-
-// Sweep any temp stop entries left over from prior runs. Called defensively
-// before adding a new one.
-void sweepTempStopTimes()
-{
-    std::string script;
-    script += "treenode stopTimes = Model.find(\"Tools/ModelUnits/ModelDateTimes/stopTimes\");\n";
-    script += "if (!stopTimes) return 0;\n";
-    script += "int swept = 0;\n";
-    script += "for (int i = stopTimes.subnodes.length; i >= 1; i--) {\n";
-    script += "    treenode n = stopTimes.subnodes[i];\n";
-    script += "    treenode ds = n.find(\"dateString\");\n";
-    script += "    if (ds && stringstartswith(ds.value, \"";
-    script += kTempStopPrefix;
-    script += "\")) { n.destroy(); swept++; }\n";
-    script += "}\n";
-    script += "return swept;\n";
-    try { executestring(script.c_str(), nullptr, nullptr, Variant()); } catch (...) {}
-}
-
-// Identify which user-managed stop time (if any) fired at the given sim
-// time. Returns its index (1-based) and dateString. Empty result if none
-// matched (within epsilon).
-struct FiredStopInfo {
-    int          index = 0;     // 0 if none
-    std::string  dateString;
-    double       modelTime = 0.0;
-};
-
-FiredStopInfo identifyFiredStop(double simTime)
-{
-    FiredStopInfo out;
-    std::string script;
-    script += "treenode stopTimes = Model.find(\"Tools/ModelUnits/ModelDateTimes/stopTimes\");\n";
-    script += "if (!stopTimes) return 0;\n";
-    script += "for (int i = 1; i <= stopTimes.subnodes.length; i++) {\n";
-    script += "    treenode n = stopTimes.subnodes[i];\n";
-    script += "    treenode mt = n.find(\"modelTime\");\n";
-    script += "    treenode en = n.find(\"enabled\");\n";
-    script += "    if (!mt || !en) continue;\n";
-    script += "    if (en.value == 0) continue;\n";
-    script += "    if (fabs(mt.value - "; script += std::to_string(simTime); script += ") < 1e-3) {\n";
-    script += "        treenode ds = n.find(\"dateString\");\n";
-    script += "        Map info = Map();\n";
-    script += "        info[\"index\"] = i;\n";
-    script += "        info[\"modelTime\"] = mt.value;\n";
-    script += "        info[\"dateString\"] = ds ? string(ds.value) : \"\";\n";
-    script += "        return info;\n";
-    script += "    }\n";
-    script += "}\n";
-    script += "return 0;\n";
-    try {
-        Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-        if (v.type == VariantType::Map) {
-            Map m = static_cast<Map>(v);
-            out.index     = static_cast<int>(double(m["index"]));
-            out.modelTime = static_cast<double>(double(m["modelTime"]));
-            out.dateString = std::string(m["dateString"]);
-        }
-    } catch (...) {}
-    return out;
-}
-
-// ----------------------------------------------------------------------------
-// Shared helpers for the run-tools surface (run_to_time / run_to_end /
-// run_until). See docs/superpowers/specs/2026-06-07-run-tools-design.md.
-//
-// All three tools share the same 100ms polled wait loop, the same
-// cancellation check, and the same sim-time-progress watchdog. Extracting
-// these as small inline helpers keeps each tool's body focused on its
-// driver (go() vs step()) and exit conditions.
-// ----------------------------------------------------------------------------
-
-// Read time() once. Returns NaN on engine error so callers can detect it.
-double currentSimTime()
-{
-    try {
-        Variant v = executestring("return time();", nullptr, nullptr, Variant());
-        if (v.type == VariantType::Number) return double(v);
-    } catch (...) {}
-    return std::nan("");
-}
-
-// Read eventqty() once. Returns -1 on engine error.
-int currentEventQty()
-{
-    try {
-        Variant v = executestring("return eventqty();", nullptr, nullptr, Variant());
-        if (v.type == VariantType::Number) return static_cast<int>(double(v));
-    } catch (...) {}
-    return -1;
-}
-
-// Issue the engine's stop sequence. Swallows failures — the caller is
-// already in a degraded path (timeout / cancel / stall) and there's
-// nothing useful to do if stop() itself throws.
-void issueEngineStop()
-{
-    try {
-        executestring("updatestates(); stop(1); applicationcommand(\"switchRunning\", 0); return 0;",
-                      nullptr, nullptr, Variant());
-    } catch (...) {}
-}
-
-// Sim-time-progress watchdog state. The polled loop instantiates one of
-// these at the top of the run; each 100ms tick calls check(), which
-// returns true exactly once when a stall is detected.
-//
-// Mechanism: track (last_wall, last_sim). Every 5 wall seconds, compute
-// Δsim. If Δsim < 5.0, declare stall. Otherwise update baseline and
-// keep going. Threshold matches Josh's design: "we're not a physics
-// simulator; nobody wants real-time simulation for months of planning."
-class SimProgressWatchdog
-{
-public:
-    explicit SimProgressWatchdog(double startSimTime)
-        : last_wall_ms_(GetTickCount64()), last_sim_(startSimTime) {}
-
-    // Returns true on the first tick where a stall is detected.
-    bool check()
-    {
-        ULONGLONG now_ms = GetTickCount64();
-        if (now_ms - last_wall_ms_ < kWindowMs) return false;
-        double sim_now = currentSimTime();
-        if (std::isnan(sim_now)) {
-            // Engine read failed — don't flag a stall on a transient
-            // read error; just reset the window so we try again.
-            last_wall_ms_ = now_ms;
-            return false;
-        }
-        double dsim = sim_now - last_sim_;
-        last_wall_ms_ = now_ms;
-        last_sim_     = sim_now;
-        return dsim < kMinSimSecPerWindow;
-    }
-
-    double lastSimTime() const { return last_sim_; }
-
-private:
-    static constexpr ULONGLONG kWindowMs              = 5000;   // 5 wall sec
-    static constexpr double    kMinSimSecPerWindow    = 5.0;    // 5 sim sec
-    ULONGLONG last_wall_ms_;
-    double    last_sim_;
-};
-
-// Exit reasons for the three run tools. Stringified for the JSON return.
-// Kept here so callers don't drift on spelling.
-const char* exitReasonName(int code)
-{
-    switch (code) {
-        case 0:  return "target_reached";
-        case 1:  return "events_drained";
-        case 2:  return "condition_met";
-        case 3:  return "events_drained_before_condition";
-        case 4:  return "user_stopped";
-        case 5:  return "wall_timeout";
-        case 6:  return "stalled";
-        case 7:  return "earlier_stop_fired";
-        case 8:  return "already_past_target";
-        case 9:  return "reset_during_run";
-        default: return "unknown";
-    }
-}
+// All previous run-state event machinery (Win32 events, hook install/
+// uninstall helpers, temp-stop helpers, polling-loop helpers, sim-time
+// watchdog, exit-reason mapping) was removed. The corresponding
+// `modelerai_*` tools below are now shells returning "not_implemented"
+// while the redesign is in flight. See KNOWLEDGE/topics/modelerai-quickref.md
+// for the FlexScript console patterns we know work; the new tool surface
+// will be built up from those.
+// ============================================================================
 
 } // namespace
 
@@ -4645,945 +4233,370 @@ modelerai_export Variant ModelerAi_removeParameter(FLEXSIMINTERFACE)
 // ============================================================================
 
 // ============================================================================
-// modelerai_notify_run_state(state_name, sim_time)
-//   Trigger callback. Invoked from FlexScript inside our installed hook blocks
-//   in OnRunStart / OnRunStop / OnModelReset. Records the state + time and
-//   signals the run-stop event so any waiter wakes.
+// RUN-MODEL TOOL SHELLS — clean-slate redesign in progress (2026-06-08).
+// ============================================================================
+//
+// The 15 functions below are all temporary shells. The original
+// implementations had FlexScript API mismatches (function_s used where
+// setsdtvalue belongs), wrong reset/install ordering for temp stop times,
+// and overcomplicated hook-based synchronization that the modeler is
+// rebuilding from scratch. Until the redesign lands, every tool below
+// returns "not_implemented" so the AI gets a clear signal rather than a
+// silent freeze.
+//
+// Working FlexScript console patterns (verified) live in
+// KNOWLEDGE/topics/modelerai-quickref.md under "Run-model tools (redesign
+// in progress)".
+//
+// EXCEPTION: ModelerAi_notifyRunState stays a true no-op (not an error
+// return). User model files may still carry our previously-installed
+// trigger hook code that calls `applicationcommand("modelerai_notify_run_state", ...)`.
+// Returning an error from those callers would log noise on every reset/run;
+// a no-op is invisible.
 // ============================================================================
 modelerai_export Variant ModelerAi_notifyRunState(FLEXSIMINTERFACE)
 {
-    try {
-        std::string state = strParam(param(1));
-        double simTime    = numParam(param(2), 0.0);
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            g_lastRunState = state.empty() ? std::string("Unknown") : state;
-            g_lastSimTime  = simTime;
-        }
-        ensureRunStopEvent();
-        // Signal only on Stopped / Reset — Started signaling would wake the
-        // waiter immediately after a run starts, which isn't what waiters want.
-        if (state == "Stopped" || state == "Reset") {
-            SetEvent(g_runStopEvent);
-        }
-        ModelerAi::bridge::consolePrint(
-            std::string("[ModelerAI] run-state notify: ") + state +
-            " @ t=" + std::to_string(simTime) + "\n");
-        return Variant(0.0);  // FlexScript callers don't use the return.
-    } catch (...) {
-        return Variant(0.0);
-    }
+    return Variant(0.0);
 }
 
-// ============================================================================
-// modelerai_install_run_hooks()
-//   Idempotent. Ensures the three ModelTriggers exist and that our marker
-//   block is at the bottom of each. Auto-called lazily by run / run_to_time;
-//   exposed as an explicit command so the AI can pre-install (or re-install
-//   after a hook-version bump) on demand.
-// ============================================================================
-modelerai_export Variant ModelerAi_installRunHooks(FLEXSIMINTERFACE)
-{
-    try {
-        std::string err;
-        int n = ensureAllHooksInstalled(err);
-        nlohmann::json out;
-        out["ok"] = (n == 3);
-        out["installed"] = n;
-        out["hook_version"] = kHookVersion;
-        if (!err.empty()) out["partial_errors"] = err;
-        return returnJson(out);
-    } catch (const std::exception& e) { return returnException("install_run_hooks", e.what()); }
-      catch (...)                     { return returnException("install_run_hooks", "unknown"); }
-}
 
-// ============================================================================
-// modelerai_uninstall_run_hooks()
-//   Finds and removes our marker blocks from all three triggers, rebuilds.
-//   Useful before sharing a model with someone who doesn't have ModelerAI.
-// ============================================================================
-modelerai_export Variant ModelerAi_uninstallRunHooks(FLEXSIMINTERFACE)
-{
-    try {
-        const char* triggers[] = { "OnRunStart", "OnRunStop", "OnModelReset" };
-        int removed = 0;
-        std::string err;
-        for (const char* t : triggers) {
-            std::string e;
-            if (uninstallHookFromTrigger(t, e)) removed++;
-            else if (!e.empty()) err += std::string(t) + ": " + e + "; ";
-        }
-        nlohmann::json out;
-        out["ok"] = removed > 0;
-        out["removed"] = removed;
-        if (!err.empty()) out["partial_errors"] = err;
-        return returnJson(out);
-    } catch (const std::exception& e) { return returnException("uninstall_run_hooks", e.what()); }
-      catch (...)                     { return returnException("uninstall_run_hooks", "unknown"); }
-}
 
-// ============================================================================
-// modelerai_reset_model()
-//   Full reset matching the GUI's behavior: notify document listeners, clear
-//   stats-delegate "initialized" flags, then resetmodel(1).
-// ============================================================================
+// modelerai_reset_model() — resetmodel(1) + clear toolbar Running indicator.
+// Returns { ok, sim_time }. sim_time is always 0 after a successful reset.
 modelerai_export Variant ModelerAi_resetModel(FLEXSIMINTERFACE)
 {
     try {
-        std::string script;
-        // Clear stats-delegate initialized vars (matches the GUI's Execute/reset block).
-        script += "treenode delegates = node(\"MAIN:/project/exec/globals/serverinterface/delegates\");\n";
-        script += "if (delegates && content(delegates) > 0) {\n";
-        script += "    for (int ci = 1; ci <= content(delegates); ci++) {\n";
-        script += "        treenode container = rank(delegates, ci);\n";
-        script += "        for (int i = 1; i <= content(container); i++) {\n";
-        script += "            setvarnum(rank(container, i), \"initialized\", 0);\n";
-        script += "        }\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "applicationcommand(\"notifydoclistenersoncustomaction\", \"Reset\");\n";
-        script += "resetmodel(1);\n";
-        script += "applicationcommand(\"switchRunning\", 0);\n";
-        script += "return time();\n";
-
         double finalTime = 0.0;
         try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
+            Variant v = executestring(
+                "resetmodel(1); applicationcommand(\"switchRunning\", 0); return time();",
+                nullptr, nullptr, Variant());
             if (v.type == VariantType::Number) finalTime = double(v);
-        } catch (...) {}
-
+        } catch (const std::exception& e) {
+            return returnError("reset_failed", e.what());
+        }
         nlohmann::json out;
-        out["ok"] = true;
+        out["ok"]       = true;
         out["sim_time"] = finalTime;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("reset_model", e.what()); }
       catch (...)                     { return returnException("reset_model", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_run_to_time(target_sim_time)
-//   Adds a temporary stop time at `target`, kicks off go(1), waits on the
-//   run-stop event (signaled by our OnRunStop hook), reads final state +
-//   sim time, identifies WHICH stop fired (target / earlier user stop /
-//   other), cleans up the temp stop, returns.
-// ============================================================================
+// modelerai_run_to_time({target_sim_time})
+//
+// Stub. The real work lives in the modelerai_call dispatcher
+// (tools/write/modelerai_call.cpp) under a special case for this command
+// name. The dispatcher runs the wait loop on the AGENT WORKER thread and
+// drives each small main-thread interaction (install, polled state read,
+// cleanup) through mainthread::runAndWait. Between polls the main thread
+// is FlexSim's, so sim advances normally.
+//
+// This stub exists so the FlexScript binding in ModelerAI.fsx still
+// resolves. If anyone invokes applicationcommand("modelerai_run_to_time",
+// ...) directly (bypassing modelerai_call), they get this error.
 modelerai_export Variant ModelerAi_runToTime(FLEXSIMINTERFACE)
 {
-    try {
-        // Accept whatever shape the AI sends:
-        //   - bare number:    600
-        //   - 1-arg pos:      [600]
-        //   - 2-arg pos:      [600, 60]   (target + timeout_seconds)
-        //   - JSON object:    "{\"target_sim_time\": 600, \"timeout_seconds\": 60}"
-        //                     also accepts "target" or "time" as the key
-        //                     and "timeout" as the timeout key.
-        //
-        // Original tool only took a bare positional Number. Frustrated the
-        // AI into 2-4 wasted calls per run (export 2026-06-07 showed
-        // {"time": 600} and {"target_sim_time": 600} both rejected before
-        // the AI guessed the right shape). Default timeout stays 300s.
-        Variant arg     = param(1);
-        Variant arg2    = param(2);
-        double  target      = 0.0;
-        double  timeoutSec  = 300.0;
-        bool    haveTarget  = false;
-
-        if (arg.type == VariantType::Number) {
-            target = double(arg);
-            haveTarget = true;
-            if (arg2.type == VariantType::Number) timeoutSec = double(arg2);
-        } else if (arg.type == VariantType::String) {
-            std::string s = std::string(arg);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object()) {
-                        // Try each common key for the target.
-                        for (const char* k : { "target_sim_time", "target", "time", "sim_time" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                target = j[k].get<double>();
-                                haveTarget = true;
-                                break;
-                            }
-                        }
-                        for (const char* k : { "timeout_seconds", "timeout", "wall_timeout" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                timeoutSec = j[k].get<double>();
-                                break;
-                            }
-                        }
-                    }
-                } catch (...) {
-                    // Fall through to the missing_target error below.
-                }
-            }
-        }
-
-        if (!haveTarget) {
-            nlohmann::json out;
-            out["ok"] = false;
-            out["error_code"]    = "missing_target";
-            out["error_message"] = "modelerai_run_to_time expects a numeric target sim time. "
-                                   "Any of these shapes work: bare number 600, positional [600], "
-                                   "positional with timeout [600, 60], or JSON "
-                                   "{\"target_sim_time\": 600, \"timeout_seconds\": 60}. "
-                                   "(Also accepted: target / time / sim_time as the target key, "
-                                   "timeout / wall_timeout as the timeout key.)";
-            return returnJson(out);
-        }
-
-        // Ensure hooks are installed (lazy first-use).
-        if (!g_hooksInstallScanDone.load()) {
-            std::string instErr;
-            ensureAllHooksInstalled(instErr);
-        }
-        ensureRunStopEvent();
-
-        // Already past target? Bail (AI should reset first).
-        double now = 0.0;
-        try {
-            Variant nt = executestring("return time();", nullptr, nullptr, Variant());
-            if (nt.type == VariantType::Number) now = double(nt);
-        } catch (...) {}
-        if (now >= target) {
-            nlohmann::json out;
-            out["ok"] = true;
-            out["completed"] = false;
-            out["target_sim_time"] = target;
-            out["final_sim_time"] = now;
-            out["run_state"] = "Stopped";
-            out["reason"] = "already_past_target";
-            out["note"] = "Current sim time is already at or past the target. Reset the model first.";
-            return returnJson(out);
-        }
-
-        // Sweep any stale temp stops from a previous (crashed) run.
-        sweepTempStopTimes();
-
-        // Install our temp stop at the target.
-        std::string addErr;
-        std::string newStopPath = addTempStopTime(target, addErr);
-        if (newStopPath.empty()) {
-            nlohmann::json out;
-            out["ok"] = false;
-            out["error_code"] = "temp_stop_install_failed";
-            out["error_message"] = addErr.empty() ? std::string("Could not add the temporary stop time.") : addErr;
-            return returnJson(out);
-        }
-
-        // Reset the event + kick off the run.
-        ResetEvent(g_runStopEvent);
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            g_lastRunState = "Running";
-            g_lastSimTime  = now;
-        }
-        try { executestring("go(1);", nullptr, nullptr, Variant()); }
-        catch (...) {
-            sweepTempStopTimes();
-            nlohmann::json out;
-            out["ok"] = false;
-            out["error_code"] = "go_failed";
-            out["error_message"] = "go(1) threw — model may not be in a runnable state.";
-            return returnJson(out);
-        }
-
-        // Wait for OnRunStop / OnModelReset hook to signal, or for our
-        // real-world timeout to expire, or for the user to click Stop.
-        //
-        // Previously this was a single WaitForSingleObject(INFINITE) which
-        // meant a runaway trigger inside the model would lock this thread
-        // forever — viewer Stop button couldn't reach us, and the only
-        // recovery was Task Manager → kill FlexSim. Now we poll in 100ms
-        // ticks and check the agent's cancel flag between each, so a Stop
-        // click unblocks within ~100ms.
-        bool timedOut     = false;
-        bool userStopped  = false;
-        bool noMoreEvents = false;
-        DWORD totalMs     = (timeoutSec < 0.0) ? 0
-                                               : static_cast<DWORD>(timeoutSec * 1000.0);
-        DWORD elapsedMs   = 0;
-        const DWORD kTickMs = 100;
-        ModelerAi::agent::Agent* a = ModelerAi::bootstrap::agent();
-        // Resolve the events node once. The event queue is hung off
-        // maintree at project/exec/events; nothing left in its subnodes
-        // means the simulation has exhausted every scheduled event, so
-        // sim time can't advance regardless of what target was asked for.
-        TreeNode* eventsNode = nullptr;
-        try { eventsNode = maintree()->find("project/exec/events"); } catch (...) {}
-        while (true) {
-            DWORD waitResult = WaitForSingleObject(g_runStopEvent, kTickMs);
-            if (waitResult == WAIT_OBJECT_0) {
-                break;  // model stopped (OnRunStop fired) — normal path
-            }
-            if (waitResult != WAIT_TIMEOUT) {
-                // Wait failed (handle invalid?) — bail to avoid spinning.
-                timedOut = true;
-                break;
-            }
-            // Poll cancellation. cancelRequested() is set when the user
-            // clicks Stop in the viewer — the bridge sets the flag from a
-            // different thread than this one, and this loop notices.
-            if (a && a->cancelRequested()) {
-                userStopped = true;
-                break;
-            }
-            // Empty event queue ⇒ nothing more to do. Skip waiting for an
-            // OnRunStop that may not fire reliably on exhaustion.
-            if (eventsNode) {
-                int eventsLeft = 0;
-                try { eventsLeft = (int)eventsNode->subnodes.length; } catch (...) {}
-                if (eventsLeft == 0) {
-                    noMoreEvents = true;
-                    break;
-                }
-            }
-            // Wall-clock budget.
-            elapsedMs += kTickMs;
-            if (timeoutSec >= 0.0 && elapsedMs >= totalMs) {
-                timedOut = true;
-                break;
-            }
-        }
-        if (timedOut || userStopped || noMoreEvents) {
-            // Stop the model so it doesn't keep churning in the background
-            // after we return. Swallow any stop() failure — we're already
-            // in a degraded path.
-            try {
-                executestring("updatestates(); stop(1); applicationcommand(\"switchRunning\", 0); return 0;",
-                              nullptr, nullptr, Variant());
-            } catch (...) {}
-        }
-
-        // Capture final state.
-        std::string state;
-        double finalTime = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            state     = g_lastRunState;
-            finalTime = g_lastSimTime;
-        }
-
-        // Clean up our temp stop. Identify which stop fired BEFORE cleanup
-        // (otherwise our entry could be the "match").
-        bool reachedTarget = std::abs(finalTime - target) < 1e-3;
-        FiredStopInfo fired;
-        if (!reachedTarget) {
-            fired = identifyFiredStop(finalTime);
-            // If the fired one is our own marker, treat as target reached
-            // (shouldn't happen with the epsilon check, but defensive).
-            if (fired.dateString.rfind(kTempStopPrefix, 0) == 0) {
-                reachedTarget = true;
-                fired = FiredStopInfo{};
-            }
-        }
-        sweepTempStopTimes();
-
-        std::string reason;
-        if (userStopped)          reason = "user_stopped";
-        else if (noMoreEvents)    reason = "no_more_events";
-        else if (timedOut)        reason = "wall_timeout";
-        else if (reachedTarget)   reason = "target_reached";
-        else if (fired.index > 0) reason = "earlier_stop_fired";
-        else if (state == "Reset") reason = "reset_during_run";
-        else reason = "stopped_early";
-
-        nlohmann::json out;
-        out["ok"] = true;
-        out["completed"]     = reachedTarget;
-        out["timed_out"]     = timedOut;
-        out["user_stopped"]  = userStopped;
-        out["no_more_events"] = noMoreEvents;
-        out["target_sim_time"] = target;
-        out["final_sim_time"] = finalTime;
-        out["run_state"] = state;
-        out["reason"] = reason;
-        if (noMoreEvents) {
-            out["events_note"] = "Event queue is empty — the simulation ran every "
-                                 "scheduled event before sim time reached the target. "
-                                 "Common causes: Source's arrival rate produced N items "
-                                 "and stopped (e.g. ArrivalSchedule exhausted), every "
-                                 "flowitem reached the Sink, or no Source is producing. "
-                                 "Inspect via modelerai_get_model_summary.";
-        }
-        if (timedOut) {
-            out["timeout_seconds"] = timeoutSec;
-            out["timeout_note"]    = "Wall-clock timeout fired before the model "
-                                     "reached its target. The model has been stopped. "
-                                     "Common causes: deadlocked flow (everything's "
-                                     "stuck), no Source generating items, a trigger "
-                                     "body in an infinite loop, or the model is "
-                                     "genuinely slower than the budget. Inspect via "
-                                     "modelerai_get_model_summary.";
-        }
-        if (userStopped) {
-            out["stop_note"] = "User clicked Stop in the viewer; the model has been "
-                               "stopped at its current sim time. Any work the AI "
-                               "did before this point is preserved.";
-        }
-        if (fired.index > 0) {
-            nlohmann::json f;
-            f["index"] = fired.index;
-            f["model_time"] = fired.modelTime;
-            f["date_string"] = fired.dateString;
-            out["fired_stop"] = std::move(f);
-        }
-        return returnJson(out);
-    } catch (const std::exception& e) { return returnException("run_to_time", e.what()); }
-      catch (...)                     { return returnException("run_to_time", "unknown"); }
+    return returnError("invoke_via_modelerai_call",
+        "modelerai_run_to_time must be invoked through the modelerai_call "
+        "dispatcher, not through applicationcommand directly. The "
+        "dispatcher runs the wait on the worker thread so FlexSim's main "
+        "thread is free to advance sim between polls; a direct call from "
+        "FlexScript would block the main thread and the run would never "
+        "progress past t=0.");
 }
 
-// ============================================================================
-// modelerai_run_to_end([timeout_seconds])
-//   Drives go(1) and waits for the event queue to drain naturally. No temp
-//   stop installed; the model runs until something stops it (FlexSim's own
-//   stop times, OnRunStop, eventqty going to zero, the user clicking Stop,
-//   the wall-clock budget, or the sim-time-progress watchdog firing).
+// Internal helper: shared step-loop body for run_until + run_to_end.
 //
-//   See docs/superpowers/specs/2026-06-07-run-tools-design.md (Tool 2).
-// ============================================================================
+// Builds a FlexScript snippet:
+//
+//    resetmodel(1);
+//    applicationcommand("switchRunning", 0);
+//    Map out = Map();
+//    int safetyTime = <safety_sec>;
+//    int steps = 0;
+//    int reason = 0;   // 0=events_drained, 1=condition_met, 2=safety_capped
+//    while (eventqty() > 0 && time() <= safetyTime) {
+//        step();
+//        steps++;
+//        if (<condition>) { reason = 1; break; }   // omitted if no condition
+//    }
+//    if (time() > safetyTime && reason == 0) reason = 2;
+//    out["reason"]         = reason;
+//    out["final_sim_time"] = time();
+//    out["steps_taken"]    = steps;
+//    out["condition_value"]= (<condition>);   // only for run_until
+//    return out;
+//
+// `condition` is the verbatim FlexScript expression from the caller. If
+// empty, no condition check is emitted (run_to_end semantics).
+namespace {
+nlohmann::json runStepLoopShared(const char* commandName,
+                                 double safetySec,
+                                 const std::string& condition)
+{
+    std::string condExpr = condition.empty() ? std::string("0") : condition;
+
+    std::string script;
+    script += "resetmodel(1);\n";
+    script += "applicationcommand(\"switchRunning\", 0);\n";
+    script += "Map out = Map();\n";
+    script += "double safetyTime = "; script += std::to_string(safetySec); script += ";\n";
+    script += "int steps = 0;\n";
+    script += "int reason = 0;\n";
+    script += "while (eventqty() > 0 && time() <= safetyTime) {\n";
+    script += "    step();\n";
+    script += "    steps++;\n";
+    if (!condition.empty()) {
+        script += "    if (("; script += condExpr; script += ")) { reason = 1; break; }\n";
+    }
+    script += "}\n";
+    script += "if (time() > safetyTime && reason == 0) reason = 2;\n";
+    script += "out[\"reason\"]          = reason;\n";
+    script += "out[\"final_sim_time\"]  = time();\n";
+    script += "out[\"steps_taken\"]     = steps;\n";
+    if (!condition.empty()) {
+        script += "out[\"condition_value\"] = (("; script += condExpr; script += ") ? 1 : 0);\n";
+    }
+    script += "return out;\n";
+
+    nlohmann::json out;
+    try {
+        Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
+        if (v.type != VariantType::Map) {
+            out["ok"]            = false;
+            out["error_code"]    = "loop_returned_wrong_type";
+            out["error_message"] = "Step loop returned non-Map; the condition "
+                                   "expression may have a compile error. "
+                                   "Condition: " + condition;
+            return out;
+        }
+        Map m = static_cast<Map>(v);
+        int reason       = static_cast<int>(double(m["reason"]));
+        double finalTime = static_cast<double>(double(m["final_sim_time"]));
+        long long steps  = static_cast<long long>(double(m["steps_taken"]));
+
+        std::string reasonStr;
+        switch (reason) {
+            case 1:  reasonStr = "condition_met";  break;
+            case 2:  reasonStr = "safety_capped";  break;
+            default: reasonStr = "events_drained"; break;
+        }
+
+        out["ok"]                  = true;
+        out["reason"]              = reasonStr;
+        out["final_sim_time"]      = finalTime;
+        out["steps_taken"]         = steps;
+        out["safety_sim_seconds"]  = safetySec;
+        if (!condition.empty()) {
+            int condVal = static_cast<int>(double(m["condition_value"]));
+            out["condition_value"] = (condVal != 0);
+        }
+    } catch (const std::exception& e) {
+        out["ok"]            = false;
+        out["error_code"]    = std::string(commandName) + "_failed";
+        out["error_message"] = std::string("step-loop threw: ") + e.what()
+                             + (condition.empty() ? std::string()
+                                : std::string(" — most likely a condition "
+                                              "expression error. Expression: ")
+                                  + condition);
+    }
+    return out;
+}
+
+// Parse args common to both run-loop tools.
+// Supported shapes (all need safety_sim_seconds):
+//   JSON   : {"safety_sim_seconds": 259200, "condition": "..."}
+// For run_to_end, `condition` is unused (and rejected if supplied).
+bool parseRunLoopArgs(const std::string& argStr,
+                      bool wantCondition,
+                      double& outSafetySec,
+                      std::string& outCondition,
+                      std::string& errCode,
+                      std::string& errMsg)
+{
+    try {
+        auto j = nlohmann::json::parse(argStr);
+        if (!j.is_object()) {
+            errCode = "bad_args_shape";
+            errMsg  = "expected JSON object";
+            return false;
+        }
+        bool haveSafety = false;
+        for (const char* k : { "safety_sim_seconds", "safety", "safety_seconds" }) {
+            if (j.contains(k) && j[k].is_number()) {
+                outSafetySec = j[k].get<double>();
+                haveSafety = true;
+                break;
+            }
+        }
+        if (!haveSafety) {
+            errCode = "missing_safety_cap";
+            errMsg  = "safety_sim_seconds is required. Pick a sim-time budget "
+                      "the run shouldn't exceed (e.g. days(N), hours(N) — "
+                      "expressed as raw seconds in JSON since it can't call "
+                      "FlexScript helpers).";
+            return false;
+        }
+        if (outSafetySec <= 0.0) {
+            errCode = "bad_safety_cap";
+            errMsg  = "safety_sim_seconds must be > 0.";
+            return false;
+        }
+
+        if (wantCondition) {
+            if (!j.contains("condition") || !j["condition"].is_string()
+                || j["condition"].get<std::string>().empty())
+            {
+                errCode = "missing_condition";
+                errMsg  = "condition (FlexScript expression string) is "
+                          "required. Example: \"Model.find(\\\"Sink1\\\")"
+                          ".stats.input.value >= 100\"";
+                return false;
+            }
+            outCondition = j["condition"].get<std::string>();
+        }
+        return true;
+    } catch (const std::exception& e) {
+        errCode = "bad_args_json";
+        errMsg  = std::string("parse: ") + e.what();
+        return false;
+    }
+}
+} // namespace
+
+// modelerai_run_to_end({safety_sim_seconds})
+//
+// Resets, then steps until eventqty() == 0 OR sim time exceeds the safety
+// cap. NO condition. step() ignores stop times — if you have stop-time
+// entries you want respected, use modelerai_run_to_time.
 modelerai_export Variant ModelerAi_runToEnd(FLEXSIMINTERFACE)
 {
     try {
-        // Parse timeout — accepts bare number, [N], or { "timeout_seconds": N }.
-        // No required args.
-        double timeoutSec = 300.0;
         Variant arg = param(1);
-        if (arg.type == VariantType::Number) {
-            timeoutSec = double(arg);
-        } else if (arg.type == VariantType::String) {
-            std::string s = std::string(arg);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object()) {
-                        for (const char* k : { "timeout_seconds", "timeout", "wall_timeout" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                timeoutSec = j[k].get<double>();
-                                break;
-                            }
-                        }
-                    }
-                } catch (...) {}
-            }
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_run_to_end expects { safety_sim_seconds } JSON.");
         }
-
-        if (!g_hooksInstallScanDone.load()) {
-            std::string instErr;
-            ensureAllHooksInstalled(instErr);
+        double safetySec = 0.0;
+        std::string condition;  // unused
+        std::string errCode, errMsg;
+        if (!parseRunLoopArgs(std::string(arg), /*wantCondition=*/false,
+                              safetySec, condition, errCode, errMsg)) {
+            return returnError(errCode.c_str(), errMsg);
         }
-        ensureRunStopEvent();
-
-        // Reset the run-stop event, mark state, kick off the run.
-        ResetEvent(g_runStopEvent);
-        double now = currentSimTime();
-        if (std::isnan(now)) now = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            g_lastRunState = "Running";
-            g_lastSimTime  = now;
-        }
-        try { executestring("go(1);", nullptr, nullptr, Variant()); }
-        catch (...) {
-            return returnError("go_failed",
-                "go(1) threw — model may not be in a runnable state. "
-                "Try modelerai_reset_model and retry.");
-        }
-
-        // Polled wait loop. Exit on: OnRunStop signal, agent cancel, event
-        // queue drained, wall timeout, sim-time-progress stall.
-        bool userStopped  = false;
-        bool timedOut     = false;
-        bool noMoreEvents = false;
-        bool stalled      = false;
-        DWORD totalMs     = (timeoutSec < 0.0) ? 0
-                                               : static_cast<DWORD>(timeoutSec * 1000.0);
-        DWORD elapsedMs   = 0;
-        const DWORD kTickMs = 100;
-        ModelerAi::agent::Agent* a = ModelerAi::bootstrap::agent();
-        SimProgressWatchdog watchdog(now);
-
-        while (true) {
-            DWORD waitResult = WaitForSingleObject(g_runStopEvent, kTickMs);
-            if (waitResult == WAIT_OBJECT_0) break;  // OnRunStop fired
-            if (waitResult != WAIT_TIMEOUT) { timedOut = true; break; }
-            if (a && a->cancelRequested()) { userStopped = true; break; }
-            if (currentEventQty() == 0)    { noMoreEvents = true; break; }
-            if (watchdog.check())          { stalled = true; break; }
-            elapsedMs += kTickMs;
-            if (timeoutSec >= 0.0 && elapsedMs >= totalMs) { timedOut = true; break; }
-        }
-
-        // Recovery: any non-OnRunStop exit needs an explicit engine stop.
-        if (userStopped || timedOut || noMoreEvents || stalled) {
-            issueEngineStop();
-        }
-
-        // Capture final state.
-        std::string state;
-        double finalTime = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            state     = g_lastRunState;
-            finalTime = g_lastSimTime;
-        }
-
-        // Identify which fired stop (if any) terminated the run early.
-        FiredStopInfo fired;
-        if (!userStopped && !timedOut && !noMoreEvents && !stalled) {
-            fired = identifyFiredStop(finalTime);
-        }
-
-        std::string reason;
-        if      (userStopped)       reason = exitReasonName(4);  // user_stopped
-        else if (stalled)           reason = exitReasonName(6);  // stalled
-        else if (noMoreEvents)      reason = exitReasonName(1);  // events_drained
-        else if (timedOut)          reason = exitReasonName(5);  // wall_timeout
-        else if (fired.index > 0)   reason = exitReasonName(7);  // earlier_stop_fired
-        else if (state == "Reset")  reason = exitReasonName(9);  // reset_during_run
-        else                        reason = exitReasonName(1);  // events_drained (OnRunStop signaled w/o other cause)
-
-        nlohmann::json out;
-        out["ok"]            = true;
-        out["completed"]     = (reason == "events_drained");
-        out["user_stopped"]  = userStopped;
-        out["timed_out"]     = timedOut;
-        out["stalled"]       = stalled;
-        out["final_sim_time"]= finalTime;
-        out["run_state"]     = state;
-        out["reason"]        = reason;
-        if (stalled) {
-            out["stalled_note"] = "Sim time stopped advancing — the model likely has a "
-                                  "runaway trigger body or a recursive event loop. Check "
-                                  "the most recently-set triggers / FlexScript-valued "
-                                  "properties (OnEntry / OnExit / SendToPort / ProcessTime). "
-                                  "If FlexSim's UI itself is unresponsive, kill the process "
-                                  "from Task Manager.";
-        }
-        if (timedOut) {
-            out["timeout_seconds"] = timeoutSec;
-            out["timeout_note"]    = "Wall-clock budget elapsed before the event queue "
-                                     "drained. Either raise timeout_seconds or check the "
-                                     "model — a Source that never stops producing will run "
-                                     "forever in mode 2.";
-        }
-        if (userStopped) {
-            out["stop_note"] = "User clicked Stop in the viewer.";
-        }
-        if (fired.index > 0) {
-            nlohmann::json f;
-            f["index"]       = fired.index;
-            f["model_time"]  = fired.modelTime;
-            f["date_string"] = fired.dateString;
-            out["fired_stop"] = std::move(f);
-        }
+        nlohmann::json out = runStepLoopShared("run_to_end", safetySec, "");
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("run_to_end", e.what()); }
       catch (...)                     { return returnException("run_to_end", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_run_until({ expression | pm + op + value }, [timeout_seconds])
-//   Step-driven loop. After each step, evaluates a user-supplied condition;
-//   exits when condition is truthy. Two condition shapes:
+// modelerai_run_until({condition, safety_sim_seconds})
 //
-//     A) FlexScript expression: { "expression": "<expr>" }
-//        Wrapped as `return (<expr>) ? 1 : 0;` and executestring'd. Soft-
-//        fails per-step on eval errors (treats as false). Caller should
-//        prefer simple expressions like Sink stats / label reads.
-//
-//     B) Structured PM: { "pm": "<name>", "op": "<op>", "value": <n> }
-//        Resolves Model.performanceMeasures.<name> once at start; after
-//        each step, evaluates the PM and compares to value via op.
-//        op ∈ {">=", ">", "<=", "<", "==", "!="}.
-//
-//   step() ignores stop times — if the modeler has user-defined stop times
-//   in the model, run_until will blow through them silently. Prefer
-//   run_to_time when stop times matter.
-//
-//   See docs/superpowers/specs/2026-06-07-run-tools-design.md (Tool 3).
-// ============================================================================
+// Resets, then steps until the supplied FlexScript condition evaluates true
+// OR eventqty() == 0 OR sim time exceeds the safety cap. `condition` is a
+// raw FlexScript expression (will be wrapped in parens at the compare
+// site). step() ignores stop times.
 modelerai_export Variant ModelerAi_runUntil(FLEXSIMINTERFACE)
 {
     try {
         Variant arg = param(1);
         if (arg.type != VariantType::String) {
-            return returnError("missing_condition",
-                "modelerai_run_until expects a JSON object with either "
-                "\"expression\" (FlexScript) or \"pm\" + \"op\" + \"value\" "
-                "(structured PM check). Also accepts \"timeout_seconds\".");
+            return returnError("missing_args",
+                "modelerai_run_until expects { condition, safety_sim_seconds } JSON.");
         }
-
-        std::string expression;
-        std::string pmName;
-        std::string opStr;
-        double      threshold   = 0.0;
-        double      timeoutSec  = 300.0;
-        bool        haveExpr    = false;
-        bool        haveStruct  = false;
-        try {
-            auto j = nlohmann::json::parse(std::string(arg));
-            if (!j.is_object()) {
-                return returnError("bad_args_shape",
-                    "modelerai_run_until expects a JSON object.");
-            }
-            if (j.contains("expression") && j["expression"].is_string()) {
-                expression = j["expression"].get<std::string>();
-                haveExpr = !expression.empty();
-            }
-            if (j.contains("pm") && j["pm"].is_string()
-                && j.contains("op") && j["op"].is_string()
-                && j.contains("value") && j["value"].is_number())
-            {
-                pmName    = j["pm"].get<std::string>();
-                opStr     = j["op"].get<std::string>();
-                threshold = j["value"].get<double>();
-                haveStruct = !pmName.empty() && !opStr.empty();
-            }
-            for (const char* k : { "timeout_seconds", "timeout", "wall_timeout" }) {
-                if (j.contains(k) && j[k].is_number()) {
-                    timeoutSec = j[k].get<double>();
-                    break;
-                }
-            }
-        } catch (const std::exception& e) {
-            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        double safetySec = 0.0;
+        std::string condition;
+        std::string errCode, errMsg;
+        if (!parseRunLoopArgs(std::string(arg), /*wantCondition=*/true,
+                              safetySec, condition, errCode, errMsg)) {
+            return returnError(errCode.c_str(), errMsg);
         }
-
-        if (!haveExpr && !haveStruct) {
-            return returnError("missing_condition",
-                "Supply either \"expression\" (FlexScript) or "
-                "\"pm\" + \"op\" + \"value\" (structured PM check).");
-        }
-        if (haveExpr && haveStruct) {
-            return returnError("bad_condition_shape",
-                "Supply EITHER \"expression\" OR \"pm\" + \"op\" + \"value\", "
-                "not both.");
-        }
-        if (haveStruct) {
-            static const std::set<std::string> kOps = {
-                ">=", ">", "<=", "<", "==", "!="
-            };
-            if (!kOps.count(opStr)) {
-                return returnError("bad_operator",
-                    "op must be one of >=, >, <=, <, ==, !=.");
-            }
-        }
-
-        // For the structured shape, resolve the PM once. We evaluate via
-        // its accessor each step rather than walking the tree.
-        if (haveStruct) {
-            std::string probe = "return Model.performanceMeasures."
-                              + pmName + ".value;";
-            try {
-                Variant v = executestring(probe.c_str(), nullptr, nullptr, Variant());
-                if (v.type != VariantType::Number) {
-                    return returnError("pm_not_found",
-                        "PerformanceMeasure '" + pmName + "' did not resolve "
-                        "to a numeric value. Check the PM name with "
-                        "modelerai_list_performance_measures.");
-                }
-            } catch (const std::exception& e) {
-                return returnError("pm_not_found",
-                    "Could not resolve PerformanceMeasure '" + pmName
-                    + "': " + e.what());
-            }
-        }
-
-        if (!g_hooksInstallScanDone.load()) {
-            std::string instErr;
-            ensureAllHooksInstalled(instErr);
-        }
-
-        double startSim = currentSimTime();
-        if (std::isnan(startSim)) startSim = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            g_lastRunState = "Running";
-            g_lastSimTime  = startSim;
-        }
-
-        // Build the per-step condition evaluator. Both shapes reduce to a
-        // double; we compare against threshold (struct) or treat non-zero
-        // as truthy (expression).
-        std::string condScript;
-        if (haveExpr) {
-            condScript = "return (" + expression + ") ? 1 : 0;";
-        } else {
-            condScript = "return Model.performanceMeasures." + pmName + ".value;";
-        }
-
-        auto evalCondition = [&](double& outValue, bool& outFailed) -> bool {
-            outFailed = false;
-            try {
-                Variant v = executestring(condScript.c_str(), nullptr, nullptr, Variant());
-                if (v.type == VariantType::Number) {
-                    outValue = double(v);
-                    if (haveExpr) return outValue != 0.0;
-                    // Structured: compare via op.
-                    if      (opStr == ">=") return outValue >= threshold;
-                    else if (opStr == ">")  return outValue >  threshold;
-                    else if (opStr == "<=") return outValue <= threshold;
-                    else if (opStr == "<")  return outValue <  threshold;
-                    else if (opStr == "==") return outValue == threshold;
-                    else if (opStr == "!=") return outValue != threshold;
-                    return false;
-                }
-            } catch (...) {
-                outFailed = true;
-            }
-            return false;
-        };
-
-        // Step loop. step() blocks while it fires one event; between steps
-        // we check condition, eventqty, cancel, wall timeout, watchdog.
-        bool conditionMet = false;
-        bool userStopped  = false;
-        bool timedOut     = false;
-        bool noMoreEvents = false;
-        bool stalled      = false;
-        long long stepsTaken     = 0;
-        long long evalAttempts   = 0;
-        long long evalFailures   = 0;
-        double    lastCondValue  = 0.0;
-        DWORD     totalMs     = (timeoutSec < 0.0) ? 0
-                                                   : static_cast<DWORD>(timeoutSec * 1000.0);
-        ULONGLONG startWallMs = GetTickCount64();
-        ModelerAi::agent::Agent* a = ModelerAi::bootstrap::agent();
-        SimProgressWatchdog watchdog(startSim);
-
-        // Check the condition once before any step — maybe it's already
-        // true (e.g. the modeler asks "until sink has >= 0 items" or the
-        // model is already in the target state).
-        {
-            double val = 0.0; bool failed = false;
-            if (evalCondition(val, failed)) {
-                conditionMet = true;
-                lastCondValue = val;
-            }
-            evalAttempts++;
-            if (failed) evalFailures++;
-        }
-
-        while (!conditionMet) {
-            // Cheap pre-step checks first.
-            if (a && a->cancelRequested()) { userStopped = true; break; }
-            if (currentEventQty() == 0)    { noMoreEvents = true; break; }
-            // Wall timeout BEFORE the step so we don't overshoot.
-            ULONGLONG nowMs = GetTickCount64();
-            if (timeoutSec >= 0.0 && (nowMs - startWallMs) >= totalMs) {
-                timedOut = true;
-                break;
-            }
-            if (watchdog.check()) { stalled = true; break; }
-
-            // Fire one event.
-            try {
-                executestring("step();", nullptr, nullptr, Variant());
-                stepsTaken++;
-            } catch (...) {
-                return returnError("step_failed",
-                    "step() threw mid-loop. The model may have entered "
-                    "an invalid state. Check the most recently-fired "
-                    "trigger or event.");
-            }
-
-            // Re-check the condition.
-            double val = 0.0; bool failed = false;
-            evalAttempts++;
-            if (evalCondition(val, failed)) {
-                conditionMet = true;
-                lastCondValue = val;
-            } else {
-                lastCondValue = val;
-            }
-            if (failed) evalFailures++;
-        }
-
-        // Capture final sim time before stopping the engine.
-        double finalSim = currentSimTime();
-        if (std::isnan(finalSim)) finalSim = watchdog.lastSimTime();
-
-        // Recovery: explicit stop for any non-condition_met exit.
-        if (!conditionMet) issueEngineStop();
-
-        // If every single evaluation failed, the expression itself is bad.
-        // Soft-fail per-step (false), but escalate on a 100% failure rate.
-        if (haveExpr && evalAttempts > 0 && evalFailures == evalAttempts) {
-            return returnError("expression_eval_failed",
-                "FlexScript expression failed to evaluate on every step. "
-                "Common causes: typo, missing variable, or referencing "
-                "an object that doesn't exist. Expression: " + expression);
-        }
-
-        std::string reason;
-        if      (conditionMet)  reason = exitReasonName(2);  // condition_met
-        else if (userStopped)   reason = exitReasonName(4);  // user_stopped
-        else if (stalled)       reason = exitReasonName(6);  // stalled
-        else if (noMoreEvents)  reason = exitReasonName(3);  // events_drained_before_condition
-        else if (timedOut)      reason = exitReasonName(5);  // wall_timeout
-        else                    reason = "unknown";
-
-        nlohmann::json out;
-        out["ok"]                 = true;
-        out["completed"]          = conditionMet;
-        out["user_stopped"]       = userStopped;
-        out["timed_out"]          = timedOut;
-        out["stalled"]            = stalled;
-        out["final_sim_time"]     = finalSim;
-        out["steps_taken"]        = stepsTaken;
-        out["final_condition_value"] = lastCondValue;
-        out["reason"]             = reason;
-        if (haveExpr && evalFailures > 0) {
-            out["eval_failures"] = evalFailures;
-            out["eval_attempts"] = evalAttempts;
-        }
-        if (stalled) {
-            out["stalled_note"] = "Sim time stopped advancing during step()-loop. "
-                                  "The condition may never become true with the "
-                                  "current event flow, or a trigger body has gone "
-                                  "into an infinite loop. Check the most recently-"
-                                  "set triggers.";
-        }
-        if (timedOut) {
-            out["timeout_seconds"] = timeoutSec;
-            out["timeout_note"]    = "Wall-clock budget elapsed before condition was "
-                                     "met. Final condition value: "
-                                   + std::to_string(lastCondValue)
-                                   + ". Either raise timeout_seconds or relax the condition.";
-        }
-        if (noMoreEvents) {
-            out["events_note"] = "Event queue drained before the condition was met. "
-                                 "Final condition value: " + std::to_string(lastCondValue)
-                               + ". The model finished its work without reaching the target.";
-        }
+        nlohmann::json out = runStepLoopShared("run_until", safetySec, condition);
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("run_until", e.what()); }
       catch (...)                     { return returnException("run_until", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_run()
-//   Async kickoff. Fires go(1) and returns immediately. AI can later call
-//   modelerai_wait_for_stop() to block until the model stops for any reason.
-// ============================================================================
+// modelerai_run() — fire-and-forget go(). No reset, no wait. Use
+// modelerai_get_run_state to poll status. Use modelerai_stop_model to halt.
 modelerai_export Variant ModelerAi_run(FLEXSIMINTERFACE)
 {
     try {
-        if (!g_hooksInstallScanDone.load()) {
-            std::string e; ensureAllHooksInstalled(e);
+        double t = 0.0;
+        try {
+            Variant v = executestring("go(); return time();",
+                                      nullptr, nullptr, Variant());
+            if (v.type == VariantType::Number) t = double(v);
+        } catch (const std::exception& e) {
+            return returnError("go_failed", e.what());
         }
-        ensureRunStopEvent();
-        ResetEvent(g_runStopEvent);
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            g_lastRunState = "Running";
-        }
-        executestring("go(1); applicationcommand(\"switchRunning\", 1); return 1;",
-                      nullptr, nullptr, Variant());
         nlohmann::json out;
-        out["ok"] = true;
-        out["started"] = true;
+        out["ok"]        = true;
         out["run_state"] = "Running";
-        out["note"] = "Async — call modelerai_wait_for_stop() to block until the model stops.";
+        out["sim_time"]  = t;
+        out["note"]      = "Async — use modelerai_get_run_state to poll, "
+                           "modelerai_stop_model to halt.";
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("run", e.what()); }
       catch (...)                     { return returnException("run", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_wait_for_stop(timeout_seconds?)
-//   Blocks until the run-stop event signals (our OnRunStop hook fires) or
-//   the timeout expires. Default timeout: infinite. Returns whether we saw
-//   the stop and the final state.
-// ============================================================================
-modelerai_export Variant ModelerAi_waitForStop(FLEXSIMINTERFACE)
-{
-    try {
-        double timeoutSec = numParam(param(1), -1.0);  // -1 → infinite
-        ensureRunStopEvent();
-        DWORD waitMs = (timeoutSec < 0.0) ? INFINITE
-                                          : static_cast<DWORD>(timeoutSec * 1000.0);
-        DWORD r = WaitForSingleObject(g_runStopEvent, waitMs);
-        std::string state; double finalTime = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(g_runStateMutex);
-            state = g_lastRunState; finalTime = g_lastSimTime;
-        }
-        nlohmann::json out;
-        out["ok"] = true;
-        out["timed_out"] = (r == WAIT_TIMEOUT);
-        out["run_state"] = state;
-        out["sim_time"] = finalTime;
-        return returnJson(out);
-    } catch (const std::exception& e) { return returnException("wait_for_stop", e.what()); }
-      catch (...)                     { return returnException("wait_for_stop", "unknown"); }
-}
-
-// ============================================================================
-// modelerai_stop_model()
-//   Stops a running sim. Mirrors the GUI's stop block: updatestates flushes
-//   pending state changes, stop(1) halts, repaintall refreshes viewport.
-// ============================================================================
+// modelerai_stop_model() — stop(1) + repaint. Returns sim_time at stop.
 modelerai_export Variant ModelerAi_stopModel(FLEXSIMINTERFACE)
 {
     try {
-        executestring("updatestates(); stop(1); repaintall(); applicationcommand(\"switchRunning\", 0); return time();",
-                      nullptr, nullptr, Variant());
         double t = 0.0;
         try {
-            Variant v = executestring("return time();", nullptr, nullptr, Variant());
+            Variant v = executestring(
+                "updatestates(); stop(1); repaintall(); "
+                "applicationcommand(\"switchRunning\", 0); return time();",
+                nullptr, nullptr, Variant());
             if (v.type == VariantType::Number) t = double(v);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            return returnError("stop_failed", e.what());
+        }
         nlohmann::json out;
-        out["ok"] = true;
-        out["sim_time"] = t;
+        out["ok"]        = true;
         out["run_state"] = "Stopped";
+        out["sim_time"]  = t;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("stop_model", e.what()); }
       catch (...)                     { return returnException("stop_model", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_step_model()
-//   Single-event step. Synchronous — returns when the event has been
-//   processed.
-// ============================================================================
+// modelerai_step_model() — single step(). Ignores stop times. Returns
+// sim_time after the step.
 modelerai_export Variant ModelerAi_stepModel(FLEXSIMINTERFACE)
 {
     try {
-        executestring("clearundohistory(NULL); step(); repaintall(); return time();",
-                      nullptr, nullptr, Variant());
         double t = 0.0;
         try {
-            Variant v = executestring("return time();", nullptr, nullptr, Variant());
+            Variant v = executestring(
+                "clearundohistory(NULL); step(); repaintall(); return time();",
+                nullptr, nullptr, Variant());
             if (v.type == VariantType::Number) t = double(v);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            return returnError("step_failed", e.what());
+        }
         nlohmann::json out;
-        out["ok"] = true;
+        out["ok"]       = true;
         out["sim_time"] = t;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("step_model", e.what()); }
       catch (...)                     { return returnException("step_model", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_get_run_state()
-//   Returns current run state ("Running" / "Stopped" / "Paused" / "Reset")
-//   plus current sim time. Non-blocking — no event wait.
-// ============================================================================
+// modelerai_get_run_state() — non-blocking status read. Wraps getrunstate()
+// (0=Stopped, 1=Running, 2=Paused) + time().
 modelerai_export Variant ModelerAi_getRunState(FLEXSIMINTERFACE)
 {
     try {
-        // FlexSim's getrunstate returns an int; map common values.
         std::string state = "Unknown";
         double t = 0.0;
         try {
-            Variant rs = executestring("return getrunstate();", nullptr, nullptr, Variant());
+            Variant rs = executestring("return getrunstate();",
+                                       nullptr, nullptr, Variant());
             if (rs.type == VariantType::Number) {
                 int v = static_cast<int>(double(rs));
                 switch (v) {
@@ -5593,52 +4606,106 @@ modelerai_export Variant ModelerAi_getRunState(FLEXSIMINTERFACE)
                     default: state = "Unknown"; break;
                 }
             }
-            Variant tv = executestring("return time();", nullptr, nullptr, Variant());
+            Variant tv = executestring("return time();",
+                                       nullptr, nullptr, Variant());
             if (tv.type == VariantType::Number) t = double(tv);
         } catch (...) {}
         nlohmann::json out;
-        out["ok"] = true;
+        out["ok"]        = true;
         out["run_state"] = state;
-        out["sim_time"] = t;
+        out["sim_time"]  = t;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_run_state", e.what()); }
       catch (...)                     { return returnException("get_run_state", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_add_stop_time(seconds, enabled?, label?)
-//   Persistent user-managed stop time. Distinct from the temp stops used
-//   internally by run_to_time. enabled defaults to 1; label (optional) is
-//   written into dateString for display.
-// ============================================================================
+// modelerai_add_stop_time(seconds[, enabled, label])
+//
+// Adds a stop time SDT to the model's stop-times table by cloning the last
+// existing entry (the toolbox widget prevents deletion of the last entry,
+// so stopTimes.last is always a valid template). Clears the model-level
+// stoptime slot 0 afterward so it doesn't override our entry.
+//
+// Does NOT auto-reset — stop times only take effect on the next reset, but
+// the modeler often wants to batch-install several before running. The
+// run-control tools call resetmodel(1) themselves when needed.
+//
+// Accepts:
+//   bare number        : 600
+//   array              : [600] / [600, 1] / [600, 1, "label"]
+//   JSON object        : {"seconds": 600, "enabled": 1, "label": "..."}
+//                        (alias: "model_time" for "seconds")
 modelerai_export Variant ModelerAi_addStopTime(FLEXSIMINTERFACE)
 {
     try {
-        Variant arg = param(1);
-        if (arg.type != VariantType::Number) {
-            nlohmann::json out;
-            out["ok"] = false;
-            out["error_code"] = "missing_seconds";
-            out["error_message"] = "modelerai_add_stop_time(seconds, enabled?, label?) requires a numeric seconds arg.";
-            return returnJson(out);
+        Variant arg1 = param(1);
+        Variant arg2 = param(2);
+        Variant arg3 = param(3);
+        double seconds = 0.0;
+        double enabled = 1.0;
+        std::string label;
+        bool haveSeconds = false;
+
+        if (arg1.type == VariantType::Number) {
+            seconds = double(arg1); haveSeconds = true;
+            if (arg2.type == VariantType::Number) enabled = double(arg2);
+            if (arg3.type == VariantType::String) label = std::string(arg3);
+        } else if (arg1.type == VariantType::String) {
+            std::string s = std::string(arg1);
+            size_t lead = s.find_first_not_of(" \t\r\n");
+            char head = (lead == std::string::npos) ? '\0' : s[lead];
+            if (head == '{') {
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object()) {
+                        for (const char* k : { "seconds", "model_time" }) {
+                            if (j.contains(k) && j[k].is_number()) {
+                                seconds = j[k].get<double>();
+                                haveSeconds = true;
+                                break;
+                            }
+                        }
+                        if (j.contains("enabled")) {
+                            if (j["enabled"].is_boolean())
+                                enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
+                            else if (j["enabled"].is_number())
+                                enabled = j["enabled"].get<double>();
+                        }
+                        if (j.contains("label") && j["label"].is_string()) {
+                            label = j["label"].get<std::string>();
+                        }
+                    }
+                } catch (...) {}
+            }
         }
-        double seconds = double(arg);
-        double enabled = numParam(param(2), 1.0);
-        std::string label = strParam(param(3));
+
+        if (!haveSeconds) {
+            return returnError("missing_seconds",
+                "modelerai_add_stop_time expects a numeric sim time. Shapes: "
+                "bare number 600, array [600, enabled?, label?], or JSON "
+                "{\"seconds\": 600, \"enabled\": 1, \"label\": \"...\"}.");
+        }
+        if (seconds <= 0.0) {
+            return returnError("bad_seconds",
+                "seconds must be > 0.");
+        }
 
         std::string script;
-        script += "treenode stopTimes = Model.find(\"Tools/ModelUnits/ModelDateTimes/stopTimes\");\n";
-        script += "if (!stopTimes) { print(\"add_stop_time: stopTimes container missing\"); return 0; }\n";
-        script += "treenode template = stopTimes.last;\n";
-        script += "if (!template) { print(\"add_stop_time: no template SDT to copy\"); return 0; }\n";
-        script += "treenode newStop = createcopy(template, stopTimes, 1);\n";
-        script += "setsdtvalue(newStop, \"enabled\", "; script += std::to_string(enabled != 0.0 ? 1 : 0); script += ");\n";
-        script += "function_s(newStop, \"setModelTime\", "; script += std::to_string(seconds); script += ");\n";
+        script += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
+        script += "if (!stopTimes) { print(\"add_stop_time: STOP_TIME_NODE not found\"); return 0; }\n";
+        script += "treenode newStop = createcopy(stopTimes.last, stopTimes, 1);\n";
+        script += "setsdtvalue(newStop, \"enabled\", ";
+        script += std::to_string(enabled != 0.0 ? 1 : 0);
+        script += ");\n";
+        script += "function_s(newStop, \"setModelTime\", ";
+        script += std::to_string(seconds);
+        script += ");\n";
         if (!label.empty()) {
             script += "setsdtvalue(newStop, \"dateString\", \"";
             script += fsEscape(label);
             script += "\");\n";
         }
+        script += "stoptime(0, 0);\n";
         script += "return newStop;\n";
 
         std::string path;
@@ -5656,95 +4723,212 @@ modelerai_export Variant ModelerAi_addStopTime(FLEXSIMINTERFACE)
 
         if (path.empty()) {
             return returnError("add_stop_time_failed",
-                "Could not add stop time — see console for cause.");
+                "Could not add stop time — see FlexSim System Console for cause.");
         }
 
         nlohmann::json out;
-        out["ok"] = true;
-        out["path"] = path;
+        out["ok"]         = true;
         out["model_time"] = seconds;
-        out["enabled"] = (enabled != 0.0);
+        out["enabled"]    = (enabled != 0.0);
+        out["path"]       = path;
         if (!label.empty()) out["label"] = label;
+        out["note"]       = "Stop time installed. Call modelerai_reset_model "
+                            "(or a run tool that resets first) for it to "
+                            "take effect.";
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("add_stop_time", e.what()); }
       catch (...)                     { return returnException("add_stop_time", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_set_warmup_time(seconds, enabled?)
-//   Sets the single warmupTime SDT. Different from stop times — there's only
-//   ONE warmup entry under ModelDateTimes/warmupTime.
-// ============================================================================
-modelerai_export Variant ModelerAi_setWarmupTime(FLEXSIMINTERFACE)
+// modelerai_remove_stop_time(model_time)
+//
+// Finds the first stop-time entry whose modelTime equals the given value
+// and destroys it. Refuses to destroy the last remaining stop time (the
+// FlexSim toolbox widget enforces this rule and our add-stop pattern
+// depends on stopTimes.last being a valid template). Clears the model-
+// level stoptime slot 0 afterward, same as the add path.
+//
+// Returns:
+//   { ok: true,  removed: true,  model_time, path }            — destroyed
+//   { ok: true,  removed: false, reason: "not_found" }         — no entry matched
+//   { ok: false, error_code: "last_stop_protected", ... }      — only one left
+//
+// Accepts:
+//   bare number  : 600
+//   array        : [600]
+//   JSON object  : {"model_time": 600}  (alias: "seconds")
+modelerai_export Variant ModelerAi_removeStopTime(FLEXSIMINTERFACE)
 {
     try {
-        // Accept any of the shapes the AI is likely to try:
-        //   - bare number:  60
-        //   - 1-arg array:  [60]                    (already worked positionally)
-        //   - 2-arg array:  [60, 1]
-        //   - JSON object:  "{\"seconds\": 60}"     (with optional "enabled")
-        //
-        // The export from 2026-06-07 showed the AI burning 4 tool calls
-        // probing for the right shape because the previous error message
-        // ("requires a numeric seconds arg") didn't say HOW. Accept all
-        // three; the error message now lists what was accepted.
-        Variant arg     = param(1);
-        Variant arg2    = param(2);
-        double  seconds = 0.0;
-        double  enabled = 1.0;
-        bool    haveSeconds = false;
-        bool    haveEnabled = false;
+        Variant arg = param(1);
+        double modelTime = 0.0;
+        bool haveModelTime = false;
 
         if (arg.type == VariantType::Number) {
-            seconds = double(arg);
-            haveSeconds = true;
-            if (arg2.type == VariantType::Number) {
-                enabled = double(arg2);
-                haveEnabled = true;
-            }
+            modelTime = double(arg); haveModelTime = true;
         } else if (arg.type == VariantType::String) {
             std::string s = std::string(arg);
-            // Trim leading whitespace for the shape sniff.
             size_t lead = s.find_first_not_of(" \t\r\n");
             char head = (lead == std::string::npos) ? '\0' : s[lead];
             if (head == '{') {
                 try {
                     auto j = nlohmann::json::parse(s);
-                    if (j.is_object() && j.contains("seconds")
-                        && j["seconds"].is_number())
-                    {
-                        seconds = j["seconds"].get<double>();
-                        haveSeconds = true;
-                    }
-                    if (j.is_object() && j.contains("enabled")) {
-                        if (j["enabled"].is_boolean()) {
-                            enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
-                            haveEnabled = true;
-                        } else if (j["enabled"].is_number()) {
-                            enabled = j["enabled"].get<double>();
-                            haveEnabled = true;
+                    if (j.is_object()) {
+                        for (const char* k : { "model_time", "seconds" }) {
+                            if (j.contains(k) && j[k].is_number()) {
+                                modelTime = j[k].get<double>();
+                                haveModelTime = true;
+                                break;
+                            }
                         }
                     }
-                } catch (...) {
-                    // Fall through to the missing_seconds error below.
-                }
+                } catch (...) {}
+            }
+        }
+
+        if (!haveModelTime) {
+            return returnError("missing_model_time",
+                "modelerai_remove_stop_time expects the modelTime of the stop "
+                "to remove. Shapes: bare number 600, array [600], or JSON "
+                "{\"model_time\": 600}.");
+        }
+
+        // Probe script returns a Map with { count, removed, removed_path }.
+        // count == 1 BEFORE remove means we refuse (last-stop protection).
+        std::string script;
+        script += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
+        script += "if (!stopTimes) { print(\"remove_stop_time: STOP_TIME_NODE not found\"); return 0; }\n";
+        script += "Map out = Map();\n";
+        script += "out[\"count\"]   = stopTimes.subnodes.length;\n";
+        script += "out[\"removed\"] = 0;\n";
+        script += "out[\"path\"]    = \"\";\n";
+        script += "if (stopTimes.subnodes.length == 1) return out;  // last-stop protection\n";
+        script += "for (int i = 1; i <= stopTimes.subnodes.length; i++) {\n";
+        script += "    treenode n = stopTimes.subnodes[i];\n";
+        script += "    if (getsdtvalue(n, \"modelTime\") == ";
+        script += std::to_string(modelTime);
+        script += ") {\n";
+        script += "        out[\"path\"]    = string(nodetomodelpath(n, 1));\n";
+        script += "        n.destroy();\n";
+        script += "        out[\"removed\"] = 1;\n";
+        script += "        break;\n";
+        script += "    }\n";
+        script += "}\n";
+        script += "stoptime(0, 0);\n";
+        script += "return out;\n";
+
+        Variant result;
+        try {
+            result = executestring(script.c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("remove_stop_time_failed", e.what());
+        }
+        if (result.type != VariantType::Map) {
+            return returnError("remove_stop_time_failed",
+                "FlexScript probe returned wrong type.");
+        }
+        Map m = static_cast<Map>(result);
+        int count   = static_cast<int>(double(m["count"]));
+        int removed = static_cast<int>(double(m["removed"]));
+        std::string path = std::string(m["path"]);
+
+        if (count == 1) {
+            return returnError("last_stop_protected",
+                "Only one stop time remains; refusing to delete it. FlexSim's "
+                "toolbox widget enforces the same rule, and our add-stop "
+                "template depends on stopTimes.last being valid. Add another "
+                "stop time first, then retry.");
+        }
+
+        nlohmann::json out;
+        out["ok"]         = true;
+        out["removed"]    = (removed != 0);
+        out["model_time"] = modelTime;
+        if (removed) {
+            out["path"] = path;
+            out["note"] = "Stop time removed. Call modelerai_reset_model "
+                          "(or a run tool that resets first) for the change "
+                          "to take effect.";
+        } else {
+            out["reason"] = "not_found";
+            out["note"]   = "No stop time matched the given modelTime "
+                            "(exact equality). List existing stops to "
+                            "find the right value.";
+        }
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("remove_stop_time", e.what()); }
+      catch (...)                     { return returnException("remove_stop_time", "unknown"); }
+}
+
+// modelerai_set_warmup_time(seconds[, enabled])
+//
+// Sets the single warmup-time SDT under getmodelunit(WARMUP_TIME_NODE).
+// Same function_s-write / getsdtvalue-read asymmetry as stop times.
+// Does NOT auto-reset.
+//
+// Accepts:
+//   bare number  : 100
+//   array        : [100] / [100, 1]
+//   JSON object  : {"seconds": 100, "enabled": 1}
+//                  (alias: "model_time" for "seconds")
+modelerai_export Variant ModelerAi_setWarmupTime(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg1 = param(1);
+        Variant arg2 = param(2);
+        double seconds = 0.0;
+        double enabled = 1.0;
+        bool haveSeconds = false;
+
+        if (arg1.type == VariantType::Number) {
+            seconds = double(arg1); haveSeconds = true;
+            if (arg2.type == VariantType::Number) enabled = double(arg2);
+        } else if (arg1.type == VariantType::String) {
+            std::string s = std::string(arg1);
+            size_t lead = s.find_first_not_of(" \t\r\n");
+            char head = (lead == std::string::npos) ? '\0' : s[lead];
+            if (head == '{') {
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object()) {
+                        for (const char* k : { "seconds", "model_time" }) {
+                            if (j.contains(k) && j[k].is_number()) {
+                                seconds = j[k].get<double>();
+                                haveSeconds = true;
+                                break;
+                            }
+                        }
+                        if (j.contains("enabled")) {
+                            if (j["enabled"].is_boolean())
+                                enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
+                            else if (j["enabled"].is_number())
+                                enabled = j["enabled"].get<double>();
+                        }
+                    }
+                } catch (...) {}
             }
         }
 
         if (!haveSeconds) {
             return returnError("missing_seconds",
-                "modelerai_set_warmup_time expects a number of seconds. "
-                "Any of these shapes work: bare number 60, positional [60], "
-                "positional with enabled [60, 1], or JSON {\"seconds\": 60, "
-                "\"enabled\": true}.");
+                "modelerai_set_warmup_time expects a numeric warmup duration "
+                "in sim time. Shapes: bare number 100, array [100, enabled?], "
+                "or JSON {\"seconds\": 100, \"enabled\": 1}.");
         }
-        (void)haveEnabled;  // default is enabled=1 if not supplied
+        if (seconds < 0.0) {
+            return returnError("bad_seconds",
+                "seconds must be >= 0.");
+        }
 
         std::string script;
-        script += "treenode wu = Model.find(\"Tools/ModelUnits/ModelDateTimes/warmupTime\");\n";
-        script += "if (!wu) { print(\"set_warmup_time: warmupTime node missing\"); return 0; }\n";
-        script += "setsdtvalue(wu, \"enabled\", "; script += std::to_string(enabled != 0.0 ? 1 : 0); script += ");\n";
-        script += "function_s(wu, \"setModelTime\", "; script += std::to_string(seconds); script += ");\n";
+        script += "treenode wu = getmodelunit(WARMUP_TIME_NODE);\n";
+        script += "if (!wu) { print(\"set_warmup_time: WARMUP_TIME_NODE not found\"); return 0; }\n";
+        script += "setsdtvalue(wu, \"enabled\", ";
+        script += std::to_string(enabled != 0.0 ? 1 : 0);
+        script += ");\n";
+        script += "function_s(wu, \"setModelTime\", ";
+        script += std::to_string(seconds);
+        script += ");\n";
         script += "return wu;\n";
 
         try {
@@ -5754,38 +4938,58 @@ modelerai_export Variant ModelerAi_setWarmupTime(FLEXSIMINTERFACE)
         }
 
         nlohmann::json out;
-        out["ok"] = true;
+        out["ok"]         = true;
         out["model_time"] = seconds;
-        out["enabled"] = (enabled != 0.0);
+        out["enabled"]    = (enabled != 0.0);
+        out["note"]       = "Warmup time set. Call modelerai_reset_model "
+                            "(or a run tool that resets first) for it to "
+                            "take effect.";
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("set_warmup_time", e.what()); }
       catch (...)                     { return returnException("set_warmup_time", "unknown"); }
 }
 
-// ============================================================================
-// modelerai_set_run_speed(speed)
-//   Sets the playback speed at MAIN:/project/exec/step. Higher = faster
-//   visualization. Clamped to FlexSim's documented bounds.
-// ============================================================================
+// modelerai_set_run_speed(speed) — wraps runspeed(N). 1.0 = real-time.
+// Higher numbers = faster. INT_MAX = max. Accepted shapes:
+//   bare number  : 16
+//   array        : [16]
+//   JSON         : {"speed": 16}
 modelerai_export Variant ModelerAi_setRunSpeed(FLEXSIMINTERFACE)
 {
     try {
         Variant arg = param(1);
-        if (arg.type != VariantType::Number) {
-            return returnError("missing_speed",
-                "modelerai_set_run_speed(speed) requires a numeric speed arg.");
+        double speed = -1.0;
+        bool haveSpeed = false;
+
+        if (arg.type == VariantType::Number) {
+            speed = double(arg); haveSpeed = true;
+        } else if (arg.type == VariantType::String) {
+            std::string s = std::string(arg);
+            size_t lead = s.find_first_not_of(" \t\r\n");
+            char head = (lead == std::string::npos) ? '\0' : s[lead];
+            if (head == '{') {
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object() && j.contains("speed") && j["speed"].is_number()) {
+                        speed = j["speed"].get<double>();
+                        haveSpeed = true;
+                    }
+                } catch (...) {}
+            }
         }
-        double speed = double(arg);
-        if (speed < 0.1)       speed = 0.1;
-        if (speed > 1.0e9)     speed = 1.0e9;
 
-        std::string script;
-        script += "treenode s = node(\"MAIN:/project/exec/step\");\n";
-        script += "if (!s) return 0;\n";
-        script += "set(s, "; script += std::to_string(speed); script += ");\n";
-        script += "applylinks(node(\"VIEW:/1/1\"), 1);\n";
-        script += "return get(s);\n";
+        if (!haveSpeed) {
+            return returnError("missing_speed",
+                "modelerai_set_run_speed expects a numeric speed. "
+                "Shapes: bare number 16, array [16], or JSON "
+                "{\"speed\": 16}. 1.0 = real-time, higher = faster.");
+        }
+        if (speed <= 0.0) {
+            return returnError("bad_speed",
+                "speed must be > 0.");
+        }
 
+        std::string script = "runspeed(" + std::to_string(speed) + "); return runspeed();";
         double actual = speed;
         try {
             Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
@@ -5795,12 +4999,15 @@ modelerai_export Variant ModelerAi_setRunSpeed(FLEXSIMINTERFACE)
         }
 
         nlohmann::json out;
-        out["ok"] = true;
+        out["ok"]        = true;
         out["run_speed"] = actual;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("set_run_speed", e.what()); }
       catch (...)                     { return returnException("set_run_speed", "unknown"); }
 }
+
+// (legacy run-tool bodies removed; the shells above are the only
+// implementations of those functions now.)
 
 // ============================================================================
 // OUTPUT DOMAIN — performance measures + object stats + model summary
@@ -7238,35 +6445,173 @@ modelerai_export Variant ModelerAi_listGroupMembers(FLEXSIMINTERFACE)
 //
 //   modelerai_create_global_table       — assert/create; optional dims + headers + initial cells
 //   modelerai_resize_global_table       — gt.setSize(rows, cols)
-//   modelerai_set_global_table_cell     — set one cell (number or string)
+//   modelerai_set_global_table_cell     — set one cell to any of FlexSim's 7 cell kinds
+//                                          (Number, String, Pointer, Array, FlexScript, Bundle,
+//                                          TrackedVariable) plus null. Mirrors modelerai_set_label.
 //   modelerai_get_global_table_cell     — read one cell with value_kind
+//                                          (number/string/pointer/array/null/flexscript/bundle/
+//                                          tracked_variable/unknown) and table_storage (tree/bundle).
 //   modelerai_list_global_tables        — every GlobalTable + dimensions
 // ============================================================================
 
-// Helper: serialize a JSON value as a FlexScript literal for a cell write.
-// Returns the literal string, or empty if the JSON value isn't a supported
-// shape (number / boolean / string).
+// Helpers: convert between JSON cell values and FlexScript. Tree-backed
+// table cells accept every FlexSim Variant type — Number, String, TreeNode,
+// Array, Null. Boolean is not a Variant type; JSON true/false is a
+// convenience coerced to 1/0 Numbers on the way in. Bundle-backed tables
+// are typed by column and the engine will throw if a value doesn't match
+// the column type — we let that exception surface.
 namespace {
-bool cellJsonToLiteral(const nlohmann::json& v, std::string& outLit, std::string& outKind)
+
+// JSON shape -> FlexScript output for a cell write:
+//   42 / 3.14            -> Number     expr=literal,                kind=number
+//   true / false         -> Number     expr="1"/"0",                kind=number
+//   "hello"              -> String     expr="\"hello\"",            kind=string
+//   null                 -> Null       expr="Variant()",            kind=null
+//   {node_path: "..."}   -> TreeNode   expr=node(...),              kind=pointer
+//   {object: "..."}      -> TreeNode   expr=Model.find(...),        kind=pointer
+//   [v1, v2, ...]        -> Array      expr=temp var name,          kind=array
+//                                       (each element same shape;
+//                                        nested arrays not supported)
+//
+// `outSetup` collects zero or more FlexScript statements (each ending in
+// "\n") that must execute in the same script scope before `outExpr` is
+// evaluated. `tmpTag` makes temp variable names unique across multiple
+// calls in one script; pass any caller-unique string.
+bool cellJsonToFlexScript(const nlohmann::json& v,
+                          const std::string& tmpTag,
+                          std::string& outSetup,
+                          std::string& outExpr,
+                          std::string& outKind,
+                          std::string& outErr)
 {
-    if (v.is_boolean()) {
-        outLit  = v.get<bool>() ? "1" : "0";
-        outKind = "number";
-        return true;
-    }
+    outSetup.clear();
+    if (v.is_null())    { outExpr = "Variant()";              outKind = "null";   return true; }
+    if (v.is_boolean()) { outExpr = v.get<bool>() ? "1" : "0"; outKind = "number"; return true; }
     if (v.is_number()) {
         std::ostringstream s; s << v.get<double>();
-        outLit  = s.str();
+        outExpr = s.str();
         outKind = "number";
         return true;
     }
     if (v.is_string()) {
-        outLit  = "\"" + fsEscape(v.get<std::string>()) + "\"";
+        outExpr = "\"" + fsEscape(v.get<std::string>()) + "\"";
         outKind = "string";
         return true;
     }
+    if (v.is_object()) {
+        std::string nodePath  = v.value("node_path", std::string(""));
+        std::string objectRef = v.value("object",    std::string(""));
+        if (!nodePath.empty()) {
+            outExpr = "node(\"" + fsEscape(nodePath) + "\", nullptr)";
+            outKind = "pointer";
+            return true;
+        }
+        if (!objectRef.empty()) {
+            outExpr = "Model.find(\"" + fsEscape(objectRef) + "\")";
+            outKind = "pointer";
+            return true;
+        }
+        outErr = "object value must contain `node_path` or `object` (TreeNode reference)";
+        return false;
+    }
+    if (v.is_array()) {
+        std::string tmpName = "__cellArr_" + tmpTag;
+        outSetup += "Array " + tmpName + " = Array();\n";
+        for (size_t i = 0; i < v.size(); ++i) {
+            const auto& e = v[i];
+            if (e.is_array()) {
+                outErr = "element " + std::to_string(i + 1) +
+                         ": nested arrays are not supported in table cells";
+                return false;
+            }
+            std::string elemSetup, elemExpr, elemKind, elemErr;
+            if (!cellJsonToFlexScript(e, tmpTag + "_" + std::to_string(i),
+                                      elemSetup, elemExpr, elemKind, elemErr)) {
+                outErr = "element " + std::to_string(i + 1) + ": " + elemErr;
+                return false;
+            }
+            outSetup += elemSetup;
+            outSetup += tmpName + ".push(" + elemExpr + ");\n";
+        }
+        outExpr = tmpName;
+        outKind = "array";
+        return true;
+    }
+    outErr = "unsupported JSON type";
     return false;
 }
+
+// Variant -> JSON for a cell read. value_kind is one of:
+// "number", "string", "pointer", "array", "null", "unknown".
+nlohmann::json cellVariantToJson(const Variant& v, std::string& outKind)
+{
+    switch (v.type) {
+        case VariantType::Number: {
+            outKind = "number";
+            double n = static_cast<double>(v);
+            if (n == static_cast<double>(static_cast<long long>(n))
+                && n >= -9.2e18 && n <= 9.2e18)
+                return nlohmann::json(static_cast<long long>(n));
+            return nlohmann::json(n);
+        }
+        case VariantType::String:
+            outKind = "string";
+            return nlohmann::json(std::string(v));
+        case VariantType::TreeNode: {
+            outKind = "pointer";
+            TreeNode* n = static_cast<TreeNode*>(v);
+            if (objectexists(n)) {
+                nlohmann::json o;
+                try { o["name"] = std::string(getname(n)); } catch (...) {}
+                try {
+                    const char* p = nodetomodelpath_cstr(n, 1);
+                    if (p) o["path"] = std::string(p);
+                } catch (...) {}
+                return o;
+            }
+            return nullptr;
+        }
+        case VariantType::Array: {
+            outKind = "array";
+            Array a = static_cast<Array>(v);
+            nlohmann::json arr = nlohmann::json::array();
+            for (int i = 1; i <= a.length; ++i) {
+                Variant e = a[i];
+                if (e.type == VariantType::Number) {
+                    double d = static_cast<double>(e);
+                    if (d == static_cast<double>(static_cast<long long>(d))
+                        && d >= -9.2e18 && d <= 9.2e18) arr.push_back(static_cast<long long>(d));
+                    else arr.push_back(d);
+                } else if (e.type == VariantType::String) {
+                    arr.push_back(std::string(e));
+                } else if (e.type == VariantType::TreeNode) {
+                    TreeNode* n = static_cast<TreeNode*>(e);
+                    if (objectexists(n)) {
+                        nlohmann::json ref;
+                        try { ref["name"] = std::string(getname(n)); } catch (...) {}
+                        try {
+                            const char* p = nodetomodelpath_cstr(n, 1);
+                            if (p) ref["path"] = std::string(p);
+                        } catch (...) {}
+                        arr.push_back(std::move(ref));
+                    } else {
+                        arr.push_back(nullptr);
+                    }
+                } else {
+                    arr.push_back(nullptr);
+                }
+            }
+            return arr;
+        }
+        case VariantType::Null:
+            outKind = "null";
+            return nullptr;
+        default:
+            outKind = "unknown";
+            return nullptr;
+    }
+}
+
 } // namespace
 
 // modelerai_create_global_table({ name, rows?, cols?, row_headers?, col_headers?, cells? })
@@ -7341,11 +6686,15 @@ modelerai_export Variant ModelerAi_createGlobalTable(FLEXSIMINTERFACE)
                 const auto& row = cells[r];
                 if (!row.is_array()) continue;
                 for (size_t c = 0; c < row.size(); ++c) {
-                    std::string lit, kind;
-                    if (!cellJsonToLiteral(row[c], lit, kind)) { ++cellsSkipped; continue; }
+                    std::string setup, expr, kind, err;
+                    std::string tag = std::to_string(r) + "_" + std::to_string(c);
+                    if (!cellJsonToFlexScript(row[c], tag, setup, expr, kind, err)) {
+                        ++cellsSkipped; continue;
+                    }
+                    script += setup;
                     script += "Table(\"" + fsEscape(tableName) + "\")[" +
                               std::to_string(r + 1) + "][" + std::to_string(c + 1) +
-                              "] = " + lit + ";\n";
+                              "] = " + expr + ";\n";
                     ++cellsWritten;
                 }
             }
@@ -7447,6 +6796,26 @@ modelerai_export Variant ModelerAi_resizeGlobalTable(FLEXSIMINTERFACE)
 }
 
 // modelerai_set_global_table_cell({ table, row, col, value })
+//
+// Value shape -> cell kind (mirrors modelerai_set_label):
+//   42 / 3.14                          -> Number
+//   true / false                       -> Number (1/0)
+//   "hi"                               -> String
+//   null                               -> Null   (clears cell)
+//   { node_path | object }             -> Pointer (TreeNode)
+//   [v1, v2, ...]                      -> Array  (elements: Number/String/Pointer/Null;
+//                                        no nested arrays)
+//   { flexscript: "body" }             -> FlexScript (bare expression gets the
+//                                        standard `Object current = ownerobject(c);
+//                                        Object item = param(1); return ...` wrapper)
+//   { bundle: { fields: [...], rows?: [...] } } -> Bundle (column-typed)
+//   { tracked_variable: { type?, start_value?, flags? } } -> TrackedVariable
+//
+// Variant kinds set via `Table(name)[r][c] = expr;` (works for tree- AND
+// bundle-backed tables, subject to bundle column-type constraints). The
+// three structural kinds mutate the underlying cell tree node via
+// `Table(name).cell(r, c)` — that call throws on bundle-backed tables
+// (a FlexSim engine limitation), so structural kinds are tree-table only.
 modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
 {
     try {
@@ -7473,10 +6842,144 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
         if (row < 1 || col < 1) {
             return returnError("bad_index", "row and col are 1-indexed and must be >= 1.");
         }
-        std::string lit, kind;
-        if (!cellJsonToLiteral(valueJson, lit, kind)) {
-            return returnError("unsupported_value_type",
-                "value must be a number, boolean, or string.");
+
+        // Classify the JSON shape. Structural kinds need the cell tree node;
+        // Variant kinds are direct subscript assignment.
+        enum class Kind { Variant, FlexScript, Bundle, TrackedVariable };
+        Kind kindEnum = Kind::Variant;
+        if (valueJson.is_object()) {
+            if      (valueJson.contains("flexscript"))       kindEnum = Kind::FlexScript;
+            else if (valueJson.contains("bundle"))           kindEnum = Kind::Bundle;
+            else if (valueJson.contains("tracked_variable")) kindEnum = Kind::TrackedVariable;
+        }
+
+        std::string cellWriteScript;  // emitted after the cellNode declaration
+        std::string outKind;          // value_kind reported to caller
+
+        if (kindEnum == Kind::Variant) {
+            std::string setup, expr, err;
+            if (!cellJsonToFlexScript(valueJson, "set", setup, expr, outKind, err)) {
+                return returnError("unsupported_value_type",
+                    "value must be a FlexSim Variant or kind-tagged object — "
+                    "Number, String, TreeNode ({node_path|object}), Array, null, "
+                    "{flexscript:\"...\"}, {bundle:{...}}, or {tracked_variable:{...}}. ("
+                    + err + ")");
+            }
+            cellWriteScript += setup;
+            cellWriteScript += "Table(\"" + fsEscape(tableName) + "\")[" +
+                               std::to_string(row) + "][" + std::to_string(col) +
+                               "] = " + expr + ";\n";
+        } else if (kindEnum == Kind::FlexScript) {
+            outKind = "flexscript";
+            if (!valueJson["flexscript"].is_string()) {
+                return returnError("bad_value_shape", "{flexscript} must be a string body.");
+            }
+            std::string body = valueJson["flexscript"].get<std::string>();
+            if (body.find("return ") == std::string::npos) {
+                body = "Object current = ownerobject(c);\n"
+                       "Object item = param(1);\n"
+                       "return " + body + ";";
+            }
+            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
+                               "\").cell(" + std::to_string(row) + ", " +
+                               std::to_string(col) + ");\n";
+            cellWriteScript += "cellNode.value = \"" + fsEscape(body) + "\";\n";
+            cellWriteScript += "switch_flexscript(cellNode, 1);\n";
+            cellWriteScript += "buildnodeflexscript(cellNode);\n";
+        } else if (kindEnum == Kind::Bundle) {
+            outKind = "bundle";
+            const auto& spec = valueJson["bundle"];
+            if (!spec.is_object()) {
+                return returnError("bad_value_shape",
+                    "{bundle} must be an object with fields + optional rows.");
+            }
+            if (!spec.contains("fields") || !spec["fields"].is_array()) {
+                return returnError("bad_value_shape", "Bundle requires a `fields` array.");
+            }
+            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
+                               "\").cell(" + std::to_string(row) + ", " +
+                               std::to_string(col) + ");\n";
+            cellWriteScript += "clearbundle(cellNode);\n";
+            std::vector<std::string> fieldTypes;
+            for (const auto& f : spec["fields"]) {
+                if (!f.is_object() || !f.contains("name") || !f.contains("type")) {
+                    return returnError("bad_value_shape",
+                        "Each bundle field needs `name` and `type`.");
+                }
+                std::string fname = f.value("name", std::string(""));
+                std::string ftype = f.value("type", std::string(""));
+                std::string typeMacro;
+                if      (ftype == "number" || ftype == "double") typeMacro = "BUNDLE_FIELD_TYPE_DOUBLE";
+                else if (ftype == "int")                          typeMacro = "BUNDLE_FIELD_TYPE_INT";
+                else if (ftype == "string")                       typeMacro = "BUNDLE_FIELD_TYPE_VARCHAR";
+                else if (ftype == "node"   || ftype == "pointer") typeMacro = "BUNDLE_FIELD_TYPE_NODEREF";
+                else {
+                    return returnError("bad_value_shape",
+                        "Bundle field type '" + ftype + "' unsupported. "
+                        "Use one of: number, int, string, node.");
+                }
+                fieldTypes.push_back(ftype);
+                cellWriteScript += "addbundlefield(cellNode, \"" + fsEscape(fname) +
+                                   "\", " + typeMacro + ");\n";
+            }
+            if (spec.contains("rows") && spec["rows"].is_array()) {
+                int rowIdx = 1;
+                for (const auto& rowVals : spec["rows"]) {
+                    if (!rowVals.is_array()) continue;
+                    cellWriteScript += "addbundleentry(cellNode, 1);\n";
+                    for (size_t c = 0; c < rowVals.size() && c < fieldTypes.size(); ++c) {
+                        std::string elSetup, elExpr, elKind, elErr;
+                        std::string elTag = "br" + std::to_string(rowIdx) +
+                                            "c" + std::to_string(c + 1);
+                        if (!cellJsonToFlexScript(rowVals[c], elTag,
+                                                  elSetup, elExpr, elKind, elErr)) {
+                            return returnError("bad_bundle_row",
+                                "Bundle row " + std::to_string(rowIdx) +
+                                " col " + std::to_string(c + 1) + ": " + elErr);
+                        }
+                        cellWriteScript += elSetup;
+                        cellWriteScript += "setbundlevalue(cellNode, " +
+                                           std::to_string(rowIdx) + ", " +
+                                           std::to_string(c + 1) + ", " + elExpr + ");\n";
+                    }
+                    ++rowIdx;
+                }
+            }
+        } else { // TrackedVariable
+            outKind = "tracked_variable";
+            const auto& spec = valueJson["tracked_variable"];
+            std::string tvTypeMacro = "STAT_TYPE_TIME_SERIES";
+            double startValue = 0.0;
+            int    flags      = -1;
+            if (spec.is_object()) {
+                std::string t = spec.value("type", std::string(""));
+                if      (t == "" || t == "time_series")    tvTypeMacro = "STAT_TYPE_TIME_SERIES";
+                else if (t == "level_history")             tvTypeMacro = "STAT_TYPE_LEVEL_HISTORY";
+                else if (t == "discrete_value")            tvTypeMacro = "STAT_TYPE_DISCRETE_VALUE";
+                else if (t == "discrete_change")           tvTypeMacro = "STAT_TYPE_DISCRETE_CHANGE";
+                else if (t == "categorical")               tvTypeMacro = "STAT_TYPE_CATEGORICAL";
+                else if (t == "categorical_combo")         tvTypeMacro = "STAT_TYPE_CATEGORICAL_COMBO";
+                else {
+                    return returnError("bad_value_shape",
+                        "TrackedVariable type '" + t + "' unknown. Use one of: "
+                        "time_series, level_history, discrete_value, discrete_change, "
+                        "categorical, categorical_combo.");
+                }
+                if (spec.contains("start_value") && spec["start_value"].is_number()) {
+                    startValue = spec["start_value"].get<double>();
+                }
+                if (spec.contains("flags") && spec["flags"].is_number_integer()) {
+                    flags = spec["flags"].get<int>();
+                }
+            }
+            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
+                               "\").cell(" + std::to_string(row) + ", " +
+                               std::to_string(col) + ");\n";
+            std::ostringstream s;
+            s << "TrackedVariable.init(cellNode, " << tvTypeMacro
+              << ", " << startValue
+              << ", " << flags << ");\n";
+            cellWriteScript += s.str();
         }
 
         std::string script;
@@ -7485,15 +6988,19 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
         script += "int nr = Table(\"" + fsEscape(tableName) + "\").numRows;\n";
         script += "int nc = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
         script += "if (" + std::to_string(row) + " > nr || " + std::to_string(col) + " > nc) return -2;\n";
-        script += "Table(\"" + fsEscape(tableName) + "\")[" +
-                  std::to_string(row) + "][" + std::to_string(col) + "] = " + lit + ";\n";
+        script += cellWriteScript;
         script += "return 1;\n";
 
         Variant result;
         try {
             result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("set_cell_failed", e.what()); }
-          catch (...) { return returnError("set_cell_failed", "non-std exception."); }
+        } catch (const std::exception& e) {
+            return returnError("set_cell_failed",
+                "kind=" + outKind + ": " + e.what() +
+                (kindEnum != Kind::Variant
+                    ? " (structural kinds require a tree-backed table; Table.cell() throws on bundle-backed tables)"
+                    : ""));
+        } catch (...) { return returnError("set_cell_failed", "non-std exception."); }
         if (result.type == VariantType::Number) {
             double v = static_cast<double>(result);
             if (v == -1) return returnError("table_not_found", "GlobalTable '" + tableName + "' does not exist.");
@@ -7512,13 +7019,18 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
         out["table"]      = tableName;
         out["row"]        = row;
         out["col"]        = col;
-        out["value_kind"] = kind;
+        out["value_kind"] = outKind;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("set_global_table_cell", e.what()); }
       catch (...)                     { return returnException("set_global_table_cell", "unknown"); }
 }
 
 // modelerai_get_global_table_cell({ table, row, col })
+//
+// Reports value_kind = number / string / pointer / array / null / unknown
+// for Variant cells, plus flexscript / bundle / tracked_variable when the
+// cell's underlying tree node carries that structural kind. Bundle-backed
+// tables only expose the Variant subset (Table.cell() throws on them).
 modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
 {
     try {
@@ -7541,9 +7053,9 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
         if (tableName.empty()) return returnError("missing_table", "table is required.");
         if (row < 1 || col < 1) return returnError("bad_index", "row and col are 1-indexed and must be >= 1.");
 
-        // Probe existence + range; on success return the cell Variant directly.
-        // Bookkeeping: we use a Map to carry { value, in_range } back so the
-        // C++ side can distinguish "cell holds 0" from "cell out of range".
+        // Probe: dispatch on whether the table itself is bundle-backed
+        // (DATA_BUNDLE on the table tools node — Table.cell() would throw)
+        // or tree-backed (probe per-cell node for kind metadata).
         std::string script;
         script += "treenode t = Tools.get(\"GlobalTable\", \"" + fsEscape(tableName) + "\");\n";
         script += "if (!t) return -1;\n";
@@ -7551,8 +7063,25 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
         script += "int nc = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
         script += "if (" + std::to_string(row) + " > nr || " + std::to_string(col) + " > nc) return -2;\n";
         script += "Map out = Map();\n";
-        script += "out[\"value\"] = Table(\"" + fsEscape(tableName) + "\")[" +
+        script += "if (t.dataType == 6) {\n";  // DATA_BUNDLE on the table itself
+        script += "    out[\"tableBundle\"] = 1;\n";
+        script += "    out[\"value\"] = Table(\"" + fsEscape(tableName) + "\")[" +
                   std::to_string(row) + "][" + std::to_string(col) + "];\n";
+        script += "} else {\n";
+        script += "    treenode cellNode = Table(\"" + fsEscape(tableName) + "\").cell(" +
+                  std::to_string(row) + ", " + std::to_string(col) + ");\n";
+        script += "    int scrFlag = switch_flexscript(cellNode, -1);\n";
+        script += "    out[\"dt\"]       = cellNode.dataType;\n";
+        script += "    out[\"isScript\"] = scrFlag;\n";
+        script += "    if (cellNode.dataType == 6) {\n";  // DATA_BUNDLE on the cell
+        script += "        out[\"bundleRows\"]   = getbundlenrentries(cellNode);\n";
+        script += "        out[\"bundleFields\"] = getbundlenrfields(cellNode);\n";
+        script += "    } else if (scrFlag == 1) {\n";
+        script += "        out[\"scriptBody\"] = getnodestr(cellNode);\n";
+        script += "    } else {\n";
+        script += "        out[\"value\"] = cellNode.value;\n";
+        script += "    }\n";
+        script += "}\n";
         script += "return out;\n";
 
         Variant result;
@@ -7576,38 +7105,62 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
             return returnError("get_cell_failed", "script returned wrong type.");
         }
         Map m = static_cast<Map>(result);
-        Variant cell = m["value"];
-        nlohmann::json valueJson;
-        std::string kind;
-        switch (cell.type) {
-            case VariantType::Number: {
-                double v = static_cast<double>(cell);
-                if (v == static_cast<double>(static_cast<long long>(v))
-                    && v >= -9.2e18 && v <= 9.2e18) valueJson = static_cast<long long>(v);
-                else valueJson = v;
-                kind = "number";
-                break;
-            }
-            case VariantType::String:
-                valueJson = std::string(cell);
-                kind = "string";
-                break;
-            case VariantType::Null:
-                valueJson = nullptr;
-                kind = "null";
-                break;
-            default:
-                valueJson = nullptr;
-                kind = "unknown";
-                break;
-        }
+
         nlohmann::json out;
-        out["ok"]         = true;
-        out["table"]      = tableName;
-        out["row"]        = row;
-        out["col"]        = col;
-        out["value"]      = std::move(valueJson);
-        out["value_kind"] = kind;
+        out["ok"]    = true;
+        out["table"] = tableName;
+        out["row"]   = row;
+        out["col"]   = col;
+
+        // Bundle-backed table: structural metadata unavailable; report
+        // Variant value only and tag the storage.
+        Variant tableBundle = m["tableBundle"];
+        if (tableBundle.type == VariantType::Number &&
+            static_cast<double>(tableBundle) == 1.0) {
+            Variant cell = m["value"];
+            std::string kind;
+            nlohmann::json valueJson = cellVariantToJson(cell, kind);
+            out["table_storage"] = "bundle";
+            out["value"]         = std::move(valueJson);
+            out["value_kind"]    = kind;
+            return returnJson(out);
+        }
+
+        // Tree-backed table: branch on the cell's structural kind.
+        int dt       = static_cast<int>(static_cast<double>(m["dt"]));
+        int isScript = static_cast<int>(static_cast<double>(m["isScript"]));
+        out["table_storage"] = "tree";
+
+        if (dt == DATA_BUNDLE) {
+            int rows   = static_cast<int>(static_cast<double>(m["bundleRows"]));
+            int fields = static_cast<int>(static_cast<double>(m["bundleFields"]));
+            nlohmann::json b;
+            b["row_count"]   = rows;
+            b["field_count"] = fields;
+            b["note"]        = "Use FlexSim bundle commands (getbundlevalue, etc.) "
+                               "via run_script to read individual cells.";
+            out["value_kind"] = "bundle";
+            out["value"]      = std::move(b);
+        } else if (isScript == 1) {
+            std::string body = std::string(m["scriptBody"]);
+            out["value_kind"] = "flexscript";
+            out["value"]      = body;
+            out["note"]       = "Value is the raw FlexScript body; not evaluated.";
+        } else if (dt == DATA_SIMPLE) {
+            // TrackedVariable: DATA_SIMPLE on a cell evaluates to a Number.
+            Variant cell = m["value"];
+            std::string kind;
+            nlohmann::json valueJson = cellVariantToJson(cell, kind);
+            out["value_kind"] = "tracked_variable";
+            out["value"]      = std::move(valueJson);
+            out["note"]       = "Reading evaluates the TrackedVariable's current value.";
+        } else {
+            Variant cell = m["value"];
+            std::string kind;
+            nlohmann::json valueJson = cellVariantToJson(cell, kind);
+            out["value_kind"] = kind;
+            out["value"]      = std::move(valueJson);
+        }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_global_table_cell", e.what()); }
       catch (...)                     { return returnException("get_global_table_cell", "unknown"); }
@@ -9015,4 +8568,1307 @@ modelerai_export Variant ModelerAi_createTrackedVariable(FLEXSIMINTERFACE)
             "See the TODO block above ModelerAi_createTrackedVariable in commands.cpp.");
     } catch (const std::exception& e) { return returnException("create_tracked_variable", e.what()); }
       catch (...)                     { return returnException("create_tracked_variable", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_create_processflow({ kind, name?, category?, template?, attached_to?, open_view? })
+//
+// Creates a ProcessFlow tool of the requested kind under the model's
+// Tools/Toolbox/ProcessFlow tree.
+//
+// kind values (required):
+//   "general"  — PF_TYPE_GENERAL  — self-attaches
+//   "object"   — PF_TYPE_OBJECT   — attaches to `attached_to` object if given
+//   "sub_flow" — PF_TYPE_SUB_FLOW — reusable sub-flow, no implicit attachment
+//   "person"   — person flow      — created via applicationcommand("addPersonFlow")
+//
+// Optional:
+//   name        — rename via setname() after creation
+//   category    — toolbox folder name (defaults by kind: General / Object / Sub Flow)
+//   template    — tree path to a template node (loadprocessflowtemplate)
+//   attached_to — model object name to attach to (kind "object" only)
+//   open_view   — default true; pass false to suppress the viewer tab
+//
+// Returns: { ok, kind, name, path, attached_to? }
+// ============================================================================
+modelerai_export Variant ModelerAi_createProcessFlow(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_create_processflow expects a JSON object arg: "
+                "{ kind, name?, category?, template?, attached_to?, open_view? }.");
+        }
+
+        std::string kind, desiredName, category, templatePath, attachedTo;
+        bool openView = true;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            kind         = j.value("kind",        std::string(""));
+            desiredName  = j.value("name",        std::string(""));
+            category     = j.value("category",    std::string(""));
+            templatePath = j.value("template",    std::string(""));
+            attachedTo   = j.value("attached_to", std::string(""));
+            if (j.contains("open_view")) {
+                const auto& ov = j["open_view"];
+                if      (ov.is_boolean()) openView = ov.get<bool>();
+                else if (ov.is_number())  openView = ov.get<double>() != 0.0;
+                else if (ov.is_string()) {
+                    std::string s = ov.get<std::string>();
+                    openView = !(s == "0" || s == "false" || s == "False" || s == "FALSE");
+                }
+            }
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (kind != "general" && kind != "object" && kind != "sub_flow" && kind != "person") {
+            return returnError("bad_kind",
+                "kind must be one of: general, object, sub_flow, person. Got: \"" + kind + "\".");
+        }
+
+        // Default category per kind. Person flows don't use the toolbox folder
+        // path — applicationcommand("addPersonFlow") handles placement itself.
+        if (category.empty()) {
+            if      (kind == "general")  category = "General";
+            else if (kind == "object")   category = "Object";
+            else if (kind == "sub_flow") category = "Sub Flow";
+        }
+
+        // Build the FlexScript that performs the actual creation.
+        std::ostringstream fs;
+        fs << "treenode pf;\n";
+
+        if (kind == "person") {
+            // Person flow has its own app command that handles toolbox placement.
+            fs << "pf = applicationcommand(\"addPersonFlow\");\n";
+        } else {
+            // General / Object / Sub Flow: use the toolbox folder + PF_TYPE_*.
+            fs << "treenode toolsTree = node(\"VIEW:/standardviews/modelingutilities/Toolbox/ToolsTree\");\n";
+            fs << "treenode toolbox = assertsubnode(assertsubnode(node(\"Tools\", model()), \"Toolbox\"), \"ProcessFlow\");\n";
+            fs << "treenode folder = assertsubnode(toolbox, getvarnode(toolsTree, \"PFTypes\").find(\""
+               << fsEscape(category) << "\").value);\n";
+            fs << "switch_expanded(toolbox, 1);\n";
+            fs << "switch_expanded(folder, 1);\n";
+
+            if (!templatePath.empty()) {
+                fs << "pf = applicationcommand(\"loadprocessflowtemplate\", node(\""
+                   << fsEscape(templatePath) << "\"));\n";
+            } else {
+                // Map kind to the FlexSim PF_TYPE_* constant.
+                std::string typeConst;
+                if      (kind == "general")  typeConst = "PF_TYPE_GENERAL";
+                else if (kind == "object")   typeConst = "PF_TYPE_OBJECT";
+                else if (kind == "sub_flow") typeConst = "PF_TYPE_SUB_FLOW";
+                fs << "pf = applicationcommand(\"addprocessflow\", " << typeConst << ");\n";
+            }
+
+            // Attach: general always self-attaches; object attaches to target if given.
+            if (kind == "general") {
+                fs << "if (objectexists(pf)) function_s(pf, \"attachObject\", pf);\n";
+            } else if (kind == "object" && !attachedTo.empty()) {
+                fs << "treenode __target = Model.find(\"" << fsEscape(attachedTo) << "\");\n";
+                fs << "if (objectexists(pf) && objectexists(__target)) "
+                      "function_s(pf, \"attachObject\", __target);\n";
+            }
+
+            // Register the shortcut coupling in the toolbox folder so the
+            // ProcessFlow appears in the sidebar list.
+            fs << "if (objectexists(pf)) {\n";
+            fs << "    nodepoint(nodeadddata(nodeinsertinto(folder), DATATYPE_COUPLING), pf);\n";
+            fs << "}\n";
+        }
+
+        // Optional rename.
+        if (!desiredName.empty()) {
+            fs << "if (objectexists(pf)) setname(pf, \"" << fsEscape(desiredName) << "\");\n";
+        }
+
+        // Optional view open.
+        if (openView) {
+            fs << "if (objectexists(pf)) applicationcommand(\"openprocessflowview\", pf);\n";
+        }
+
+        fs << "return pf;\n";
+
+        // Execute.
+        Variant result;
+        try {
+            result = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("create_pf_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("create_pf_failed", "non-std exception during ProcessFlow creation.");
+        }
+
+        if (result.type != VariantType::TreeNode) {
+            return returnError("create_failed",
+                "ProcessFlow creation returned no treenode. "
+                "Possible causes: model limit reached, invalid template path, "
+                "or FlexSim ProcessFlow module not loaded.");
+        }
+        treenode pf = static_cast<treenode>(result);
+        if (!objectexists(pf)) {
+            return returnError("create_failed",
+                "ProcessFlow creation returned a null treenode.");
+        }
+
+        // Build response.
+        nlohmann::json out;
+        out["ok"]   = true;
+        out["kind"] = kind;
+        out["name"] = std::string(getname(pf));
+        try {
+            const char* p = nodetomodelpath_cstr(pf, 1);
+            if (p) out["path"] = std::string(p);
+        } catch (...) {}
+        if (kind == "object" && !attachedTo.empty()) {
+            out["attached_to"] = attachedTo;
+        }
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("create_processflow", e.what()); }
+      catch (...)                     { return returnException("create_processflow", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_list_processflows({})
+//
+// Walks Tools/Toolbox/ProcessFlow/* and emits one entry per ProcessFlow.
+// Infers `kind` from the parent folder name:
+//   "General"   -> "general"
+//   "Object"    -> "object"
+//   "Sub Flow"  -> "sub_flow"
+//   "Person Flow" -> "person"
+//   anything else -> "unknown"
+//
+// activity_count is the raw subnode count of the PF node (v1 — good enough
+// for the AI to judge size without running the model).
+//
+// Returns: { ok, count, processflows: [{ name, kind, path, activity_count }] }
+// ============================================================================
+modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
+{
+    try {
+        // Walk /Tools/ProcessFlow/* directly — the storage location for all PFs.
+        // (The toolbox has UI coupling shortcuts but can be missing or stale.)
+        std::string script;
+        script += "print(\"[ModelerAI] list_processflows: enter\\n\");\n";
+        script += "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        script += "print(\"[ModelerAI] list_processflows: walking pfStorage subnodes\\n\");\n";
+        script += "Array out = Array();\n";
+        script += "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        script += "    treenode pf = pfStorage.subnodes[iP];\n";
+        script += "    if (!objectexists(pf)) continue;\n";
+        // Infer kind from PF's own properties.
+        script += "    string kind = \"general\";\n";
+        script += "    if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
+        script += "    else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
+        script += "    else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
+        script += "    Map row = Map();\n";
+        script += "    row[\"name\"] = string(pf.name);\n";
+        script += "    row[\"kind\"] = kind;\n";
+        script += "    row[\"path\"] = string(nodetomodelpath(pf, 1));\n";
+        // activity_count was previously written here as `pf.subnodes.length`
+        // (an int into the Map). That broke the Array<Map> marshal back
+        // through executestring() — silent failure mode showed up as
+        // count:0 even with PFs present. We derive activity_count C++-side
+        // from a separate path-resolve walk instead (see C++ block below).
+        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + string(pf.name) + \"' kind=\" + kind + \"\\n\");\n";
+        script += "    out[out.length + 1] = row;\n";
+        script += "}\n";
+        script += "print(\"[ModelerAI] list_processflows: returning result array\\n\");\n";
+        script += "return out;\n";
+
+        nlohmann::json results = nlohmann::json::array();
+        try {
+            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
+            if (v.type == VariantType::Array) {
+                Array a = static_cast<Array>(v);
+                for (int i = 1; i <= a.length; ++i) {
+                    Variant rowV = a[i];
+                    if (rowV.type != VariantType::Map) continue;
+                    Map m = static_cast<Map>(rowV);
+
+                    std::string name, kind, path;
+                    try { name = std::string(m["name"]); } catch (...) {}
+                    try { kind = std::string(m["kind"]); } catch (...) {}
+                    try { path = std::string(m["path"]); } catch (...) {}
+
+                    if (kind.empty()) kind = "unknown";
+
+                    nlohmann::json row;
+                    row["name"] = name;
+                    row["kind"] = kind;
+                    row["path"] = path;
+                    // activity_count omitted — use modelerai_list_activities
+                    // on a specific PF to get its activity list / count.
+                    results.push_back(std::move(row));
+                }
+            }
+        } catch (const std::exception& e) {
+            return returnError("list_pf_failed", e.what());
+        }
+
+        nlohmann::json out;
+        out["ok"]           = true;
+        out["count"]        = static_cast<int>(results.size());
+        out["processflows"] = std::move(results);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_processflows", e.what()); }
+      catch (...)                     { return returnException("list_processflows", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_delete_processflow({ name } | "name")
+//
+// Finds the ProcessFlow by name under any Tools/Toolbox/ProcessFlow/* folder
+// and destroys it (and its toolbox coupling entry).
+//
+// Safety: only destroys nodes that are actually inside the
+// Tools/Toolbox/ProcessFlow subtree — won't touch arbitrary model objects.
+//
+// Returns: { ok, name, kind, removed }
+//   ok == false  + error_code "not_found" if no PF by that name exists.
+// ============================================================================
+modelerai_export Variant ModelerAi_deleteProcessFlow(FLEXSIMINTERFACE)
+{
+    try {
+        // Accept either a bare string param or { "name": "..." }.
+        std::string name = resolveNameArg(param(1), "name");
+        if (name.empty()) {
+            return returnError("missing_name",
+                "modelerai_delete_processflow requires a name: pass a string or { \"name\": \"...\" }.");
+        }
+
+        // FlexScript: scan /Tools/ProcessFlow/* (storage location), find the PF
+        // by name, infer its kind, destroy it (also cleans up any toolbox coupling
+        // if present, best-effort).
+        std::string script;
+        script += "print(\"[ModelerAI] delete_processflow: enter — name=" + fsEscape(name) + "\\n\");\n";
+        script += "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        script += "print(\"[ModelerAI] delete_processflow: walking pfStorage subnodes\\n\");\n";
+        script += "treenode pf = NULL;\n";
+        script += "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        script += "    if (string(pfStorage.subnodes[iP].name) == \"" + fsEscape(name) + "\") {\n";
+        script += "        pf = pfStorage.subnodes[iP];\n";
+        script += "        break;\n";
+        script += "    }\n";
+        script += "}\n";
+        script += "if (!objectexists(pf)) { print(\"[ModelerAI] delete_processflow: NO ProcessFlow named '" + fsEscape(name) + "' under /Tools/ProcessFlow.\\n\"); return \"\"; }\n";
+        script += "print(\"[ModelerAI] delete_processflow: found PF at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        // Infer kind before destroying.
+        script += "string kind = \"general\";\n";
+        script += "if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
+        script += "else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
+        script += "else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
+        // Best-effort: also remove any toolbox coupling entry pointing to this PF.
+        script += "treenode toolbox = node(\"Tools/Toolbox/ProcessFlow\", model());\n";
+        script += "if (objectexists(toolbox)) {\n";
+        script += "    for (int iF = 1; iF <= toolbox.subnodes.length; iF++) {\n";
+        script += "        treenode folder = toolbox.subnodes[iF];\n";
+        script += "        for (int iC = folder.subnodes.length; iC >= 1; iC--) {\n";
+        script += "            treenode coupling = folder.subnodes[iC];\n";
+        script += "            if (coupling.dataType != DATATYPE_COUPLING) continue;\n";
+        script += "            if (coupling.value == pf) { print(\"[ModelerAI] delete_processflow: removing toolbox coupling\\n\"); coupling.destroy(); }\n";
+        script += "        }\n";
+        script += "    }\n";
+        script += "}\n";
+        script += "pf.destroy();\n";
+        script += "print(\"[ModelerAI] delete_processflow: destroyed — kind=\" + kind + \"\\n\");\n";
+        script += "return kind;\n";
+
+        Variant v;
+        try {
+            v = executestring(script.c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("delete_pf_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("delete_pf_failed", "non-std exception.");
+        }
+
+        std::string kindStr;
+        if (v.type == VariantType::String) kindStr = std::string(v);
+
+        if (kindStr.empty()) {
+            nlohmann::json err;
+            err["ok"]            = false;
+            err["error_code"]    = "not_found";
+            err["error_message"] = "No ProcessFlow named \"" + name + "\" found under "
+                                   "Tools/ProcessFlow.";
+            err["name"]          = name;
+            return returnJson(err);
+        }
+
+        nlohmann::json out;
+        out["ok"]      = true;
+        out["name"]    = name;
+        out["kind"]    = kindStr;
+        out["removed"] = true;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("delete_processflow", e.what()); }
+      catch (...)                     { return returnException("delete_processflow", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_add_activity({ processflow, type, library_path?, name?, after?, position? })
+//
+// Adds an activity of the given type to a named ProcessFlow using the
+// view-based createActivity API (openprocessflowview + createActivity).
+//
+// IMPORTANT: ProcessFlows live at /Tools/ProcessFlow/<name> (storage location).
+// Model.find("MyFlow") returns null. This function looks up via the storage
+// location; do not use Model.find shortcuts or the toolbox coupling path.
+//
+// Required:
+//   processflow  — PF name under /Tools/ProcessFlow
+//   type         — activity class name in the library (e.g. "Delay", "Source")
+//
+// Optional:
+//   library_path — library subtree path; defaults to "processflow/activities".
+//                  Use "people/Activities" for People activities.
+//   name         — setname() on the new activity after creation.
+//   after        — name of an existing activity in the same PF; when given the
+//                  new activity is auto-wired AND stacked visually below the
+//                  predecessor via createActivity's 4th arg. Without `after`,
+//                  the activity is placed standalone (no connector drawn).
+//                  Use modelerai_connect_activities to draw explicit arrows.
+//   position     — [x, y] — override the placement position (skipped in
+//                  stacked mode unless explicitly provided).
+//
+// Returns: { ok, name, type, processflow, path, connected_to? }
+//   connected_to is only present when `after` was used.
+//
+// Errors: processflow_not_found | library_path_not_found |
+//         activity_type_not_found | previous_not_found | add_activity_failed
+// ============================================================================
+modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_add_activity expects a JSON object arg: "
+                "{ processflow, type, library_path?, name?, after?, position? }.");
+        }
+
+        std::string pfName, actType, libraryPath, actName, afterName;
+        bool hasPosition = false;
+        double posX = 0.0, posY = 0.0;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName      = j.value("processflow",  std::string(""));
+            actType     = j.value("type",         std::string(""));
+            libraryPath = j.value("library_path", std::string("processflow/activities"));
+            actName     = j.value("name",         std::string(""));
+            afterName   = j.value("after",        std::string(""));
+            if (j.contains("position") && j["position"].is_array() && j["position"].size() == 2) {
+                posX = j["position"][0].get<double>();
+                posY = j["position"][1].get<double>();
+                hasPosition = true;
+            }
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actType.empty()) return returnError("missing_args", "type is required.");
+        if (libraryPath.empty()) libraryPath = "processflow/activities";
+
+        // Build FlexScript that opens the view, creates the activity, and
+        // returns the new activity treenode. Error paths use print() + return
+        // null so the C++ side sees "not a treenode" → structured error,
+        // while the user sees the specific cause in System Console.
+        std::ostringstream fs;
+
+        // 1. Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
+        fs << "print(\"[ModelerAI] add_activity: enter — pf=" << fsEscape(pfName) << " type=" << fsEscape(actType) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "print(\"[ModelerAI] add_activity: walking pfStorage subnodes\\n\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP];\n";
+        fs << "        break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] add_activity: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] add_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+
+        // 2. Locate the library template.
+        fs << "treenode libPath = library().find(\"" << fsEscape(libraryPath) << "\");\n";
+        fs << "if (!objectexists(libPath)) { print(\"[ModelerAI] add_activity: library_path '" << fsEscape(libraryPath) << "' not found. Try processflow/activities or people/Activities.\\n\"); return NULL; }\n";
+        fs << "treenode libObj = libPath.find(\"" << fsEscape(actType) << "\");\n";
+        fs << "if (!objectexists(libObj)) { print(\"[ModelerAI] add_activity: activity type '" << fsEscape(actType) << "' not found under library_path '" << fsEscape(libraryPath) << "'. Common types: InterArrivalSource, ScheduleSource, DateTimeSource, Delay, Decide, AssignLabels, Sink.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] add_activity: found libObj \" + string(libObj.name) + \"\\n\");\n";
+
+        // 3. Resolve `after` activity if specified.
+        //    Manual subnodes walk — `pf.find(name)` was observed to return
+        //    the wrong sibling (or a partial-match) in tests; the explicit
+        //    name-equality walk is the proven pattern from list_activities.
+        if (!afterName.empty()) {
+            fs << "treenode prevActivity = NULL;\n";
+            fs << "for (int iPrev = 1; iPrev <= pf.subnodes.length; iPrev++) {\n";
+            fs << "    if (string(pf.subnodes[iPrev].name) == \"" << fsEscape(afterName) << "\") { prevActivity = pf.subnodes[iPrev]; break; }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(prevActivity)) { print(\"[ModelerAI] add_activity: 'after' activity '" << fsEscape(afterName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+            fs << "print(\"[ModelerAI] add_activity: resolved 'after' activity '\" + string(prevActivity.name) + \"'\\n\");\n";
+        }
+
+        // 4. Open the ProcessFlowView — required for createActivity to work.
+        //    openprocessflowview is idempotent (safe to call even if already open).
+        fs << "treenode view = applicationcommand(\"openprocessflowview\", pf);\n";
+        fs << "if (!objectexists(view)) { print(\"[ModelerAI] add_activity: openprocessflowview returned null for PF '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] add_activity: view opened\\n\");\n";
+
+        // 5. Create the activity via the view's createActivity callback.
+        //    With `after` arg → auto-positions and stacks visually below the
+        //    predecessor (the 4th arg triggers that placement logic).
+        //    Without `after` → standalone placement at origin.
+        if (!afterName.empty()) {
+            fs << "treenode newActivity = function_s(view, \"createActivity\", getvarnode(view, \"ProcessFlowView\"), libObj, prevActivity);\n";
+        } else {
+            fs << "treenode newActivity = function_s(view, \"createActivity\", getvarnode(view, \"ProcessFlowView\"), libObj);\n";
+        }
+        fs << "if (!objectexists(newActivity)) { print(\"[ModelerAI] add_activity: createActivity returned null — view may not be open or library type is invalid.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] add_activity: created activity \" + string(newActivity.name) + \"\\n\");\n";
+
+        // 6. Optional position override.
+        //    In stacked mode the view auto-positions; only override if explicit.
+        if (hasPosition) {
+            fs << "setloc(newActivity, " << posX << ", " << posY << ", 0);\n";
+        }
+
+        // 7. Optional rename.
+        if (!actName.empty()) {
+            fs << "setname(newActivity, \"" << fsEscape(actName) << "\");\n";
+        }
+
+        // 8. Return the new activity treenode (same pattern as createProcessFlow).
+        //    String / Map returns don't marshal back through executestring()
+        //    cleanly in this FlexSim build, but TreeNode does. C++ reads name
+        //    + path from the returned treenode below.
+        fs << "return newActivity;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("add_activity_failed",
+                std::string("FlexScript execution threw: ") + e.what()
+                + ". Check System Console for [ModelerAI] diagnostic lines.");
+        } catch (...) {
+            return returnError("add_activity_failed",
+                "non-std exception during add_activity. Check System Console.");
+        }
+
+        if (v.type != VariantType::TreeNode) {
+            return returnError("add_activity_failed",
+                "FlexScript did not return a treenode. Possible causes: "
+                "processflow not found, library_path/type invalid, "
+                "`after` activity not in this flow. "
+                "Check System Console for [ModelerAI] diagnostic lines.");
+        }
+        treenode newActivity = static_cast<treenode>(v);
+        if (!objectexists(newActivity)) {
+            return returnError("add_activity_failed",
+                "FlexScript returned a null treenode. "
+                "Check System Console for [ModelerAI] diagnostic lines.");
+        }
+
+        std::string newName = std::string(getname(newActivity));
+        std::string newPath;
+        try { newPath = nodetomodelpath(newActivity, 1).c_str(); } catch (...) {}
+        std::string connectedTo = afterName;  // empty if not connected
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["name"]        = newName;
+        out["type"]        = actType;
+        out["processflow"] = pfName;
+        out["path"]        = newPath;
+        if (!afterName.empty()) out["connected_to"] = afterName;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("add_activity", e.what()); }
+      catch (...)                     { return returnException("add_activity", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_connect_activities({ processflow, from, to })
+//
+// Draws an explicit connector arrow between two existing activities in a
+// named ProcessFlow. Both activities must already exist in the PF.
+//
+// IMPORTANT: ProcessFlows live at /Tools/ProcessFlow/<name> (storage location).
+// Model.find("MyFlow") returns null. This function looks up via the storage
+// location; do not use Model.find shortcuts or the toolbox coupling path.
+//
+// Required:
+//   processflow — PF name under /Tools/ProcessFlow
+//   from        — name of the source activity in the PF
+//   to          — name of the target activity in the PF
+//
+// Returns: { ok, processflow, from, to, connected: true }
+//
+// Errors: processflow_not_found | from_not_found | to_not_found | missing_args |
+//         connect_activities_failed
+// ============================================================================
+modelerai_export Variant ModelerAi_connectActivities(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_connect_activities expects a JSON object: "
+                "{ processflow, from, to }.");
+        }
+
+        std::string pfName, fromName, toName;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName   = j.value("processflow", std::string(""));
+            fromName = j.value("from",        std::string(""));
+            toName   = j.value("to",          std::string(""));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (pfName.empty())   return returnError("missing_args", "processflow is required.");
+        if (fromName.empty()) return returnError("missing_args", "from is required.");
+        if (toName.empty())   return returnError("missing_args", "to is required.");
+
+        // Build FlexScript: locate PF, open view, find activities, create connector.
+        std::ostringstream fs;
+
+        // 1. Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
+        fs << "print(\"[ModelerAI] connect_activities: enter — pf=" << fsEscape(pfName) << " from=" << fsEscape(fromName) << " to=" << fsEscape(toName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "print(\"[ModelerAI] connect_activities: walking pfStorage subnodes\\n\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP];\n";
+        fs << "        break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] connect_activities: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] connect_activities: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+
+        // 2. Resolve the from and to activities via manual walk.
+        //    pf.find(name) was observed to return the wrong sibling (so both
+        //    from and to resolved to the same node, creating a self-loop).
+        //    Explicit name-equality walk avoids that.
+        fs << "treenode fromAct = NULL;\n";
+        fs << "for (int iFrom = 1; iFrom <= pf.subnodes.length; iFrom++) {\n";
+        fs << "    if (string(pf.subnodes[iFrom].name) == \"" << fsEscape(fromName) << "\") { fromAct = pf.subnodes[iFrom]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(fromAct)) { print(\"[ModelerAI] connect_activities: 'from' activity '" << fsEscape(fromName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] connect_activities: resolved 'from' activity '\" + string(fromAct.name) + \"'\\n\");\n";
+        fs << "treenode toAct = NULL;\n";
+        fs << "for (int iTo = 1; iTo <= pf.subnodes.length; iTo++) {\n";
+        fs << "    if (string(pf.subnodes[iTo].name) == \"" << fsEscape(toName) << "\") { toAct = pf.subnodes[iTo]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(toAct)) { print(\"[ModelerAI] connect_activities: 'to' activity '" << fsEscape(toName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] connect_activities: resolved 'to' activity '\" + string(toAct.name) + \"'\\n\");\n";
+
+        // 3. Open the view (idempotent) — required for createConnector.
+        fs << "treenode view = applicationcommand(\"openprocessflowview\", pf);\n";
+        fs << "if (!objectexists(view)) { print(\"[ModelerAI] connect_activities: openprocessflowview returned null for PF '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+        fs << "print(\"[ModelerAI] connect_activities: view opened\\n\");\n";
+
+        // 4. Draw the connector arrow.
+        fs << "function_s(pf, \"createConnector\", activedocumentnode(), fromAct, toAct);\n";
+        fs << "print(\"[ModelerAI] connect_activities: connector drawn\\n\");\n";
+
+        // 5. Return the pf treenode as a success signal (TreeNode marshals cleanly).
+        fs << "return pf;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("connect_activities_failed",
+                std::string("FlexScript execution threw: ") + e.what()
+                + ". Check System Console for [ModelerAI] diagnostic lines.");
+        } catch (...) {
+            return returnError("connect_activities_failed",
+                "non-std exception during connect_activities. Check System Console.");
+        }
+
+        if (v.type != VariantType::TreeNode) {
+            return returnError("connect_activities_failed",
+                "FlexScript did not return a treenode. Possible causes: "
+                "processflow not found, 'from' or 'to' activity not in this flow. "
+                "Check System Console for [ModelerAI] diagnostic lines.");
+        }
+        treenode pfNode = static_cast<treenode>(v);
+        if (!objectexists(pfNode)) {
+            return returnError("connect_activities_failed",
+                "FlexScript returned a null treenode. "
+                "Check System Console for [ModelerAI] diagnostic lines.");
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["from"]        = fromName;
+        out["to"]          = toName;
+        out["connected"]   = true;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("connect_activities", e.what()); }
+      catch (...)                     { return returnException("connect_activities", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_delete_activity({ activity, processflow })
+//
+// Finds the named activity within the named ProcessFlow and destroys it.
+// Both arguments are required because activity names are only unique per-PF.
+//
+// Note (v1): Does not explicitly clean up connectors that referenced the
+// deleted activity — FlexSim's connector destruction follows the activity
+// destroy in practice; dangling cases will surface at run time.
+//
+// Returns: { ok, name, processflow, removed: true }
+// Errors: processflow_not_found | activity_not_found | missing_args
+// ============================================================================
+modelerai_export Variant ModelerAi_deleteActivity(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_delete_activity expects a JSON object: { activity, processflow }.");
+        }
+
+        std::string pfName, actName;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+
+        // FlexScript: locate the PF via /Tools/ProcessFlow/* storage, find the activity, destroy it.
+        std::ostringstream fs;
+        fs << "print(\"[ModelerAI] delete_activity: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "print(\"[ModelerAI] delete_activity: walking pfStorage subnodes\\n\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP];\n";
+        fs << "        break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] delete_activity: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
+        fs << "print(\"[ModelerAI] delete_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+
+        fs << "treenode activity = NULL;\n";
+        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
+        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] delete_activity: activity '" << fsEscape(actName) << "' not found in PF '\" + string(pf.name) + \"'.\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+        fs << "print(\"[ModelerAI] delete_activity: destroying activity '\" + string(activity.name) + \"'\\n\");\n";
+        fs << "activity.destroy();\n";
+        fs << "print(\"[ModelerAI] delete_activity: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("delete_activity_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("delete_activity_failed", "non-std exception during delete_activity.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                std::string rest = s.substr(4);
+                auto sep = rest.find(':');
+                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "delete_activity_failed";
+                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
+                return returnError(code.c_str(), msg);
+            }
+            // "ok" string = success
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["name"]        = actName;
+        out["processflow"] = pfName;
+        out["removed"]     = true;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("delete_activity", e.what()); }
+      catch (...)                     { return returnException("delete_activity", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_set_activity_variable({ processflow, activity, variable, value })
+//
+// Sets a variable on an activity within a named ProcessFlow.
+//
+// Required:
+//   processflow — PF name
+//   activity    — activity name within that PF
+//   variable    — variable name on the activity (as seen in its class schema)
+//   value       — one of:
+//     number              → setvarnum(activity, varName, n)
+//     string              → getvarnode(activity, varName).value = "s"
+//     { "ref": "Name" }   → look up "Name" as an activity in the same PF;
+//                           getvarnode(activity, varName).value = otherActivity
+//     { "ref_pf": "Name" }→ look up "Name" as a ProcessFlow (flowRef pattern);
+//                           getvarnode(activity, varName).value = otherFlow
+//
+// Returns: { ok, activity, variable, value_kind, processflow }
+//   value_kind: "number" | "string" | "ref" | "ref_pf"
+//
+// Errors: processflow_not_found | activity_not_found | ref_not_found |
+//         ref_pf_not_found | missing_args | bad_args_json
+// ============================================================================
+modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_set_activity_variable expects a JSON object: "
+                "{ processflow, activity, variable, value }.");
+        }
+
+        std::string pfName, actName, varName, valueKind;
+        std::string strValue, refName, refPfName;
+        double numValue = 0.0;
+
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+            if (!j.contains("value")) {
+                return returnError("missing_args", "value is required.");
+            }
+            const auto& val = j["value"];
+            if (val.is_number()) {
+                numValue  = val.get<double>();
+                valueKind = "number";
+            } else if (val.is_string()) {
+                strValue  = val.get<std::string>();
+                valueKind = "string";
+            } else if (val.is_object()) {
+                if (val.contains("ref") && val["ref"].is_string()) {
+                    refName   = val["ref"].get<std::string>();
+                    valueKind = "ref";
+                } else if (val.contains("ref_pf") && val["ref_pf"].is_string()) {
+                    refPfName = val["ref_pf"].get<std::string>();
+                    valueKind = "ref_pf";
+                } else {
+                    return returnError("bad_value",
+                        "value object must have a \"ref\" or \"ref_pf\" key.");
+                }
+            } else {
+                return returnError("bad_value",
+                    "value must be a number, string, { \"ref\": \"...\" }, "
+                    "or { \"ref_pf\": \"...\" }.");
+            }
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+
+        // Build FlexScript.
+        std::ostringstream fs;
+
+        // Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
+        fs << "print(\"[ModelerAI] set_activity_variable: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << " variable=" << fsEscape(varName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "print(\"[ModelerAI] set_activity_variable: walking pfStorage subnodes\\n\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP];\n";
+        fs << "        break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] set_activity_variable: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
+        fs << "print(\"[ModelerAI] set_activity_variable: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+
+        // Locate the activity via manual walk (pf.find is unreliable).
+        fs << "treenode activity = NULL;\n";
+        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
+        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] set_activity_variable: activity '" << fsEscape(actName) << "' not found.\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+        fs << "print(\"[ModelerAI] set_activity_variable: found activity '\" + string(activity.name) + \"'\\n\");\n";
+
+        // Apply the value.
+        if (valueKind == "number") {
+            std::ostringstream numStr;
+            numStr << numValue;
+            fs << "setvarnum(activity, \"" << fsEscape(varName) << "\", " << numStr.str() << ");\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set number " << numStr.str() << " on '\" + string(activity.name) + \"'\\n\");\n";
+        } else if (valueKind == "string") {
+            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = \""
+               << fsEscape(strValue) << "\";\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set string value on '\" + string(activity.name) + \"'\\n\");\n";
+        } else if (valueKind == "ref") {
+            fs << "treenode refActivity = NULL;\n";
+            fs << "for (int iRef = 1; iRef <= pf.subnodes.length; iRef++) {\n";
+            fs << "    if (string(pf.subnodes[iRef].name) == \"" << fsEscape(refName) << "\") { refActivity = pf.subnodes[iRef]; break; }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(refActivity)) { print(\"[ModelerAI] set_activity_variable: ref activity '" << fsEscape(refName) << "' not found.\\n\"); return \"ERR:ref_not_found:Activity \\\"" << fsEscape(refName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refActivity;\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set ref to '\" + string(refActivity.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
+        } else if (valueKind == "ref_pf") {
+            // Locate the referenced ProcessFlow via /Tools/ProcessFlow/* storage.
+            fs << "treenode refPf = NULL;\n";
+            fs << "for (int jP = 1; jP <= pfStorage.subnodes.length; jP++) {\n";
+            fs << "    if (string(pfStorage.subnodes[jP].name) == \"" << fsEscape(refPfName) << "\") {\n";
+            fs << "        refPf = pfStorage.subnodes[jP];\n";
+            fs << "        break;\n";
+            fs << "    }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(refPf)) { print(\"[ModelerAI] set_activity_variable: ref_pf '" << fsEscape(refPfName) << "' not found.\\n\"); return \"ERR:ref_pf_not_found:ProcessFlow \\\"" << fsEscape(refPfName) << "\\\" not found under Tools/ProcessFlow.\";\n }\n";
+            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refPf;\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set ref_pf to '\" + string(refPf.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
+        }
+
+        fs << "print(\"[ModelerAI] set_activity_variable: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("set_var_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("set_var_failed", "non-std exception during set_activity_variable.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                std::string rest = s.substr(4);
+                auto sep = rest.find(':');
+                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "set_var_failed";
+                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
+                return returnError(code.c_str(), msg);
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["value_kind"]  = valueKind;
+        out["processflow"] = pfName;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_activity_variable", e.what()); }
+      catch (...)                     { return returnException("set_activity_variable", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_list_activities({ processflow } | "processflowName")
+//
+// Lists every activity inside a named ProcessFlow. Reads from
+// /Tools/ProcessFlow/<name> storage — does NOT touch the toolbox coupling.
+//
+// Returns: { ok, processflow, count, activities: [{ name, class, path }] }
+// Errors:  processflow_not_found | missing_args | bad_args_json
+// ============================================================================
+modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
+{
+    try {
+        std::string pfName = resolveNameArg(param(1), "processflow");
+        if (pfName.empty()) {
+            return returnError("missing_args",
+                "modelerai_list_activities requires a processflow name: "
+                "pass a string or { \"processflow\": \"...\" }.");
+        }
+
+        std::ostringstream fs;
+        fs << "print(\"[ModelerAI] list_activities: enter — pf=" << fsEscape(pfName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "print(\"[ModelerAI] list_activities: walking pfStorage subnodes\\n\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP];\n";
+        fs << "        break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] list_activities: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return Array(); }\n";
+        fs << "print(\"[ModelerAI] list_activities: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        fs << "Array out = Array();\n";
+        // Each direct subnode of a PF is either an activity or a container
+        // node like 'variables'/'connectors' on the PF itself. Real activities
+        // resolve to a class treenode under .../library/processflow/activities
+        // (or people/Activities). Bookkeeping subnodes have no classobject().
+        // The class node's name is the class name (e.g. "InterArrivalSource").
+        fs << "for (int iA = 1; iA <= pf.subnodes.length; iA++) {\n";
+        fs << "    treenode a = pf.subnodes[iA];\n";
+        fs << "    if (!objectexists(a)) continue;\n";
+        fs << "    treenode clsNode = classobject(a);\n";
+        fs << "    if (!objectexists(clsNode)) continue;\n";
+        fs << "    string cls = string(clsNode.name);\n";
+        fs << "    if (cls == \"\") continue;\n";
+        fs << "    Map row = Map();\n";
+        fs << "    row[\"name\"]  = string(a.name);\n";
+        fs << "    row[\"class\"] = cls;\n";
+        fs << "    row[\"path\"]  = string(nodetomodelpath(a, 1));\n";
+        fs << "    out[out.length + 1] = row;\n";
+        fs << "}\n";
+        fs << "print(\"[ModelerAI] list_activities: returning result array\\n\");\n";
+        fs << "return out;\n";
+
+        nlohmann::json activities = nlohmann::json::array();
+        try {
+            Variant v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+            if (v.type == VariantType::Array) {
+                Array a = static_cast<Array>(v);
+                for (int i = 1; i <= a.length; ++i) {
+                    Variant rowV = a[i];
+                    if (rowV.type != VariantType::Map) continue;
+                    Map m = static_cast<Map>(rowV);
+                    std::string name, cls, path;
+                    try { name = std::string(m["name"]); }  catch (...) {}
+                    try { cls  = std::string(m["class"]); } catch (...) {}
+                    try { path = std::string(m["path"]); }  catch (...) {}
+                    nlohmann::json row;
+                    row["name"]  = name;
+                    row["class"] = cls;
+                    row["path"]  = path;
+                    activities.push_back(std::move(row));
+                }
+            }
+        } catch (const std::exception& e) {
+            return returnError("list_activities_failed", e.what());
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["count"]       = static_cast<int>(activities.size());
+        out["activities"]  = std::move(activities);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_activities", e.what()); }
+      catch (...)                     { return returnException("list_activities", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_get_activity_info({ processflow, activity })
+//
+// Returns descriptive info about a single activity: class, full path, and
+// a comma-separated list of its variable names so the agent can discover
+// what's readable via modelerai_get_activity_variable.
+//
+// Returns: { ok, processflow, activity, class, path, variables: ["name", ...] }
+// Errors:  processflow_not_found | activity_not_found | missing_args
+// ============================================================================
+modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_get_activity_info expects a JSON object: "
+                "{ processflow, activity }.");
+        }
+        std::string pfName, actName;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+
+        std::ostringstream fs;
+        fs << "print(\"[ModelerAI] get_activity_info: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
+        fs << "        pf = pfStorage.subnodes[iP]; break;\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] get_activity_info: NO ProcessFlow named '" << fsEscape(pfName) << "'\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
+        fs << "treenode activity = NULL;\n";
+        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
+        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] get_activity_info: activity '" << fsEscape(actName) << "' not found\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\"; }\n";
+        fs << "print(\"[ModelerAI] get_activity_info: found activity at \" + string(nodetomodelpath(activity, 1)) + \"\\n\");\n";
+        // Walk the activity's variables container (subnode named "variables"
+        // on FlexScript objects). Each child is one variable; the child's
+        // name is the variable name. If the container isn't present, the
+        // activity has no variables and we emit an empty list.
+        fs << "Array out = Array();\n";
+        fs << "Map row = Map();\n";
+        fs << "row[\"name\"]  = string(activity.name);\n";
+        fs << "treenode clsNode = classobject(activity);\n";
+        fs << "string clsName = \"\";\n";
+        fs << "if (objectexists(clsNode)) clsName = string(clsNode.name);\n";
+        fs << "row[\"class\"] = clsName;\n";
+        fs << "row[\"path\"]  = string(nodetomodelpath(activity, 1));\n";
+        fs << "string varCsv = \"\";\n";
+        fs << "treenode varsContainer = activity.find(\"variables\");\n";
+        fs << "if (objectexists(varsContainer)) {\n";
+        fs << "    for (int iV = 1; iV <= varsContainer.subnodes.length; iV++) {\n";
+        fs << "        if (varCsv != \"\") varCsv = varCsv + \",\";\n";
+        fs << "        varCsv = varCsv + string(varsContainer.subnodes[iV].name);\n";
+        fs << "    }\n";
+        fs << "}\n";
+        fs << "row[\"variables_csv\"] = varCsv;\n";
+        fs << "out[1] = row;\n";
+        fs << "print(\"[ModelerAI] get_activity_info: done\\n\");\n";
+        fs << "return out;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("get_activity_info_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("get_activity_info_failed", "non-std exception during get_activity_info.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                std::string rest = s.substr(4);
+                auto sep = rest.find(':');
+                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "get_activity_info_failed";
+                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
+                return returnError(code.c_str(), msg);
+            }
+        }
+        if (v.type != VariantType::Array) {
+            return returnError("get_activity_info_failed",
+                "FlexScript did not return an Array. Check System Console for [ModelerAI] diagnostics.");
+        }
+        Array a = static_cast<Array>(v);
+        if (a.length < 1) {
+            return returnError("get_activity_info_failed", "Empty result array.");
+        }
+        Variant rowV = a[1];
+        if (rowV.type != VariantType::Map) {
+            return returnError("get_activity_info_failed", "Row is not a Map.");
+        }
+        Map m = static_cast<Map>(rowV);
+        std::string actNameOut, cls, path, varCsv;
+        try { actNameOut = std::string(m["name"]);  }         catch (...) {}
+        try { cls        = std::string(m["class"]); }         catch (...) {}
+        try { path       = std::string(m["path"]);  }         catch (...) {}
+        try { varCsv     = std::string(m["variables_csv"]); } catch (...) {}
+
+        nlohmann::json variables = nlohmann::json::array();
+        if (!varCsv.empty()) {
+            size_t start = 0;
+            while (start <= varCsv.size()) {
+                size_t comma = varCsv.find(',', start);
+                std::string tok = (comma == std::string::npos)
+                    ? varCsv.substr(start)
+                    : varCsv.substr(start, comma - start);
+                if (!tok.empty()) variables.push_back(tok);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actNameOut;
+        out["class"]       = cls;
+        out["path"]        = path;
+        out["variables"]   = std::move(variables);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_activity_info", e.what()); }
+      catch (...)                     { return returnException("get_activity_info", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_get_activity_variable({ processflow, activity, variable })
+//
+// Reads a single variable on an activity. Symmetric with
+// modelerai_set_activity_variable. Determines the variable's kind from its
+// node datatype and returns the value in the corresponding JSON shape:
+//   number  → { kind: "number", value: 42.0 }
+//   string  → { kind: "string", value: "expr" }
+//   ref     → { kind: "ref",    value: "OtherActivity" }  (sibling activity)
+//   ref_pf  → { kind: "ref_pf", value: "OtherFlow" }      (another PF)
+//   unknown → { kind: "unknown", value: <best-effort string> }
+//
+// Returns: { ok, processflow, activity, variable, kind, value }
+// Errors:  processflow_not_found | activity_not_found | variable_not_found
+// ============================================================================
+modelerai_export Variant ModelerAi_getActivityVariable(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_get_activity_variable expects a JSON object: "
+                "{ processflow, activity, variable }.");
+        }
+        std::string pfName, actName, varName;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+
+        std::ostringstream fs;
+        fs << "print(\"[ModelerAI] get_activity_variable: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << " variable=" << fsEscape(varName) << "\\n\");\n";
+        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        fs << "treenode pf = NULL;\n";
+        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") { pf = pfStorage.subnodes[iP]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] get_activity_variable: NO ProcessFlow '" << fsEscape(pfName) << "'\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
+        fs << "treenode activity = NULL;\n";
+        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
+        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
+        fs << "}\n";
+        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] get_activity_variable: activity '" << fsEscape(actName) << "' not found\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\"; }\n";
+        fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
+        fs << "if (!objectexists(varNode)) { print(\"[ModelerAI] get_activity_variable: variable '" << fsEscape(varName) << "' not found on '\" + string(activity.name) + \"'\\n\"); return \"ERR:variable_not_found:Variable \\\"" << fsEscape(varName) << "\\\" not found on activity \\\"" << fsEscape(actName) << "\\\".\"; }\n";
+
+        // Inspect the variable node's datatype to determine its kind.
+        // FlexSim datatype constants: 1=NUMBER, 2=STRING, 3=NODE (coupling).
+        // For coupling, resolve where it points and detect whether the
+        // target is a sibling activity (ref) or a sibling ProcessFlow (ref_pf).
+        fs << "Array out = Array();\n";
+        fs << "Map row = Map();\n";
+        fs << "int dt = getdatatype(varNode);\n";
+        fs << "print(\"[ModelerAI] get_activity_variable: inspecting datatype\\n\");\n";
+        fs << "if (dt == 1) {\n";
+        fs << "    row[\"kind\"]      = \"number\";\n";
+        fs << "    row[\"value_num\"] = getvarnum(activity, \"" << fsEscape(varName) << "\");\n";
+        fs << "    row[\"value_str\"] = \"\";\n";
+        fs << "} else if (dt == 2) {\n";
+        fs << "    row[\"kind\"]      = \"string\";\n";
+        fs << "    row[\"value_num\"] = 0;\n";
+        fs << "    row[\"value_str\"] = string(varNode.value);\n";
+        fs << "} else if (dt == 3) {\n";
+        fs << "    treenode target = varNode.value;\n";
+        fs << "    if (!objectexists(target)) {\n";
+        fs << "        row[\"kind\"]      = \"unknown\";\n";
+        fs << "        row[\"value_num\"] = 0;\n";
+        fs << "        row[\"value_str\"] = \"\";\n";
+        fs << "    } else {\n";
+        // Is the target a sibling activity in this PF?
+        fs << "        treenode parent = up(target);\n";
+        fs << "        if (objectexists(parent) && parent == pf) {\n";
+        fs << "            row[\"kind\"]      = \"ref\";\n";
+        fs << "            row[\"value_num\"] = 0;\n";
+        fs << "            row[\"value_str\"] = string(target.name);\n";
+        fs << "        } else if (objectexists(parent) && parent == pfStorage) {\n";
+        // Target is another ProcessFlow (parent == /Tools/ProcessFlow).
+        fs << "            row[\"kind\"]      = \"ref_pf\";\n";
+        fs << "            row[\"value_num\"] = 0;\n";
+        fs << "            row[\"value_str\"] = string(target.name);\n";
+        fs << "        } else {\n";
+        // Some other treenode — return its path so the agent has something
+        // to work with.
+        fs << "            row[\"kind\"]      = \"node\";\n";
+        fs << "            row[\"value_num\"] = 0;\n";
+        fs << "            row[\"value_str\"] = string(nodetomodelpath(target, 1));\n";
+        fs << "        }\n";
+        fs << "    }\n";
+        fs << "} else {\n";
+        fs << "    row[\"kind\"]      = \"unknown\";\n";
+        fs << "    row[\"value_num\"] = 0;\n";
+        fs << "    row[\"value_str\"] = string(varNode.value);\n";
+        fs << "}\n";
+        fs << "out[1] = row;\n";
+        fs << "print(\"[ModelerAI] get_activity_variable: done\\n\");\n";
+        fs << "return out;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("get_activity_variable_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("get_activity_variable_failed", "non-std exception during get_activity_variable.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                std::string rest = s.substr(4);
+                auto sep = rest.find(':');
+                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "get_activity_variable_failed";
+                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
+                return returnError(code.c_str(), msg);
+            }
+        }
+        if (v.type != VariantType::Array) {
+            return returnError("get_activity_variable_failed",
+                "FlexScript did not return an Array. Check System Console for [ModelerAI] diagnostics.");
+        }
+        Array a = static_cast<Array>(v);
+        if (a.length < 1) {
+            return returnError("get_activity_variable_failed", "Empty result array.");
+        }
+        Variant rowV = a[1];
+        if (rowV.type != VariantType::Map) {
+            return returnError("get_activity_variable_failed", "Row is not a Map.");
+        }
+        Map m = static_cast<Map>(rowV);
+        std::string kind, valStr;
+        double valNum = 0.0;
+        try { kind   = std::string(m["kind"]); }      catch (...) {}
+        try { valStr = std::string(m["value_str"]); } catch (...) {}
+        try {
+            Variant nv = m["value_num"];
+            if (nv.type == VariantType::Number) valNum = static_cast<double>(nv);
+        } catch (...) {}
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["kind"]        = kind;
+        if      (kind == "number") out["value"] = valNum;
+        else if (kind == "string") out["value"] = valStr;
+        else if (kind == "ref")    out["value"] = { { "ref",    valStr } };
+        else if (kind == "ref_pf") out["value"] = { { "ref_pf", valStr } };
+        else                       out["value"] = valStr;  // unknown / node path
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_activity_variable", e.what()); }
+      catch (...)                     { return returnException("get_activity_variable", "unknown"); }
 }
