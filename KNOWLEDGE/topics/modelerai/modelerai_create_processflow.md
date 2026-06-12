@@ -1,7 +1,9 @@
 # modelerai_create_processflow
 
 Creates a ProcessFlow tool of the requested kind and registers it under the
-model's Tools/Toolbox/ProcessFlow tree.
+model's `/Tools/ProcessFlow` storage list (a flat list of ProcessFlow nodes).
+The `Tools/Toolbox/ProcessFlow/<category>` tree is only a UI category shortcut,
+not the storage location.
 
 ## Args
 

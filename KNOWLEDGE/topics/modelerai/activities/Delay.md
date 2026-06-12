@@ -45,12 +45,13 @@ purely numeric)
   - With Object math: `Object src = Model.find("Source1"); return src.stats.output.value > 100 ? 30 : 60;`
 
 **Setting via `modelerai_set_activity_variable`:**
-The curated tool just writes whatever string you pass to the underlying
-node. If you pass a numeric string (`"30"`), the engine *should* treat it
-as literal-mode on next evaluation. If you pass a FlexScript body, the
-engine *should* compile it as FlexScript. The exact mode-flip mechanism
-(whether the tool needs to mark the node's dataType / nodeflags
-explicitly) is **NOT yet verified** — TODO when we add a smoke test.
+- **Literal number:** `value: 30` (or `"30"`) → stored as a plain number,
+  read directly in model units.
+- **FlexScript expression:** `value: {flexscript: "return exponential(0, 30, 0);"}`
+  → the tool marks the node as flexscript (`switch_flexscript` +
+  `buildnodeflexscript`) AND auto-prepends the standard codeHeader, so
+  `current`/`activity`/`token`/`processFlow` are in scope and a bare
+  `return ...;` compiles. Verified working.
 
 ### `container`, `lockedToMe`, `next`, `prev` — DANGEROUS, DO NOT SET via the tool
 

@@ -1,7 +1,8 @@
 # modelerai_list_processflows
 
-Walks `Tools/Toolbox/ProcessFlow/*` and returns metadata for every ProcessFlow
-registered in the model. Read-only — does not evaluate any FlexScript.
+Walks `/Tools/ProcessFlow` (the flat storage list) and returns metadata for
+every ProcessFlow registered in the model. Read-only — does not evaluate any
+FlexScript.
 
 ## Args
 
@@ -16,26 +17,24 @@ registered in the model. Read-only — does not evaluate any FlexScript.
   "ok": true,
   "count": 2,
   "processflows": [
-    { "name": "MainFlow",  "kind": "general",  "path": "Tools/…/MainFlow",  "activity_count": 5 },
-    { "name": "SubFlow1",  "kind": "sub_flow", "path": "Tools/…/SubFlow1",  "activity_count": 3 }
+    { "name": "MainFlow",  "kind": "general",  "path": "/Tools/ProcessFlow/MainFlow" },
+    { "name": "SubFlow1",  "kind": "sub_flow", "path": "/Tools/ProcessFlow/SubFlow1" }
   ]
 }
 ```
 
-## Kind inference
+Each entry is `{ name, kind, path }`. There is no `activity_count` field — use
+`modelerai_list_activities` on a specific PF for its activities.
 
-Inferred from the parent toolbox folder name:
+Duplicate-named PFs disambiguate with a `~N` path-tail suffix in `name`
+(`MainFlow`, `MainFlow~2`); pass that form verbatim to other tools.
 
-| Folder | kind |
-|---|---|
-| `"General"` | `"general"` |
-| `"Object"` | `"object"` |
-| `"Sub Flow"` | `"sub_flow"` |
-| `"Person Flow"` | `"person"` |
-| anything else | `"unknown"` |
+## Kind
 
-`activity_count` is the raw subnode count of the ProcessFlow node (v1 — total,
-not filtered to activity types).
+`kind` is detected from the PF node: `sub_flow` (isSubFlow), `person`
+(isPersonFlow), `object` (has a non-self `attachedObject`), else `general`.
+The `general` branch is verified; the others mirror `delete_processflow`'s
+detection.
 
 ## Example
 

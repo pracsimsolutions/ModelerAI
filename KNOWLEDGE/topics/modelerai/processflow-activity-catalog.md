@@ -11,7 +11,7 @@ For People-specific activities (CreatePerson, EnterLocation, etc.), pass `librar
 
 ## Path convention
 
-ProcessFlows are stored at `Tools/ProcessFlow/<name>` in the model tree. `Model.find("MyFlow")` returns null; use `Model.find("Tools/ProcessFlow/MyFlow")` if reaching one via FlexScript. The `modelerai_*` PF tools handle this for you (they walk the toolbox).
+ProcessFlows are stored at `/Tools/ProcessFlow/<name>` — a flat list. `Model.find("MyFlow")` returns null; in raw FlexScript use `node("/Tools/ProcessFlow/MyFlow", model())` or walk `node("Tools/ProcessFlow", model()).subnodes`. The `/Tools/Toolbox/ProcessFlow/...` subtree is only a UI category shortcut, not the storage location. The `modelerai_*` PF tools resolve via the storage list for you.
 
 ## Categories — copy of the FlexSim DragDropLibrary tree
 

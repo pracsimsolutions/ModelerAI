@@ -1,8 +1,11 @@
 # modelerai_get_activity_info
 
 Returns descriptive info about a single activity in a named ProcessFlow:
-its class, full tree path, and the list of variable names defined on it.
-Read-only.
+its `name`, `class`, and full tree `path`. Read-only.
+
+This tool does NOT return a list of variables. To discover valid variable names
+for an activity class, read the KB topic
+[`processflow-activity-variables.md`](processflow-activity-variables.md).
 
 Reads from `/Tools/ProcessFlow/<name>` storage — same path discipline as
 every other PF tool.
@@ -24,18 +27,12 @@ every other PF tool.
   "processflow": "MainFlow",
   "activity": "Source1",
   "class": "InterArrivalSource",
-  "path": "/Tools/ProcessFlow/MainFlow/Source1",
-  "variables": [
-    "arrivalSpacing",
-    "flowItemClass",
-    "labelData",
-    "..."
-  ]
+  "path": "/Tools/ProcessFlow/MainFlow/Source1"
 }
 ```
 
-`variables` is enumerated from the activity's `variables` subnode container.
-An activity with no such container reports an empty array.
+The return contains only `name`, `class`, and `path` (plus `ok` and
+`processflow`). There is no `variables` array.
 
 ## Errors
 
@@ -54,8 +51,10 @@ modelerai_call({ name: "modelerai_get_activity_info",
 
 ## When to use
 
-- BEFORE `modelerai_set_activity_variable` when you don't know the variable
-  names for that activity class. The `variables` list tells you what's
-  writable. (Read the actual current value with
-  `modelerai_get_activity_variable`.)
-- For inspection / debugging: confirm class + path before downstream calls.
+- For inspection / debugging: confirm an activity's class + path before
+  downstream calls.
+- To discover which variables an activity class supports, do NOT call this tool
+  — read the KB topic
+  [`processflow-activity-variables.md`](processflow-activity-variables.md)
+  for valid variable names, then read current values with
+  `modelerai_get_activity_variable`.

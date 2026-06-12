@@ -26,7 +26,7 @@ run time or in validation.
 
 | error_code | Meaning |
 |---|---|
-| `processflow_not_found` | No PF with that name under Tools/Toolbox/ProcessFlow |
+| `processflow_not_found` | No PF with that name in /Tools/ProcessFlow |
 | `activity_not_found` | No activity with that name inside the named ProcessFlow |
 | `missing_args` | `processflow` or `activity` not provided |
 | `delete_activity_failed` | FlexScript execution threw an exception |

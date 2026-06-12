@@ -5313,7 +5313,7 @@ modelerai_export Variant ModelerAi_listPerformanceMeasures(FLEXSIMINTERFACE)
         script += "            treenode r = v.find(\"reference\");\n";
         script += "            if (r && objectexists(r.value)) row[\"reference_path\"] = string(nodetomodelpath(r.value, 1));\n";
         script += "        }\n";
-        script += "        out[out.length+1] = row;\n";
+        script += "        out.push(row);\n";  // NOT out[out.length+1] — that throws on empty 1-based arrays
         script += "    }\n";
         script += "}\n";
         script += "return out;\n";
@@ -5450,7 +5450,7 @@ modelerai_export Variant ModelerAi_getPerformanceMeasures(FLEXSIMINTERFACE)
         listScript += "    for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
         listScript += "        treenode pm = pms.subnodes[iP];\n";
         listScript += "        treenode nm = pm.find(\"Name\");\n";
-        listScript += "        if (nm && string(nm.value) != \"\") out[out.length+1] = string(nm.value);\n";
+        listScript += "        if (nm && string(nm.value) != \"\") out.push(string(nm.value));\n";  // NOT out[out.length+1] — throws on empty 1-based arrays
         listScript += "    }\n";
         listScript += "}\n";
         listScript += "return out;\n";
@@ -8766,12 +8766,12 @@ modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
 {
     try {
         // Walk /Tools/ProcessFlow/* directly — the storage location for all PFs.
-        // Simplified at .1000045: no kind detection inside the loop. The
-        // previous getvarnum/getvarnode branch was the only structural
-        // difference from list_activities (which works reliably), and it
-        // consistently produced empty results via executestring even with
-        // PFs present in the tree. kind is now reported as "unknown" — a
-        // future get_processflow_info tool will inspect kind on demand.
+        // Returns kind via getvarnum detection (restored .1000056 after the
+        // array-append fix proved the getvarnum path works — see the loop
+        // body). Note: the .1000055 smoke only exercised a "general" PF;
+        // the sub_flow/object/person branches mirror delete_processflow's
+        // (which has used them in production) but the non-general branches
+        // haven't been independently re-verified post-fix.
         std::string script;
         script += "print(\"[ModelerAI] list_processflows: enter\\n\");\n";
         // ROOT CAUSE (found .1000052): the real bug behind every
@@ -8797,11 +8797,20 @@ modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
         script += "    }\n";
         script += "    string displayName = baseName;\n";
         script += "    if (priorCount > 0) displayName = baseName + \"~\" + (priorCount + 1);\n";
+        // Kind detection restored at .1000056: the getvarnum path was proven
+        // to work (delete_processflow uses the identical logic and returned
+        // the correct kind in the .1000055 smoke test without throwing). The
+        // earlier stripping was collateral damage from the array-append
+        // misdiagnosis. Same branches as delete_processflow.
+        script += "    string kind = \"general\";\n";
+        script += "    if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
+        script += "    else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
+        script += "    else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
         script += "    Map row = Map();\n";
         script += "    row[\"name\"] = displayName;\n";
-        script += "    row[\"kind\"] = \"unknown\";\n";
+        script += "    row[\"kind\"] = kind;\n";
         script += "    row[\"path\"] = string(nodetomodelpath(pf, 1));\n";
-        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + displayName + \"'\\n\");\n";
+        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + displayName + \"' kind=\" + kind + \"\\n\");\n";
         script += "    out.push(row);\n";
         script += "}\n";
         script += "print(\"[ModelerAI] list_processflows: returning result array\\n\");\n";
@@ -9095,9 +9104,10 @@ modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
         }
 
         // 8. Return the new activity treenode (same pattern as createProcessFlow).
-        //    String / Map returns don't marshal back through executestring()
-        //    cleanly in this FlexSim build, but TreeNode does. C++ reads name
-        //    + path from the returned treenode below.
+        //    add_activity returns a TreeNode because C++ reads name + path off
+        //    the result below. (Array<Map> returns DO marshal fine through
+        //    executestring — that was a long-standing misdiagnosis; the real
+        //    bug was the array-append throw, since fixed. See list_activities.)
         fs << "return newActivity;\n";
 
         Variant v;
@@ -9398,6 +9408,9 @@ modelerai_export Variant ModelerAi_deleteActivity(FLEXSIMINTERFACE)
 //   "schedule_label"         — ScheduleSource arrivals label cells (cols
 //                              4+); rowNumber + repeatCount + tokenIndex +
 //                              labelName extras
+//   "create_object_label"    — CreateObject "Assign Labels to Created
+//                              Objects" value cells; item + assignTo alias +
+//                              createdrank + labelName
 //
 // `maybePrependCodeHeader` skips the prepend when the body already declares
 // `Object current` (the signature line every header starts with) — avoids
@@ -9425,6 +9438,21 @@ std::string activityCodeHeader(const std::string& mode)
                "int repeatCount = param(5);\n"
                "int tokenIndex = param(6);\n"
                "string labelName = param(7);\n"
+               "treenode processFlow = ownerobject(activity);\n";
+    }
+    if (mode == "create_object_label") {
+        // CreateObject's "Assign Labels to Created Objects" table — label
+        // VALUE cells. The label is applied to EACH created item (when
+        // quantity > 1, every item gets it). `assignTo` is a convenience
+        // alias for the item being labeled; `createdrank` is the 1-based
+        // index of the item within this creation batch.
+        return "Object current = param(1);\n"
+               "treenode activity = param(2);\n"
+               "Token token = param(3);\n"
+               "Object item = param(4);\n"
+               "Variant assignTo = item;\n"
+               "int createdrank = param(5);\n"
+               "string labelName = param(6);\n"
                "treenode processFlow = ownerobject(activity);\n";
     }
     // standard / default
@@ -9461,9 +9489,10 @@ DisambiguatedName parseDisambiguatedName(const std::string& nameIn)
 }
 
 // Emit the standard PF storage walk + name-with-disambiguation match.
-// Uses `node("Tools/ProcessFlow", model())` directly — the assertsubnode
-// pattern we used earlier returned empty results via executestring even
-// when the storage was populated (root cause TBD; this works).
+// Uses `node("Tools/ProcessFlow", model())` directly. (An earlier
+// assertsubnode-based form was blamed for empty results, but that was the
+// same array-append misdiagnosis — both forms reach the same storage node;
+// node() is just the more direct expression of the well-known path.)
 //
 // After this script runs, `pf` is in scope (or the script has already
 // returned an ERR string and bailed).
@@ -9625,11 +9654,12 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
                << fsEscape(strValue) << "\";\n";
             fs << "print(\"[ModelerAI] set_activity_variable: set string value on '\" + string(activity.name) + \"'\\n\");\n";
         } else if (valueKind == "ref") {
-            fs << "treenode refActivity = NULL;\n";
-            fs << "for (int iRef = 1; iRef <= pf.subnodes.length; iRef++) {\n";
-            fs << "    if (string(pf.subnodes[iRef].name) == \"" << fsEscape(refName) << "\") { refActivity = pf.subnodes[iRef]; break; }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(refActivity)) { print(\"[ModelerAI] set_activity_variable: ref activity '" << fsEscape(refName) << "' not found.\\n\"); return \"ERR:ref_not_found:Activity \\\"" << fsEscape(refName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+            // Resolve the sibling activity via the shared helper so `~N`
+            // disambiguation works (a plain first-match would silently bind
+            // to the wrong activity when two share a base name). The helper
+            // emits `return "ERR:...";` on miss — fine, this tool returns
+            // strings. Reuses `activity`-scope `pf`; result var `refActivity`.
+            fs << emitActivityResolveScript("set_activity_variable", refName, "refActivity", pfName, "iRef");
             fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refActivity;\n";
             fs << "print(\"[ModelerAI] set_activity_variable: set ref to '\" + string(refActivity.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
         } else if (valueKind == "ref_pf") {
@@ -9792,11 +9822,12 @@ modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
 // ============================================================================
 // modelerai_get_activity_info({ processflow, activity })
 //
-// Returns descriptive info about a single activity: class, full path, and
-// a comma-separated list of its variable names so the agent can discover
-// what's readable via modelerai_get_activity_variable.
+// Returns descriptive info about a single activity: name, class, full path.
+// (A variable-name enumeration was intentionally dropped — for valid
+// variable names per class, read KNOWLEDGE/topics/modelerai/
+// processflow-activity-variables.md.)
 //
-// Returns: { ok, processflow, activity, class, path, variables: ["name", ...] }
+// Returns: { ok, processflow, activity, class, path }
 // Errors:  processflow_not_found | activity_not_found | missing_args
 // ============================================================================
 modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
@@ -9824,15 +9855,13 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
         fs << emitPfResolveScript("get_activity_info", pfName);
         fs << emitActivityResolveScript("get_activity_info", actName, "activity", pfName, "iAct");
         fs << "print(\"[ModelerAI] get_activity_info: found activity at \" + string(nodetomodelpath(activity, 1)) + \"\\n\");\n";
-        // Simplified at .1000046: drop the >variables walk inline. Earlier
-        // versions tried to enumerate the variable names here, but the
-        // script consistently failed back through executestring with "did
-        // not return an Array" even with the >variables path fix. To unblock
-        // the agent, this tool now reliably returns just name/class/path —
-        // the same fields list_activities returns per row, plus the
-        // single-activity convenience. A future modelerai_list_activity_variables
-        // tool will handle the variable enumeration in isolation so a bug
-        // there can't take down get_activity_info too.
+        // Returns just name/class/path. The earlier inline >variables
+        // enumeration was dropped at .1000046 (it failed back through
+        // executestring — almost certainly the same array-append throw, since
+        // fixed, but never re-attempted). For valid variable names per class,
+        // the agent reads KNOWLEDGE/topics/modelerai/processflow-activity-
+        // variables.md. If per-instance enumeration is wanted later, re-add a
+        // >variables walk using out.push() (the append idiom that was the bug).
         fs << "Array out = Array();\n";
         fs << "Map row = Map();\n";
         fs << "row[\"name\"] = string(activity.name);\n";
@@ -9889,9 +9918,8 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
         out["activity"]    = actNameOut;
         out["class"]       = cls;
         out["path"]        = path;
-        // `variables` enumeration moved to a future modelerai_list_activity_variables
-        // tool — see processflow-activity-variables.md for the full per-class list
-        // until that tool ships.
+        // No `variables` field — see processflow-activity-variables.md for the
+        // per-class variable list.
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_activity_info", e.what()); }
       catch (...)                     { return returnException("get_activity_info", "unknown"); }
@@ -10440,14 +10468,13 @@ modelerai_export Variant ModelerAi_getActivityTableSize(FLEXSIMINTERFACE)
         std::ostringstream fs;
         fs << emitActivityTableResolveScript("get_activity_table_size", pfName, actName, varName);
         fs << "Table tbl = tblNode;\n";
-        // We return an Array<Map> with one row holding rows/cols (as string-typed
-        // counters to avoid the int-in-Map marshal trap we hit in list_processflows)
-        // plus a comma-separated header list.
+        // One-row Array<Map>. rows/cols are stored as strings via empty-string
+        // concat (`"" + n`) — `string(rawInt)` is unreliable for bare ints in
+        // this FlexScript build (it parses `string` as a command call), whereas
+        // `string(treenodeProperty)` works because the input is already typed.
+        // The `"" + n` idiom sidesteps it entirely.
         fs << "Array out = Array();\n";
         fs << "Map row = Map();\n";
-        // string(<int>) parse-fails in this FlexScript build; use empty-string
-        // concat to coerce int → string (the same idiom the user verified
-        // earlier when prints concatenate v.dataType etc.)
         fs << "row[\"rows\"] = \"\" + tbl.numRows;\n";
         fs << "row[\"cols\"] = \"\" + tbl.numCols;\n";
         fs << "string headerCsv = \"\";\n";
@@ -10716,14 +10743,19 @@ modelerai_export Variant ModelerAi_setCreateObjectTargetLabel(FLEXSIMINTERFACE)
         fs << "treenode instAssignTo = getvarnode(activity, \"assignTo\");\n";
         fs << "if (!objectexists(instAssignTo)) { print(\"[ModelerAI] set_create_object_target_label: instance assignTo not found\\n\"); return \"ERR:variable_not_found:assignTo variable not found on activity (is this a CreateObject?).\"; }\n";
 
-        // Copy/replace: idempotent reset to the library template shape.
-        fs << "copyreplace(instAssignTo, libAssignTo);\n";
+        // Copy the library template OVER the instance node:
+        // source.copy(destination, COPY_FLAG_REPLACE) replaces the destination
+        // node with a copy of the source. The returned treenode is the new
+        // node (the old instAssignTo handle may be stale after replace), so
+        // capture it and re-resolve from there.
+        fs << "treenode newAssignTo = libAssignTo.copy(instAssignTo, COPY_FLAG_REPLACE);\n";
+        fs << "if (!objectexists(newAssignTo)) newAssignTo = getvarnode(activity, \"assignTo\");\n";
         fs << "print(\"[ModelerAI] set_create_object_target_label: copy/replace done\\n\");\n";
 
         // Set the stringValue subnode (second subnode of assignTo) to the
         // label name.
-        fs << "if (instAssignTo.subnodes.length < 2) { print(\"[ModelerAI] set_create_object_target_label: assignTo has < 2 subnodes after copy\\n\"); return \"ERR:malformed_template:assignTo template lacks the stringValue subnode (post-copy structure unexpected).\"; }\n";
-        fs << "treenode stringValueNode = instAssignTo.subnodes[2];\n";
+        fs << "if (newAssignTo.subnodes.length < 2) { print(\"[ModelerAI] set_create_object_target_label: assignTo has < 2 subnodes after copy\\n\"); return \"ERR:malformed_template:assignTo template lacks the stringValue subnode (post-copy structure unexpected).\"; }\n";
+        fs << "treenode stringValueNode = newAssignTo.subnodes[2];\n";
         fs << "stringValueNode.value = \"" << fsEscape(labelName) << "\";\n";
 
         // Set assignType (overwrite=0, append=1).

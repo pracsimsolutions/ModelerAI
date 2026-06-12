@@ -1,11 +1,11 @@
 # modelerai_delete_processflow
 
-Finds a ProcessFlow by name under any `Tools/Toolbox/ProcessFlow/*` folder,
+Finds a ProcessFlow by name in the `/Tools/ProcessFlow` storage list,
 destroys the ProcessFlow node, and removes its toolbox coupling entry.
 
-**Safety:** only destroys nodes that live inside the
-`Tools/Toolbox/ProcessFlow` subtree — will not accidentally destroy arbitrary
-model objects even if a name collision exists elsewhere.
+**Safety:** only destroys nodes that live inside the `/Tools/ProcessFlow`
+storage list — will not accidentally destroy arbitrary model objects even if a
+name collision exists elsewhere.
 
 **v1 limitation:** does not chase RunSubFlow activity references before
 deleting. If other ProcessFlows call this one via a RunSubFlow activity, those
@@ -23,14 +23,16 @@ Warn the modeler when deleting a `sub_flow` that may be referenced elsewhere.
 ## Returns
 
 ```jsonc
-{ "ok": true, "name": "MyFlow", "kind": "sub_flow", "removed": true }
+{ "ok": true, "name": "MyFlow", "kind": "unknown", "removed": true }
 ```
+
+`kind` comes from a best-effort detection and may be `"unknown"`.
 
 ## Errors
 
 | error_code | Meaning |
 |---|---|
-| `not_found` | No ProcessFlow with that name under Tools/Toolbox/ProcessFlow |
+| `not_found` | No ProcessFlow with that name in /Tools/ProcessFlow |
 | `missing_name` | No name arg provided |
 | `delete_pf_failed` | FlexScript execution threw an exception |
 

@@ -41,7 +41,7 @@ Activities are filtered by `getclassname(node) != ""`; bookkeeping subnodes
 
 | error_code | meaning |
 |---|---|
-| `processflow_not_found` | no PF named `<processflow>` at `/Tools/ProcessFlow/` (returns empty `activities` array, not an error in current build — TBD) |
+| `processflow_not_found` | no PF named `<processflow>` at `/Tools/ProcessFlow/` (returns this error when the PF isn't found) |
 | `missing_args` | no `processflow` supplied |
 
 ## Example

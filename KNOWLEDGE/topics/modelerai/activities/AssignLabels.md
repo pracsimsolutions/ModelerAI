@@ -42,26 +42,36 @@ distinct storage modes — it determines WHAT the labels get assigned to:
   - Conditional / lookup logic before the return is fine — same shape
     as Delay's `delayTimeNode` FlexScript mode.
 
-**TODO:** the curated tool currently takes the value as a plain string
-and doesn't differentiate the three modes. Setting a string via
-`set_activity_variable` will likely produce a FlexScript-mode node. For
-pointer mode, the agent would need to use the `{ref:"ObjectName"}` shape
-(if supported by the tool's coupling write path) — needs verification.
+**Setting `assignTo` via the curated tool** — pick the value shape by intent:
+- **Token (most common):** `{flexscript: "return token;"}` — marks the node
+  flexscript and auto-prepends the codeHeader so `token` is in scope.
+- **A specific existing model object:** `{model_object: "Queue1"}` — stores a
+  coupling pointer. (Do NOT use `{ref:...}` for a model object; `ref` is for a
+  sibling ACTIVITY, not a model object.)
+- **Computed target:** `{flexscript: "return token.labels[\"targetItem\"].value;"}`.
 
 ### `>labels` subnode (hidden container) — WHERE THE ACTUAL LABEL KEY/VALUES LIVE
 
-The `>variables` walk doesn't surface this; it's a separate hidden
-container under the activity. The key/value pairs the modeler enters in
-the AssignLabels UI grid end up here.
+This is a **Table** at the hidden subnode `>labels`. Column 1 = label name,
+column 2 = value (any cell can be a literal or a FlexScript expression). Write
+it with the activity-table tools, passing `variable: ">labels"`:
 
-**TODO:** we have not yet enumerated the `>labels` subnode structure. The
-curated `set_activity_variable` cannot write into `>labels` directly — a
-new tool (or extension) is needed to add/edit individual label rows. A
-later session should walk a configured AssignLabels instance and
-document the shape:
-- One subnode per label-to-assign?
-- Each row holding `name` + `value`?
-- Is `value` a literal or a FlexScript expression with the same header?
+```jsonc
+// label "status" = literal string "processed"
+modelerai_set_activity_table_cell { processflow, activity: "AssignLabels1",
+  variable: ">labels", row: 1, col: 1, value: "status" }
+modelerai_set_activity_table_cell { processflow, activity: "AssignLabels1",
+  variable: ">labels", row: 1, col: 2, value: "processed" }
+
+// label "entryTime" = current model time (FlexScript — evaluates per token)
+modelerai_set_activity_table_cell { processflow, activity: "AssignLabels1",
+  variable: ">labels", row: 2, col: 1, value: "entryTime" }
+modelerai_set_activity_table_cell { processflow, activity: "AssignLabels1",
+  variable: ">labels", row: 2, col: 2, value: { "flexscript": "return time();" } }
+```
+
+The cell tool auto-grows the table, so you can write any (row, col) directly.
+**Label names cannot contain spaces** — use `entryTime`, not `entry time`.
 
 ### `includeDefaultLabels` (dataType 1 → number)
 
@@ -76,20 +86,20 @@ NEVER set `next`/`prev` — use `modelerai_connect_activities` instead.**
 ## Common patterns
 
 ```jsonc
-// Assign labels to the token itself (most common case)
+// 1. Target the token itself (default for label assignment)
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "AssignLabels1",
-  variable: "assignTo", value: "return token;"
+  variable: "assignTo", value: { "flexscript": "return token;" }
 }
-// Then the label rows themselves — TODO, no tool yet.
+// 2. Add the label rows (see the >labels section above for the table writes)
 ```
 
 ## Gotchas
-
-- **Can't yet add label rows via curated tools.** Setting `assignTo` works
-  via FlexScript-mode strings, but the actual key/value pairs require
-  hand-editing the activity in the FlexSim UI until a `>labels` writer
-  tool is added.
-- **Pointer vs FlexScript mode.** If the modeler wants a hard-pinned
-  target object, FlexScript-mode (`return Model.find("X");`) is the
-  practical workaround until coupling-mode set is supported.
+- **`assignTo` for a model object: use `{model_object:"X"}`** (coupling
+  pointer) — that's the clean shape. `{flexscript:"return Model.find(\"X\");"}`
+  also works but is heavier. `{ref:...}` is WRONG here (it's for sibling
+  activities).
+- **Label names cannot contain spaces** — `entryTime`, not `entry time`.
+- **`>labels` cells:** literal strings/numbers store as-is; pass
+  `{flexscript:...}` for a value that must evaluate per token (e.g.
+  `return time();`).

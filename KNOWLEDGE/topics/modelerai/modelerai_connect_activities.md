@@ -6,15 +6,17 @@ tool. The view is opened (idempotent) and `createConnector` is invoked on the
 ProcessFlow.
 
 > **Path note**: ProcessFlows do NOT live at the model root.
-> `Model.find("MainFlow")` returns null.
-> The correct path is `Tools/Toolbox/ProcessFlow/<kind>/<name>`.
-> This tool walks the toolbox correctly — do not use `Model.find` shortcuts.
+> They live in the flat storage list at `/Tools/ProcessFlow/<name>`.
+> In raw FlexScript resolve via `node("/Tools/ProcessFlow/<name>", model())`
+> or walk `node("Tools/ProcessFlow", model()).subnodes`. The
+> `Tools/Toolbox/ProcessFlow/<category>` tree is only a UI category shortcut,
+> not the storage location. This tool resolves the storage path internally.
 
 ## Args
 
 ```jsonc
 {
-  "processflow": "MyFlow",   // required — PF name under Tools/Toolbox/ProcessFlow
+  "processflow": "MyFlow",   // required — PF name in /Tools/ProcessFlow
   "from":        "Source1",  // required — name of the source activity in the PF
   "to":          "Delay1"    // required — name of the target activity in the PF
 }
@@ -28,7 +30,7 @@ ProcessFlow.
 
 ## Behavior
 
-- Locates the ProcessFlow via the toolbox walk (not `Model.find`).
+- Locates the ProcessFlow via the `/Tools/ProcessFlow` storage walk.
 - Opens the ProcessFlowView via `applicationcommand("openprocessflowview", pf)`
   — idempotent; safe to call even if the view is already open.
 - Calls `function_s(pf, "createConnector", activedocumentnode(), fromAct,
@@ -52,7 +54,7 @@ ProcessFlow.
 
 | error_code | Meaning |
 |---|---|
-| `processflow_not_found` | No PF with that name under Tools/Toolbox/ProcessFlow |
+| `processflow_not_found` | No PF with that name in /Tools/ProcessFlow |
 | `from_not_found` | `from` activity not found inside the named ProcessFlow |
 | `to_not_found` | `to` activity not found inside the named ProcessFlow |
 | `connect_activities_failed` | View could not be opened, or FlexScript threw during `createConnector` |

@@ -467,16 +467,20 @@ Bundle-creation tools aren't surfaced yet. When triggers / stats_collectors land
 
 | Tool | Status | One-line purpose |
 |---|---|---|
-| `modelerai_create_processflow` | implemented | Create a ProcessFlow of any kind (general / object / sub_flow / person) under the model toolbox. |
-| `modelerai_list_processflows` | implemented | Walk Tools/Toolbox/ProcessFlow/* and return all PFs with name, kind, path, activity_count. |
-| `modelerai_delete_processflow` | implemented | Destroy a ProcessFlow by name; removes both the PF node and its toolbox coupling entry. |
-| `modelerai_add_activity` | implemented | Add an activity to a named ProcessFlow via view-based `createActivity`. With `after`: auto-stacks visually + draws connector. Without: standalone, no wiring. |
-| `modelerai_connect_activities` | implemented | Draw an explicit connector arrow between two existing activities in a ProcessFlow. Use when activities were placed without `after`, or for branching/back-edge wiring. |
+| `modelerai_create_processflow` | implemented | Create a ProcessFlow of any kind (general / object / sub_flow / person). Stored at `/Tools/ProcessFlow/<name>`. |
+| `modelerai_list_processflows` | implemented | Walk `/Tools/ProcessFlow/*` and return all PFs with `{name, kind, path}` (kind: general / object / sub_flow / person, detected from the PF node). |
+| `modelerai_delete_processflow` | implemented | Destroy a ProcessFlow by name (best-effort cleanup of any toolbox coupling shortcut). |
+| `modelerai_add_activity` | implemented | Add an activity to a named ProcessFlow via view-based `createActivity`. With `after`: auto-stacks + draws connector (NOTE: `after` has been unreliable when the predecessor was created in the same batch — prefer standalone + connect_activities). |
+| `modelerai_connect_activities` | implemented | Draw an explicit connector arrow between two existing activities in a ProcessFlow. |
 | `modelerai_delete_activity` | implemented | Destroy a named activity within a named ProcessFlow. |
-| `modelerai_set_activity_variable` | implemented | Set a numeric, string, activity-ref, or flow-ref variable on an activity. |
+| `modelerai_set_activity_variable` | implemented | Set a variable on an activity. Value: number, string, `{ref}`, `{ref_pf}`, `{model_object}` (coupling pointer), or `{flexscript}` (auto-prepends codeHeader). |
 | `modelerai_list_activities` | implemented | List every activity in a ProcessFlow — returns `{name, class, path}` per activity. Read-only. |
-| `modelerai_get_activity_info` | implemented | Get one activity's class + path + list of variable names. Use BEFORE `set_activity_variable` to discover what variables exist. Read-only. |
+| `modelerai_get_activity_info` | implemented | Get one activity's `{name, class, path}`. (Does NOT return a variable list — for valid variable names read `processflow-activity-variables.md`.) Read-only. |
 | `modelerai_get_activity_variable` | implemented | Read a single variable on an activity. Returns `{kind, value}` where kind is `number` / `string` / `ref` / `ref_pf` / `node` / `unknown`. Read-only. |
+| `modelerai_set_activity_table_cell` | implemented | Set one cell of a table-shaped variable (ScheduleSource `arrivals`, AssignLabels `>labels`). Value: number, string, `{flexscript}`, or `{model_object}`. Auto-grows the table. |
+| `modelerai_get_activity_table_cell` / `_size` | implemented | Read a cell `{kind, value}` / table `{rows, cols, headers}`. Read-only. |
+| `modelerai_resize_activity_table` / `_set_..._column_header` | implemented | Resize a table / set a column header (label-column name for arrivals). |
+| `modelerai_set_create_object_target_label` | implemented | CreateObject token-label mode: store the new object's ref into a token label. `{processflow, activity, label_name, append?}`. |
 
 **`modelerai_create_processflow`** — create a ProcessFlow tool.
 
@@ -505,7 +509,10 @@ Kind defaults:
 
 ```jsonc
 modelerai_call({ name: "modelerai_list_processflows", args: {} })
-// Returns: { ok, count, processflows: [{ name, kind, path, activity_count }, ...] }
+// Returns: { ok, count, processflows: [{ name, kind, path }, ...] }
+// kind is detected (general / object / sub_flow / person). name carries the
+// ~N disambiguator for duplicate-named PFs. No activity_count — use
+// modelerai_list_activities on a specific PF for its activities.
 ```
 
 **`modelerai_delete_processflow`** — destroy a ProcessFlow by name.
@@ -521,10 +528,15 @@ modelerai_call({ name: "modelerai_delete_processflow", args: { name: "MainFlow" 
 > references will surface at model run time. The agent should warn the modeler
 > if deleting a sub_flow that may be referenced elsewhere.
 
-> **Path note**: ProcessFlows do NOT live at the model root.
-> `Model.find("MainFlow")` returns **null**. The correct path is
-> `Tools/Toolbox/ProcessFlow/<kind>/<name>`. All PF tools walk the toolbox
-> correctly — never use bare `Model.find("<pfName>")` as a shortcut.
+> **Path note**: ProcessFlows are stored at `/Tools/ProcessFlow/<name>` — a
+> FLAT list under one node. NOT at the model root (`Model.find("MainFlow")`
+> returns null) and NOT at `/Tools/Toolbox/ProcessFlow/...` (that subtree is
+> just a UI category shortcut). In raw FlexScript, resolve via
+> `node("/Tools/ProcessFlow/MainFlow", model())` or walk
+> `node("Tools/ProcessFlow", model()).subnodes`. The curated PF tools do this
+> for you — you should not need run_script for PF work. Duplicate-named PFs
+> disambiguate with a `~N` suffix on the path tail (`MainFlow~2`); the create
+> and list tools return that disambiguated form as `name` — pass it verbatim.
 
 **`modelerai_add_activity`** — add an activity to a ProcessFlow.
 
@@ -596,8 +608,25 @@ modelerai_call({ name: "modelerai_set_activity_variable",
   args: { processflow: "PersonSource", activity: "CreatePerson1",
           variable: "flowRef", value: { "ref_pf": "MainPersonFlow" } } })
 
+// Pointer to a SPECIFIC existing model object (Queue1, Source3, …) — stores
+// a coupling pointer. Use this for destination/objectRef/assignTo when you
+// mean "this object", NOT a raw string "Queue1" (which stores literal text).
+modelerai_call({ name: "modelerai_set_activity_variable",
+  args: { processflow: "MainFlow", activity: "CreateObject1",
+          variable: "destination", value: { "model_object": "Queue1" } } })
+
+// FlexScript body — the tool marks the node as flexscript AND auto-prepends
+// the right codeHeader (current/activity/token/processFlow in scope), so a
+// bare `return time();` works. Use for computed/dynamic values.
+modelerai_call({ name: "modelerai_set_activity_variable",
+  args: { processflow: "MainFlow", activity: "Delay1",
+          variable: "delayTimeNode", value: { "flexscript": "return exponential(0, 30, 0);" } } })
+//   optional `header` field on the value selects the codeHeader variant:
+//   "standard" (default) | "pre_token" (source interArrivalTime / arrivals
+//   Time cells) | "create_object_quantity" | "schedule_label".
+
 // Returns: { ok, activity, variable, value_kind, processflow }
-// value_kind: "number" | "string" | "ref" | "ref_pf"
+// value_kind: "number" | "string" | "ref" | "ref_pf" | "model_object" | "flexscript"
 ```
 
 ## Discovery tools

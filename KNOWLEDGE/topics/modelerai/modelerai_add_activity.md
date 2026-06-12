@@ -5,9 +5,16 @@ API (`openprocessflowview` + `createActivity`). The view is opened (idempotent)
 before every call so the view's connector wiring and placement logic is reused.
 
 > **Path note**: ProcessFlows do NOT live at the model root.
-> `Model.find("MainFlow")` returns null.
-> The correct path is `Tools/Toolbox/ProcessFlow/<kind>/<name>`.
-> This tool walks the toolbox correctly — do not use `Model.find` shortcuts.
+> They live in the flat storage list at `/Tools/ProcessFlow/<name>`.
+> In raw FlexScript resolve via `node("/Tools/ProcessFlow/<name>", model())`
+> or walk `node("Tools/ProcessFlow", model()).subnodes`. The
+> `Tools/Toolbox/ProcessFlow/<category>` tree is only a UI category shortcut,
+> not the storage location. This tool resolves the storage path internally.
+
+> **Reliability note**: `after` mode has been unreliable when the predecessor
+> activity was created earlier in the same batch. For robust results, create
+> activities standalone (no `after`) and wire them with
+> `modelerai_connect_activities`.
 
 ## Args
 
@@ -64,7 +71,7 @@ before every call so the view's connector wiring and placement logic is reused.
 
 | error_code | Meaning |
 |---|---|
-| `processflow_not_found` | No PF with that name under Tools/Toolbox/ProcessFlow |
+| `processflow_not_found` | No PF with that name in /Tools/ProcessFlow |
 | `library_path_not_found` | The `library_path` subtree doesn't exist in the FlexSim library |
 | `activity_type_not_found` | `type` not found under the given `library_path` |
 | `previous_not_found` | `after` activity not found inside the named ProcessFlow |

@@ -13,7 +13,15 @@ The variable's *kind* is inferred from its underlying node datatype:
 | `DATATYPE_NODE`   (3) → sibling activity in this PF | `"ref"` | `{ "ref": "OtherActivity" }` |
 | `DATATYPE_NODE`   (3) → another PF | `"ref_pf"` | `{ "ref_pf": "OtherFlow" }` |
 | `DATATYPE_NODE`   (3) → some other treenode | `"node"` | `"/path/to/node"` |
+| `7` (SIMPLE — polymorphic; e.g. `assignTo`, `objectRef`, `destination`) | `"node"` (or best-effort) | `"/path/to/node"` (best-effort) |
 | anything else | `"unknown"` | best-effort string |
+
+dataType-7 SIMPLE is the most common polymorphic PF variable type. Reading it
+returns kind `"node"` (or a best-effort representation) since the underlying
+value may be a coupling, an expression, or a node. To **set** a SIMPLE variable,
+use `modelerai_set_activity_variable` with `{ "model_object": "Queue1" }`,
+`{ "flexscript": "return ...;" }`, or `{ "ref": "OtherActivity" }` depending on
+what the variable should point at.
 
 ## Args
 
@@ -59,7 +67,10 @@ The variable's *kind* is inferred from its underlying node datatype:
 ## Discovery flow
 
 1. `modelerai_list_activities { processflow }` → names + classes.
-2. `modelerai_get_activity_info { processflow, activity }` → variable name list.
+2. Read the KB topic
+   [`processflow-activity-variables.md`](processflow-activity-variables.md) for
+   the valid variable names of that activity class. (`get_activity_info` does
+   NOT return a variable list.)
 3. `modelerai_get_activity_variable { processflow, activity, variable }` →
    one value at a time, with kind.
 

@@ -99,27 +99,65 @@ DATATYPE_SIMPLE: can hold a coupling pointer, a literal, OR a FlexScript
 expression depending on what's assigned. Selects WHERE the new-object
 reference gets stored. Two distinct usage patterns exposed in the UI:
 
-**Token-label mode** (most common: store the new object on a token
-label)
-- Requires a special node structure copied from the library template.
-- Copy/replace from:
-  `maintree().find("project/library/processflow/activities/CreateObject>variables/assignTo")`
-- The second subnode of `assignTo` is named `stringValue` — set it to
-  the label name you want to assert (e.g. `"createdItem"`).
-- Then `assignType` (above) chooses overwrite vs append.
+**Token-label mode** (most common: store the new object on a token label)
+- Use the dedicated tool — it does the library-template copy/replace +
+  `stringValue` + `assignType` internally:
+  ```jsonc
+  modelerai_set_create_object_target_label {
+    processflow: "MainFlow", activity: "CreateObject1",
+    label_name: "createdItem",   // the token label the new object's ref goes into
+    append: false                // false=overwrite (default), true=append to a list
+  }
+  ```
 
 **Arbitrary-label mode** (write to any label on any model object)
-- FlexScript-expression that returns a label node directly:
+- `set_activity_variable` on `assignTo` with a FlexScript body returning a
+  label node:
+  ```jsonc
+  modelerai_set_activity_variable {
+    processflow: "MainFlow", activity: "CreateObject1", variable: "assignTo",
+    value: { "flexscript": "return Model.find(\"Queue1\").labels[\"createdItems\"];" }
+  }
   ```
-  return Model.find("Queue1").labels["createdItems"];
-  ```
-- Same standard PF codeHeader.
 
-**TODO:** the curated `set_activity_variable` does NOT yet handle the
-copy/replace pattern for token-label mode. For now, this needs manual
-configuration in the FlexSim UI, OR the agent uses the
-arbitrary-label-mode FlexScript form (which the tool can write as a
-plain string).
+### "Assign Labels to Created Objects" — a label table on the NEW OBJECTS
+
+Distinct from `assignTo` (which stores the object reference onto the token).
+This is a Name/Value table that puts labels **on each created item**. If
+`quantity > 1`, the label is applied to ALL created items in the batch.
+
+It's a table at the hidden subnode `>labels` (same name as AssignLabels):
+col 1 = label name, col 2 = value. Write it with the activity-table tools,
+passing `variable: ">labels"` — no new tooling needed:
+```jsonc
+// give every created item a label "batch" = its position in the batch
+modelerai_set_activity_table_cell { processflow, activity: "CreateObject1",
+  variable: ">labels", row: 1, col: 1, value: "batch" }
+modelerai_set_activity_table_cell { processflow, activity: "CreateObject1",
+  variable: ">labels", row: 1, col: 2,
+  value: { "flexscript": "return createdrank;", "header": "create_object_label" } }
+```
+
+**Value-cell codeHeader** — use `header: "create_object_label"` when a value
+cell is FlexScript. It binds:
+```
+Object current = param(1);
+treenode activity = param(2);
+Token token = param(3);
+Object item = param(4);       // the item being labeled
+Variant assignTo = item;      // convenience alias
+int createdrank = param(5);   // 1-based index of this item within the batch
+string labelName = param(6);  // the label name (col 1 of this row)
+treenode processFlow = ownerobject(activity);
+```
+Example (label each created item with its batch position):
+```jsonc
+modelerai_set_activity_table_cell {
+  processflow, activity: "CreateObject1", variable: "<labels-table>",
+  row: 1, col: 2,
+  value: { "flexscript": "return createdrank;", "header": "create_object_label" }
+}
+```
 
 ### Inherited / visual — DANGEROUS or USELESS
 
@@ -131,33 +169,31 @@ Same policy. **Never set `next` or `prev`.** See [Delay topic](Delay.md).
 // Spawn 1 Box into Plane1 per token arrival, no assignment
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "CreateObject1",
-  variable: "objectRef", value: 1  // Box, assuming default FlowItemBin order
+  variable: "objectRef", value: 1  // Box (index into Tools/FlowItemBin)
 }
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "CreateObject1",
-  variable: "destination", value: "return Model.find(\"Plane1\");"
+  variable: "destination", value: { "model_object": "Plane1" }  // coupling pointer
 }
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "CreateObject1",
   variable: "quantity", value: 1
 }
 
-// Spawn N tokens-worth of pallets, assign created item to a Queue1 label
+// Spawn token-driven count of pallets, store created item on a token label
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "CreateObject1",
   variable: "objectRef", value: 4  // Pallet
 }
 modelerai_set_activity_variable {
   processflow: "MainFlow", activity: "CreateObject1",
-  variable: "quantity", value: "return token.labels[\"orderSize\"].value;"
+  variable: "quantity",
+  value: { "flexscript": "return token.labels[\"orderSize\"].value;",
+           "header": "create_object_quantity" }  // quantity body has the extra `item` param
 }
-modelerai_set_activity_variable {
+modelerai_set_create_object_target_label {
   processflow: "MainFlow", activity: "CreateObject1",
-  variable: "assignTo", value: "return Model.find(\"Queue1\").labels[\"recent\"];"
-}
-modelerai_set_activity_variable {
-  processflow: "MainFlow", activity: "CreateObject1",
-  variable: "assignType", value: 1  // append
+  label_name: "createdItem", append: false
 }
 ```
 
@@ -166,10 +202,10 @@ modelerai_set_activity_variable {
 - **`objectRef` is an INDEX, not a class name.** "Box" is `1` (in the
   default ordering), not `"Box"`. Customized FlowItemBin orderings will
   shift the mapping — verify before setting.
-- **`assignTo` token-label mode needs a special node structure.** Setting
-  the variable to a plain string in token-label mode will NOT work; the
-  tool needs an extension to handle the copy-replace pattern, OR the
-  agent uses the FlexScript-expression form returning a label node.
+- **`assignTo` token-label mode:** use `modelerai_set_create_object_target_label`
+  (handles the library-template copy/replace + stringValue + assignType for
+  you). For arbitrary model-object labels, use `set_activity_variable` on
+  `assignTo` with `{flexscript:"return Model.find(\"X\").labels[\"y\"];"}`.
 - **`createAt` controls parent-vs-place semantics** but isn't in the
   `>variables` sweep — its location in the tree is still TODO. Until
   enumerated, modify via UI.
