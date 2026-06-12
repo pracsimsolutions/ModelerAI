@@ -153,3 +153,5 @@ For People-specific activities, swap `library_path` to `"people/Activities"`. Th
 - [`modelerai_add_activity`](modelerai_add_activity.md) — uses the `type` strings cataloged here
 - [`modelerai_connect_activities`](modelerai_connect_activities.md) — wires two activities with a connector arrow (distinct from the stacking that `add_activity`'s `after` arg does)
 - [`modelerai_set_activity_variable`](modelerai_set_activity_variable.md) — sets variables on an activity (e.g. `arrivalSpacing` on InterArrivalSource, `flowRef` on RunSubFlow)
+- [processflow-activity-variables.md](processflow-activity-variables.md) — full per-class variable list with raw dataTypes
+- [activities/](activities/README.md) — hand-curated **semantic deep-dive** per class: storage modes, codeHeaders, value examples, gotchas. Currently covers Delay, AssignLabels, CustomCode, InterArrivalSource, CreateObject, EventTriggeredSource, ScheduleSource. **Read the per-class doc before setting any non-trivial variable.**

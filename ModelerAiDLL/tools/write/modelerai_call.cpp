@@ -238,6 +238,8 @@ ToolResult ModelerAiCallTool::run(std::string_view args_json)
         "modelerai_list_activities",
         "modelerai_get_activity_info",
         "modelerai_get_activity_variable",
+        "modelerai_get_activity_table_cell",
+        "modelerai_get_activity_table_size",
     };
     if (!kReadOnly.count(commandName)) {
         ModelerAi::tree::invalidateCondenseCache();

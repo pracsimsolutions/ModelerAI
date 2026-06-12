@@ -122,6 +122,20 @@ modelerai_export Variant ModelerAi_listActivities          (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_getActivityInfo         (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_getActivityVariable     (FLEXSIMINTERFACE);
 
+// Activity-table tools — for table-shaped variables on PF activities
+// (ScheduleSource.arrivals, AssignLabels.>labels, and similar). Variable
+// names starting with ">" resolve as hidden subnodes (activity.find);
+// regular names use getvarnode.
+modelerai_export Variant ModelerAi_setActivityTableCell         (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_getActivityTableCell         (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_getActivityTableSize         (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_resizeActivityTable          (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_setActivityTableColumnHeader (FLEXSIMINTERFACE);
+
+// CreateObject specialized: copy/replace + stringValue + assignType.
+// Handles the token-label-mode SDT structure for the assignTo variable.
+modelerai_export Variant ModelerAi_setCreateObjectTargetLabel   (FLEXSIMINTERFACE);
+
 // Output domain — performance measures, object stats, model summary.
 // PerformanceMeasures live inside PerformanceMeasureTables. Each PM has a
 // Value/valueNode script that's invoked when you read it via

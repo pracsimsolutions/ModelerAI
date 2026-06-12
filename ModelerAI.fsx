@@ -4386,7 +4386,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000040&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000053&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -8696,6 +8696,12 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_list_activities</name><data>dll:"module:ModelerAI" func:"ModelerAi_listActivities"</data></node>
       <node f="1000042" dt="2"><name>modelerai_get_activity_info</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityInfo"</data></node>
       <node f="1000042" dt="2"><name>modelerai_get_activity_variable</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityVariable"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_set_activity_table_cell</name><data>dll:"module:ModelerAI" func:"ModelerAi_setActivityTableCell"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_get_activity_table_cell</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityTableCell"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_get_activity_table_size</name><data>dll:"module:ModelerAI" func:"ModelerAi_getActivityTableSize"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_resize_activity_table</name><data>dll:"module:ModelerAI" func:"ModelerAi_resizeActivityTable"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_set_activity_table_column_header</name><data>dll:"module:ModelerAI" func:"ModelerAi_setActivityTableColumnHeader"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_set_create_object_target_label</name><data>dll:"module:ModelerAI" func:"ModelerAi_setCreateObjectTargetLabel"</data></node>
      </node>
     </node>
    </node>

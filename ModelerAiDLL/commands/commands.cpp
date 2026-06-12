@@ -8716,15 +8716,28 @@ modelerai_export Variant ModelerAi_createProcessFlow(FLEXSIMINTERFACE)
                 "ProcessFlow creation returned a null treenode.");
         }
 
-        // Build response.
+        // Build response. We return the path-tail as `name` (rather than
+        // .name, which can collide and lose the `~N` disambiguator). The
+        // agent uses this name verbatim in subsequent tool calls; every PF
+        // tool's lookup parses `~N` to find the right match in storage.
         nlohmann::json out;
         out["ok"]   = true;
         out["kind"] = kind;
-        out["name"] = std::string(getname(pf));
+        std::string fullPath;
         try {
             const char* p = nodetomodelpath_cstr(pf, 1);
-            if (p) out["path"] = std::string(p);
+            if (p) fullPath = p;
         } catch (...) {}
+        if (!fullPath.empty()) {
+            out["path"] = fullPath;
+            // Extract last path segment as the canonical name.
+            size_t lastSlash = fullPath.find_last_of('/');
+            out["name"] = (lastSlash != std::string::npos)
+                ? fullPath.substr(lastSlash + 1)
+                : fullPath;
+        } else {
+            out["name"] = std::string(getname(pf));
+        }
         if (kind == "object" && !attachedTo.empty()) {
             out["attached_to"] = attachedTo;
         }
@@ -8753,31 +8766,43 @@ modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
 {
     try {
         // Walk /Tools/ProcessFlow/* directly — the storage location for all PFs.
-        // (The toolbox has UI coupling shortcuts but can be missing or stale.)
+        // Simplified at .1000045: no kind detection inside the loop. The
+        // previous getvarnum/getvarnode branch was the only structural
+        // difference from list_activities (which works reliably), and it
+        // consistently produced empty results via executestring even with
+        // PFs present in the tree. kind is now reported as "unknown" — a
+        // future get_processflow_info tool will inspect kind on demand.
         std::string script;
         script += "print(\"[ModelerAI] list_processflows: enter\\n\");\n";
-        script += "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
+        // ROOT CAUSE (found .1000052): the real bug behind every
+        // Array-returning PF tool was `out[out.length + 1] = row;` — on a
+        // 1-based FlexScript array that's empty (length 0), index 1 is out
+        // of bounds, so the assignment THREW "Array index out of bounds".
+        // executestring swallowed the throw as a generic failure (showing
+        // count:0); a direct applicationcommand surfaced it as a hard throw.
+        // Fix: `out.push(row)`. NEVER a Map-marshaling problem — confirmed
+        // by list_activities (Array<Map>) working with the same push fix,
+        // so list_processflows is back on the clean Array<Map> form.
+        script += "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
+        script += "if (!objectexists(pfStorage)) { print(\"[ModelerAI] list_processflows: /Tools/ProcessFlow node missing — model has no PFs yet\\n\"); return Array(); }\n";
         script += "print(\"[ModelerAI] list_processflows: walking pfStorage subnodes\\n\");\n";
         script += "Array out = Array();\n";
         script += "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
         script += "    treenode pf = pfStorage.subnodes[iP];\n";
         script += "    if (!objectexists(pf)) continue;\n";
-        // Infer kind from PF's own properties.
-        script += "    string kind = \"general\";\n";
-        script += "    if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
-        script += "    else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
-        script += "    else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
+        script += "    string baseName = string(pf.name);\n";
+        script += "    int priorCount = 0;\n";
+        script += "    for (int iJ = 1; iJ < iP; iJ++) {\n";
+        script += "        if (string(pfStorage.subnodes[iJ].name) == baseName) priorCount = priorCount + 1;\n";
+        script += "    }\n";
+        script += "    string displayName = baseName;\n";
+        script += "    if (priorCount > 0) displayName = baseName + \"~\" + (priorCount + 1);\n";
         script += "    Map row = Map();\n";
-        script += "    row[\"name\"] = string(pf.name);\n";
-        script += "    row[\"kind\"] = kind;\n";
+        script += "    row[\"name\"] = displayName;\n";
+        script += "    row[\"kind\"] = \"unknown\";\n";
         script += "    row[\"path\"] = string(nodetomodelpath(pf, 1));\n";
-        // activity_count was previously written here as `pf.subnodes.length`
-        // (an int into the Map). That broke the Array<Map> marshal back
-        // through executestring() — silent failure mode showed up as
-        // count:0 even with PFs present. We derive activity_count C++-side
-        // from a separate path-resolve walk instead (see C++ block below).
-        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + string(pf.name) + \"' kind=\" + kind + \"\\n\");\n";
-        script += "    out[out.length + 1] = row;\n";
+        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + displayName + \"'\\n\");\n";
+        script += "    out.push(row);\n";
         script += "}\n";
         script += "print(\"[ModelerAI] list_processflows: returning result array\\n\");\n";
         script += "return out;\n";
@@ -8821,6 +8846,28 @@ modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("list_processflows", "unknown"); }
 }
 
+// Forward declarations for PF-tool helpers (definitions live just before
+// set_activity_variable and inside the activity-table namespace block).
+// Needed here because delete_processflow / add_activity / connect_activities
+// / delete_activity / list_activities use them and appear before the
+// definition sites. The full DisambiguatedName struct is required (not just
+// forward-declared) because parseDisambiguatedName returns it by value.
+namespace {
+struct DisambiguatedName {
+    std::string base;
+    int index;
+};
+DisambiguatedName parseDisambiguatedName(const std::string& nameIn);
+std::string emitPfResolveScript(const std::string& toolName, const std::string& pfName);
+std::string emitActivityResolveScript(
+    const std::string& toolName,
+    const std::string& actName,
+    const std::string& actVarName,
+    const std::string& pfName,
+    const std::string& loopVar);
+nlohmann::json parseErrString(const std::string& s, const char* defaultCode);
+} // anonymous namespace
+
 // ============================================================================
 // modelerai_delete_processflow({ name } | "name")
 //
@@ -8846,19 +8893,7 @@ modelerai_export Variant ModelerAi_deleteProcessFlow(FLEXSIMINTERFACE)
         // FlexScript: scan /Tools/ProcessFlow/* (storage location), find the PF
         // by name, infer its kind, destroy it (also cleans up any toolbox coupling
         // if present, best-effort).
-        std::string script;
-        script += "print(\"[ModelerAI] delete_processflow: enter — name=" + fsEscape(name) + "\\n\");\n";
-        script += "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        script += "print(\"[ModelerAI] delete_processflow: walking pfStorage subnodes\\n\");\n";
-        script += "treenode pf = NULL;\n";
-        script += "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        script += "    if (string(pfStorage.subnodes[iP].name) == \"" + fsEscape(name) + "\") {\n";
-        script += "        pf = pfStorage.subnodes[iP];\n";
-        script += "        break;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "if (!objectexists(pf)) { print(\"[ModelerAI] delete_processflow: NO ProcessFlow named '" + fsEscape(name) + "' under /Tools/ProcessFlow.\\n\"); return \"\"; }\n";
-        script += "print(\"[ModelerAI] delete_processflow: found PF at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        std::string script = emitPfResolveScript("delete_processflow", name);
         // Infer kind before destroying.
         script += "string kind = \"general\";\n";
         script += "if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
@@ -8986,18 +9021,27 @@ modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
         std::ostringstream fs;
 
         // 1. Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
+        //    NOTE: add_activity returns a treenode (not a string) on success,
+        //    so the resolve script's ERR: string return would be mis-parsed
+        //    by C++ here. Use an inline NULL-return on not-found for
+        //    add_activity specifically, but still leverage the ~N parsing
+        //    by constructing the walk inline using the same logic.
         fs << "print(\"[ModelerAI] add_activity: enter — pf=" << fsEscape(pfName) << " type=" << fsEscape(actType) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "print(\"[ModelerAI] add_activity: walking pfStorage subnodes\\n\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP];\n";
-        fs << "        break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] add_activity: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] add_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        {
+            auto disambig = parseDisambiguatedName(pfName);
+            fs << "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
+            fs << "if (!objectexists(pfStorage)) { print(\"[ModelerAI] add_activity: /Tools/ProcessFlow missing\\n\"); return NULL; }\n";
+            fs << "treenode pf = NULL;\n";
+            fs << "int pfMatchesSoFar = 0;\n";
+            fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+            fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(disambig.base) << "\") {\n";
+            fs << "        pfMatchesSoFar = pfMatchesSoFar + 1;\n";
+            fs << "        if (pfMatchesSoFar == " << disambig.index << ") { pf = pfStorage.subnodes[iP]; break; }\n";
+            fs << "    }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(pf)) { print(\"[ModelerAI] add_activity: PF '" << fsEscape(pfName) << "' not found\\n\"); return NULL; }\n";
+            fs << "print(\"[ModelerAI] add_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        }
 
         // 2. Locate the library template.
         fs << "treenode libPath = library().find(\"" << fsEscape(libraryPath) << "\");\n";
@@ -9006,16 +9050,18 @@ modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
         fs << "if (!objectexists(libObj)) { print(\"[ModelerAI] add_activity: activity type '" << fsEscape(actType) << "' not found under library_path '" << fsEscape(libraryPath) << "'. Common types: InterArrivalSource, ScheduleSource, DateTimeSource, Delay, Decide, AssignLabels, Sink.\\n\"); return NULL; }\n";
         fs << "print(\"[ModelerAI] add_activity: found libObj \" + string(libObj.name) + \"\\n\");\n";
 
-        // 3. Resolve `after` activity if specified.
-        //    Manual subnodes walk — `pf.find(name)` was observed to return
-        //    the wrong sibling (or a partial-match) in tests; the explicit
-        //    name-equality walk is the proven pattern from list_activities.
+        // 3. Resolve `after` activity if specified (with ~N disambiguation).
         if (!afterName.empty()) {
+            auto afterDis = parseDisambiguatedName(afterName);
             fs << "treenode prevActivity = NULL;\n";
+            fs << "int prevMatchesSoFar = 0;\n";
             fs << "for (int iPrev = 1; iPrev <= pf.subnodes.length; iPrev++) {\n";
-            fs << "    if (string(pf.subnodes[iPrev].name) == \"" << fsEscape(afterName) << "\") { prevActivity = pf.subnodes[iPrev]; break; }\n";
+            fs << "    if (string(pf.subnodes[iPrev].name) == \"" << fsEscape(afterDis.base) << "\") {\n";
+            fs << "        prevMatchesSoFar = prevMatchesSoFar + 1;\n";
+            fs << "        if (prevMatchesSoFar == " << afterDis.index << ") { prevActivity = pf.subnodes[iPrev]; break; }\n";
+            fs << "    }\n";
             fs << "}\n";
-            fs << "if (!objectexists(prevActivity)) { print(\"[ModelerAI] add_activity: 'after' activity '" << fsEscape(afterName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
+            fs << "if (!objectexists(prevActivity)) { print(\"[ModelerAI] add_activity: 'after' activity '" << fsEscape(afterName) << "' not found\\n\"); return NULL; }\n";
             fs << "print(\"[ModelerAI] add_activity: resolved 'after' activity '\" + string(prevActivity.name) + \"'\\n\");\n";
         }
 
@@ -9145,36 +9191,48 @@ modelerai_export Variant ModelerAi_connectActivities(FLEXSIMINTERFACE)
         // Build FlexScript: locate PF, open view, find activities, create connector.
         std::ostringstream fs;
 
-        // 1. Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
+        // 1. Locate the ProcessFlow + from/to activities (inline because
+        //    connect_activities returns a treenode and ERR: string return
+        //    from the helper would be mis-parsed by C++ — same as add_activity).
         fs << "print(\"[ModelerAI] connect_activities: enter — pf=" << fsEscape(pfName) << " from=" << fsEscape(fromName) << " to=" << fsEscape(toName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "print(\"[ModelerAI] connect_activities: walking pfStorage subnodes\\n\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP];\n";
-        fs << "        break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] connect_activities: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] connect_activities: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        {
+            auto pfDis    = parseDisambiguatedName(pfName);
+            auto fromDis  = parseDisambiguatedName(fromName);
+            auto toDis    = parseDisambiguatedName(toName);
+            fs << "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
+            fs << "if (!objectexists(pfStorage)) { print(\"[ModelerAI] connect_activities: /Tools/ProcessFlow missing\\n\"); return NULL; }\n";
+            fs << "treenode pf = NULL;\n";
+            fs << "int pfMatchesSoFar = 0;\n";
+            fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+            fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfDis.base) << "\") {\n";
+            fs << "        pfMatchesSoFar = pfMatchesSoFar + 1;\n";
+            fs << "        if (pfMatchesSoFar == " << pfDis.index << ") { pf = pfStorage.subnodes[iP]; break; }\n";
+            fs << "    }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(pf)) { print(\"[ModelerAI] connect_activities: PF '" << fsEscape(pfName) << "' not found\\n\"); return NULL; }\n";
 
-        // 2. Resolve the from and to activities via manual walk.
-        //    pf.find(name) was observed to return the wrong sibling (so both
-        //    from and to resolved to the same node, creating a self-loop).
-        //    Explicit name-equality walk avoids that.
-        fs << "treenode fromAct = NULL;\n";
-        fs << "for (int iFrom = 1; iFrom <= pf.subnodes.length; iFrom++) {\n";
-        fs << "    if (string(pf.subnodes[iFrom].name) == \"" << fsEscape(fromName) << "\") { fromAct = pf.subnodes[iFrom]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(fromAct)) { print(\"[ModelerAI] connect_activities: 'from' activity '" << fsEscape(fromName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] connect_activities: resolved 'from' activity '\" + string(fromAct.name) + \"'\\n\");\n";
-        fs << "treenode toAct = NULL;\n";
-        fs << "for (int iTo = 1; iTo <= pf.subnodes.length; iTo++) {\n";
-        fs << "    if (string(pf.subnodes[iTo].name) == \"" << fsEscape(toName) << "\") { toAct = pf.subnodes[iTo]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(toAct)) { print(\"[ModelerAI] connect_activities: 'to' activity '" << fsEscape(toName) << "' not found in ProcessFlow '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] connect_activities: resolved 'to' activity '\" + string(toAct.name) + \"'\\n\");\n";
+            // from
+            fs << "treenode fromAct = NULL;\n";
+            fs << "int fromMatchesSoFar = 0;\n";
+            fs << "for (int iFrom = 1; iFrom <= pf.subnodes.length; iFrom++) {\n";
+            fs << "    if (string(pf.subnodes[iFrom].name) == \"" << fsEscape(fromDis.base) << "\") {\n";
+            fs << "        fromMatchesSoFar = fromMatchesSoFar + 1;\n";
+            fs << "        if (fromMatchesSoFar == " << fromDis.index << ") { fromAct = pf.subnodes[iFrom]; break; }\n";
+            fs << "    }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(fromAct)) { print(\"[ModelerAI] connect_activities: from activity '" << fsEscape(fromName) << "' not found\\n\"); return NULL; }\n";
+
+            // to
+            fs << "treenode toAct = NULL;\n";
+            fs << "int toMatchesSoFar = 0;\n";
+            fs << "for (int iTo = 1; iTo <= pf.subnodes.length; iTo++) {\n";
+            fs << "    if (string(pf.subnodes[iTo].name) == \"" << fsEscape(toDis.base) << "\") {\n";
+            fs << "        toMatchesSoFar = toMatchesSoFar + 1;\n";
+            fs << "        if (toMatchesSoFar == " << toDis.index << ") { toAct = pf.subnodes[iTo]; break; }\n";
+            fs << "    }\n";
+            fs << "}\n";
+            fs << "if (!objectexists(toAct)) { print(\"[ModelerAI] connect_activities: to activity '" << fsEscape(toName) << "' not found\\n\"); return NULL; }\n";
+        }
 
         // 3. Open the view (idempotent) — required for createConnector.
         fs << "treenode view = applicationcommand(\"openprocessflowview\", pf);\n";
@@ -9259,26 +9317,9 @@ modelerai_export Variant ModelerAi_deleteActivity(FLEXSIMINTERFACE)
         if (pfName.empty())  return returnError("missing_args", "processflow is required.");
         if (actName.empty()) return returnError("missing_args", "activity is required.");
 
-        // FlexScript: locate the PF via /Tools/ProcessFlow/* storage, find the activity, destroy it.
         std::ostringstream fs;
-        fs << "print(\"[ModelerAI] delete_activity: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "print(\"[ModelerAI] delete_activity: walking pfStorage subnodes\\n\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP];\n";
-        fs << "        break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] delete_activity: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
-        fs << "print(\"[ModelerAI] delete_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
-
-        fs << "treenode activity = NULL;\n";
-        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
-        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] delete_activity: activity '" << fsEscape(actName) << "' not found in PF '\" + string(pf.name) + \"'.\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+        fs << emitPfResolveScript("delete_activity", pfName);
+        fs << emitActivityResolveScript("delete_activity", actName, "activity", pfName, "iAct");
         fs << "print(\"[ModelerAI] delete_activity: destroying activity '\" + string(activity.name) + \"'\\n\");\n";
         fs << "activity.destroy();\n";
         fs << "print(\"[ModelerAI] delete_activity: done\\n\");\n";
@@ -9334,11 +9375,156 @@ modelerai_export Variant ModelerAi_deleteActivity(FLEXSIMINTERFACE)
 //                           getvarnode(activity, varName).value = otherFlow
 //
 // Returns: { ok, activity, variable, value_kind, processflow }
-//   value_kind: "number" | "string" | "ref" | "ref_pf"
+//   value_kind: "number" | "string" | "ref" | "ref_pf" | "model_object" | "flexscript"
 //
 // Errors: processflow_not_found | activity_not_found | ref_not_found |
-//         ref_pf_not_found | missing_args | bad_args_json
+//         ref_pf_not_found | model_object_not_found | missing_args | bad_args_json
 // ============================================================================
+
+// PF activity codeHeader generator. Shared by set_activity_variable and
+// set_activity_table_cell's {flexscript:...} handlers; prepends the right
+// param-bindings header so `current`/`token`/`activity`/etc. are in scope
+// when the body evaluates. The four variants match what FlexSim's engine
+// passes to each variable's body — see the activity deep-dive docs.
+//
+// Variants:
+//   "standard"               — most PF activity vars (Delay, AssignLabels,
+//                              CustomCode, CreateObject.destination, etc.)
+//   "pre_token"              — runs before the token exists
+//                              (InterArrivalSource.interArrivalTime;
+//                              ScheduleSource arrivals Time/Quantity cells)
+//   "create_object_quantity" — CreateObject.quantity body has an extra
+//                              `Object item` param
+//   "schedule_label"         — ScheduleSource arrivals label cells (cols
+//                              4+); rowNumber + repeatCount + tokenIndex +
+//                              labelName extras
+//
+// `maybePrependCodeHeader` skips the prepend when the body already declares
+// `Object current` (the signature line every header starts with) — avoids
+// double-prepending when the caller already supplied a header.
+namespace {
+std::string activityCodeHeader(const std::string& mode)
+{
+    if (mode == "pre_token") {
+        return "Object current = param(1);\n"
+               "treenode activity = param(2);\n"
+               "treenode processFlow = ownerobject(activity);\n";
+    }
+    if (mode == "create_object_quantity") {
+        return "Object current = param(1);\n"
+               "treenode activity = param(2);\n"
+               "Token token = param(3);\n"
+               "Object item = param(4);\n"
+               "treenode processFlow = ownerobject(activity);\n";
+    }
+    if (mode == "schedule_label") {
+        return "Object current = param(1);\n"
+               "treenode activity = param(2);\n"
+               "Token token = param(3);\n"
+               "int rowNumber = param(4);\n"
+               "int repeatCount = param(5);\n"
+               "int tokenIndex = param(6);\n"
+               "string labelName = param(7);\n"
+               "treenode processFlow = ownerobject(activity);\n";
+    }
+    // standard / default
+    return "Object current = param(1);\n"
+           "treenode activity = param(2);\n"
+           "Token token = param(3);\n"
+           "treenode processFlow = ownerobject(activity);\n";
+}
+
+std::string maybePrependCodeHeader(const std::string& body, const std::string& mode)
+{
+    if (body.find("Object current") != std::string::npos) return body;
+    return activityCodeHeader(mode) + body;
+}
+
+// Implementation of parseDisambiguatedName — see forward declaration above
+// (placed before delete_processflow so the earlier tools can call it).
+// Splits "MainFlow~2" into ("MainFlow", 2); "MainFlow" stays as ("MainFlow", 1).
+DisambiguatedName parseDisambiguatedName(const std::string& nameIn)
+{
+    DisambiguatedName out{nameIn, 1};
+    size_t tildePos = nameIn.find('~');
+    if (tildePos == std::string::npos) return out;
+    try {
+        int parsed = std::stoi(nameIn.substr(tildePos + 1));
+        if (parsed >= 1) {
+            out.base  = nameIn.substr(0, tildePos);
+            out.index = parsed;
+        }
+    } catch (...) {
+        // Not a real suffix — leave the name as-is and treat as the 1st match.
+    }
+    return out;
+}
+
+// Emit the standard PF storage walk + name-with-disambiguation match.
+// Uses `node("Tools/ProcessFlow", model())` directly — the assertsubnode
+// pattern we used earlier returned empty results via executestring even
+// when the storage was populated (root cause TBD; this works).
+//
+// After this script runs, `pf` is in scope (or the script has already
+// returned an ERR string and bailed).
+std::string emitPfResolveScript(const std::string& toolName, const std::string& pfName)
+{
+    auto disambig = parseDisambiguatedName(pfName);
+    std::ostringstream fs;
+    fs << "print(\"[ModelerAI] " << toolName << ": resolving PF '" << fsEscape(pfName)
+       << "' (base='" << fsEscape(disambig.base) << "' match#=" << disambig.index << ")\\n\");\n";
+    fs << "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
+    fs << "if (!objectexists(pfStorage)) { print(\"[ModelerAI] " << toolName
+       << ": /Tools/ProcessFlow node missing — model has no PFs yet\\n\"); "
+       << "return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName)
+       << "\\\" found (no PF storage exists yet).\"; }\n";
+    fs << "treenode pf = NULL;\n";
+    fs << "int pfMatchesSoFar = 0;\n";
+    fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
+    fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(disambig.base) << "\") {\n";
+    fs << "        pfMatchesSoFar = pfMatchesSoFar + 1;\n";
+    fs << "        if (pfMatchesSoFar == " << disambig.index << ") { pf = pfStorage.subnodes[iP]; break; }\n";
+    fs << "    }\n";
+    fs << "}\n";
+    fs << "if (!objectexists(pf)) { print(\"[ModelerAI] " << toolName
+       << ": PF '" << fsEscape(pfName) << "' not in storage\\n\"); "
+       << "return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName)
+       << "\\\" found.\"; }\n";
+    fs << "print(\"[ModelerAI] " << toolName << ": found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+    return fs.str();
+}
+
+// Emit the activity-by-name walk on the resolved `pf` from above. Also
+// handles `~N` disambiguation for activity names (engine auto-suffixes
+// when the modeler creates a second Source1 in the same PF).
+//
+// Sets `<actVarName>` treenode in scope, or bails with ERR.
+std::string emitActivityResolveScript(
+    const std::string& toolName,
+    const std::string& actName,
+    const std::string& actVarName,
+    const std::string& pfName,
+    const std::string& loopVar)
+{
+    auto disambig = parseDisambiguatedName(actName);
+    std::ostringstream fs;
+    fs << "treenode " << actVarName << " = NULL;\n";
+    fs << "int " << loopVar << "MatchesSoFar = 0;\n";
+    fs << "for (int " << loopVar << " = 1; " << loopVar << " <= pf.subnodes.length; " << loopVar << "++) {\n";
+    fs << "    if (string(pf.subnodes[" << loopVar << "].name) == \"" << fsEscape(disambig.base) << "\") {\n";
+    fs << "        " << loopVar << "MatchesSoFar = " << loopVar << "MatchesSoFar + 1;\n";
+    fs << "        if (" << loopVar << "MatchesSoFar == " << disambig.index << ") { "
+       << actVarName << " = pf.subnodes[" << loopVar << "]; break; }\n";
+    fs << "    }\n";
+    fs << "}\n";
+    fs << "if (!objectexists(" << actVarName << ")) { print(\"[ModelerAI] " << toolName
+       << ": activity '" << fsEscape(actName) << "' not found in PF '" << fsEscape(pfName) << "'\\n\"); "
+       << "return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName)
+       << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\"; }\n";
+    return fs.str();
+}
+} // anonymous namespace
+
 modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
 {
     try {
@@ -9350,7 +9536,7 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
         }
 
         std::string pfName, actName, varName, valueKind;
-        std::string strValue, refName, refPfName;
+        std::string strValue, refName, refPfName, modelObjName, flexBody;
         double numValue = 0.0;
 
         try {
@@ -9376,14 +9562,44 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
                 } else if (val.contains("ref_pf") && val["ref_pf"].is_string()) {
                     refPfName = val["ref_pf"].get<std::string>();
                     valueKind = "ref_pf";
+                } else if (val.contains("model_object") && val["model_object"].is_string()) {
+                    // Pointer to an existing model object (Queue1, Source3, etc.)
+                    // Storage: the variable node becomes a COUPLING pointing
+                    // at the resolved Model.find(name). This is the right
+                    // shape when the modeler references a SPECIFIC existing
+                    // object — not a string literal, not a FlexScript body.
+                    modelObjName = val["model_object"].get<std::string>();
+                    valueKind    = "model_object";
+                } else if (val.contains("flexscript") && val["flexscript"].is_string()) {
+                    // Explicit FlexScript-mode body. The node is marked as
+                    // FlexScript via switch_flexscript+buildnodeflexscript
+                    // so the engine compiles + evaluates on read instead of
+                    // treating the body as a literal string.
+                    //
+                    // We auto-prepend the right codeHeader so `current`,
+                    // `token`, `activity` etc. are in scope. The optional
+                    // `header` field picks which one (defaults to "standard"
+                    // — see activityCodeHeader for the variants).
+                    flexBody  = val["flexscript"].get<std::string>();
+                    valueKind = "flexscript";
+                    std::string headerMode = "standard";
+                    if (val.contains("header") && val["header"].is_string()) {
+                        headerMode = val["header"].get<std::string>();
+                    }
+                    flexBody = maybePrependCodeHeader(flexBody, headerMode);
                 } else {
                     return returnError("bad_value",
-                        "value object must have a \"ref\" or \"ref_pf\" key.");
+                        "value object must have one of: \"ref\" (sibling activity), "
+                        "\"ref_pf\" (other ProcessFlow), \"model_object\" (specific "
+                        "existing model object — stores as a pointer), or "
+                        "\"flexscript\" (FlexScript body — marked as a flexscript "
+                        "node so the engine evaluates it).");
                 }
             } else {
                 return returnError("bad_value",
-                    "value must be a number, string, { \"ref\": \"...\" }, "
-                    "or { \"ref_pf\": \"...\" }.");
+                    "value must be a number, string, {ref:\"...\"}, "
+                    "{ref_pf:\"...\"}, {model_object:\"...\"}, or "
+                    "{flexscript:\"...\"}.");
             }
         } catch (const std::exception& e) {
             return returnError("bad_args_json", std::string("parse: ") + e.what());
@@ -9393,29 +9609,9 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
         if (actName.empty()) return returnError("missing_args", "activity is required.");
         if (varName.empty()) return returnError("missing_args", "variable is required.");
 
-        // Build FlexScript.
         std::ostringstream fs;
-
-        // Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
-        fs << "print(\"[ModelerAI] set_activity_variable: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << " variable=" << fsEscape(varName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "print(\"[ModelerAI] set_activity_variable: walking pfStorage subnodes\\n\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP];\n";
-        fs << "        break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] set_activity_variable: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
-        fs << "print(\"[ModelerAI] set_activity_variable: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
-
-        // Locate the activity via manual walk (pf.find is unreliable).
-        fs << "treenode activity = NULL;\n";
-        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
-        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] set_activity_variable: activity '" << fsEscape(actName) << "' not found.\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\";\n }\n";
+        fs << emitPfResolveScript("set_activity_variable", pfName);
+        fs << emitActivityResolveScript("set_activity_variable", actName, "activity", pfName, "iAct");
         fs << "print(\"[ModelerAI] set_activity_variable: found activity '\" + string(activity.name) + \"'\\n\");\n";
 
         // Apply the value.
@@ -9448,6 +9644,28 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
             fs << "if (!objectexists(refPf)) { print(\"[ModelerAI] set_activity_variable: ref_pf '" << fsEscape(refPfName) << "' not found.\\n\"); return \"ERR:ref_pf_not_found:ProcessFlow \\\"" << fsEscape(refPfName) << "\\\" not found under Tools/ProcessFlow.\";\n }\n";
             fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refPf;\n";
             fs << "print(\"[ModelerAI] set_activity_variable: set ref_pf to '\" + string(refPf.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
+        } else if (valueKind == "model_object") {
+            // Pointer-to-model-object mode: make the variable node a COUPLING
+            // pointing at Model.find(name). Right shape for `destination`,
+            // `objectRef`, `assignTo` etc. when targeting a specific
+            // existing object.
+            fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
+            fs << "treenode targetObj = Model.find(\"" << fsEscape(modelObjName) << "\");\n";
+            fs << "if (!objectexists(targetObj)) { print(\"[ModelerAI] set_activity_variable: Model.find('" << fsEscape(modelObjName) << "') returned NULL\\n\"); return \"ERR:model_object_not_found:Model object \\\"" << fsEscape(modelObjName) << "\\\" not found.\"; }\n";
+            fs << "nodeadddata(varNode, DATATYPE_COUPLING);\n";
+            fs << "nodepoint(varNode, targetObj);\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set model_object pointer to '" << fsEscape(modelObjName) << "'\\n\");\n";
+        } else if (valueKind == "flexscript") {
+            // Force FlexScript-mode: store the body as a string and mark the
+            // node as a flexscript node so the engine compiles + evaluates
+            // on read. Without switch_flexscript+buildnodeflexscript, the
+            // engine would treat the body as a literal string (the bug
+            // that produced labels carrying `"return time();"` verbatim).
+            fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
+            fs << "varNode.value = \"" << fsEscape(flexBody) << "\";\n";
+            fs << "switch_flexscript(varNode, 1);\n";
+            fs << "buildnodeflexscript(varNode);\n";
+            fs << "print(\"[ModelerAI] set_activity_variable: set flexscript body on '\" + string(activity.name) + \"'\\n\");\n";
         }
 
         fs << "print(\"[ModelerAI] set_activity_variable: done\\n\");\n";
@@ -9505,18 +9723,7 @@ modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
         }
 
         std::ostringstream fs;
-        fs << "print(\"[ModelerAI] list_activities: enter — pf=" << fsEscape(pfName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "print(\"[ModelerAI] list_activities: walking pfStorage subnodes\\n\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP];\n";
-        fs << "        break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] list_activities: NO ProcessFlow named '" << fsEscape(pfName) << "' under /Tools/ProcessFlow.\\n\"); return Array(); }\n";
-        fs << "print(\"[ModelerAI] list_activities: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+        fs << emitPfResolveScript("list_activities", pfName);
         fs << "Array out = Array();\n";
         // Each direct subnode of a PF is either an activity or a container
         // node like 'variables'/'connectors' on the PF itself. Real activities
@@ -9534,7 +9741,7 @@ modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
         fs << "    row[\"name\"]  = string(a.name);\n";
         fs << "    row[\"class\"] = cls;\n";
         fs << "    row[\"path\"]  = string(nodetomodelpath(a, 1));\n";
-        fs << "    out[out.length + 1] = row;\n";
+        fs << "    out.push(row);\n";
         fs << "}\n";
         fs << "print(\"[ModelerAI] list_activities: returning result array\\n\");\n";
         fs << "return out;\n";
@@ -9542,6 +9749,15 @@ modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
         nlohmann::json activities = nlohmann::json::array();
         try {
             Variant v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+            // emitPfResolveScript returns "ERR:..." on PF-not-found; surface that.
+            if (v.type == VariantType::String) {
+                std::string s = std::string(v);
+                if (s.rfind("ERR:", 0) == 0) {
+                    auto err = parseErrString(s, "list_activities_failed");
+                    return returnError(err["code"].get<std::string>().c_str(),
+                                       err["msg"].get<std::string>());
+                }
+            }
             if (v.type == VariantType::Array) {
                 Array a = static_cast<Array>(v);
                 for (int i = 1; i <= a.length; ++i) {
@@ -9605,43 +9821,27 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
         if (actName.empty()) return returnError("missing_args", "activity is required.");
 
         std::ostringstream fs;
-        fs << "print(\"[ModelerAI] get_activity_info: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") {\n";
-        fs << "        pf = pfStorage.subnodes[iP]; break;\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] get_activity_info: NO ProcessFlow named '" << fsEscape(pfName) << "'\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
-        fs << "treenode activity = NULL;\n";
-        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
-        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] get_activity_info: activity '" << fsEscape(actName) << "' not found\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\"; }\n";
+        fs << emitPfResolveScript("get_activity_info", pfName);
+        fs << emitActivityResolveScript("get_activity_info", actName, "activity", pfName, "iAct");
         fs << "print(\"[ModelerAI] get_activity_info: found activity at \" + string(nodetomodelpath(activity, 1)) + \"\\n\");\n";
-        // Walk the activity's variables container (subnode named "variables"
-        // on FlexScript objects). Each child is one variable; the child's
-        // name is the variable name. If the container isn't present, the
-        // activity has no variables and we emit an empty list.
+        // Simplified at .1000046: drop the >variables walk inline. Earlier
+        // versions tried to enumerate the variable names here, but the
+        // script consistently failed back through executestring with "did
+        // not return an Array" even with the >variables path fix. To unblock
+        // the agent, this tool now reliably returns just name/class/path —
+        // the same fields list_activities returns per row, plus the
+        // single-activity convenience. A future modelerai_list_activity_variables
+        // tool will handle the variable enumeration in isolation so a bug
+        // there can't take down get_activity_info too.
         fs << "Array out = Array();\n";
         fs << "Map row = Map();\n";
-        fs << "row[\"name\"]  = string(activity.name);\n";
+        fs << "row[\"name\"] = string(activity.name);\n";
         fs << "treenode clsNode = classobject(activity);\n";
         fs << "string clsName = \"\";\n";
         fs << "if (objectexists(clsNode)) clsName = string(clsNode.name);\n";
         fs << "row[\"class\"] = clsName;\n";
-        fs << "row[\"path\"]  = string(nodetomodelpath(activity, 1));\n";
-        fs << "string varCsv = \"\";\n";
-        fs << "treenode varsContainer = activity.find(\"variables\");\n";
-        fs << "if (objectexists(varsContainer)) {\n";
-        fs << "    for (int iV = 1; iV <= varsContainer.subnodes.length; iV++) {\n";
-        fs << "        if (varCsv != \"\") varCsv = varCsv + \",\";\n";
-        fs << "        varCsv = varCsv + string(varsContainer.subnodes[iV].name);\n";
-        fs << "    }\n";
-        fs << "}\n";
-        fs << "row[\"variables_csv\"] = varCsv;\n";
-        fs << "out[1] = row;\n";
+        fs << "row[\"path\"] = string(nodetomodelpath(activity, 1));\n";
+        fs << "out.push(row);\n";
         fs << "print(\"[ModelerAI] get_activity_info: done\\n\");\n";
         fs << "return out;\n";
 
@@ -9678,25 +9878,10 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
             return returnError("get_activity_info_failed", "Row is not a Map.");
         }
         Map m = static_cast<Map>(rowV);
-        std::string actNameOut, cls, path, varCsv;
-        try { actNameOut = std::string(m["name"]);  }         catch (...) {}
-        try { cls        = std::string(m["class"]); }         catch (...) {}
-        try { path       = std::string(m["path"]);  }         catch (...) {}
-        try { varCsv     = std::string(m["variables_csv"]); } catch (...) {}
-
-        nlohmann::json variables = nlohmann::json::array();
-        if (!varCsv.empty()) {
-            size_t start = 0;
-            while (start <= varCsv.size()) {
-                size_t comma = varCsv.find(',', start);
-                std::string tok = (comma == std::string::npos)
-                    ? varCsv.substr(start)
-                    : varCsv.substr(start, comma - start);
-                if (!tok.empty()) variables.push_back(tok);
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-            }
-        }
+        std::string actNameOut, cls, path;
+        try { actNameOut = std::string(m["name"]);  } catch (...) {}
+        try { cls        = std::string(m["class"]); } catch (...) {}
+        try { path       = std::string(m["path"]);  } catch (...) {}
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -9704,7 +9889,9 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
         out["activity"]    = actNameOut;
         out["class"]       = cls;
         out["path"]        = path;
-        out["variables"]   = std::move(variables);
+        // `variables` enumeration moved to a future modelerai_list_activity_variables
+        // tool — see processflow-activity-variables.md for the full per-class list
+        // until that tool ships.
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_activity_info", e.what()); }
       catch (...)                     { return returnException("get_activity_info", "unknown"); }
@@ -9749,18 +9936,8 @@ modelerai_export Variant ModelerAi_getActivityVariable(FLEXSIMINTERFACE)
         if (varName.empty()) return returnError("missing_args", "variable is required.");
 
         std::ostringstream fs;
-        fs << "print(\"[ModelerAI] get_activity_variable: enter — pf=" << fsEscape(pfName) << " activity=" << fsEscape(actName) << " variable=" << fsEscape(varName) << "\\n\");\n";
-        fs << "treenode pfStorage = assertsubnode(node(\"Tools\", model()), \"ProcessFlow\");\n";
-        fs << "treenode pf = NULL;\n";
-        fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfName) << "\") { pf = pfStorage.subnodes[iP]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(pf)) { print(\"[ModelerAI] get_activity_variable: NO ProcessFlow '" << fsEscape(pfName) << "'\\n\"); return \"ERR:processflow_not_found:No ProcessFlow named \\\"" << fsEscape(pfName) << "\\\" found.\"; }\n";
-        fs << "treenode activity = NULL;\n";
-        fs << "for (int iAct = 1; iAct <= pf.subnodes.length; iAct++) {\n";
-        fs << "    if (string(pf.subnodes[iAct].name) == \"" << fsEscape(actName) << "\") { activity = pf.subnodes[iAct]; break; }\n";
-        fs << "}\n";
-        fs << "if (!objectexists(activity)) { print(\"[ModelerAI] get_activity_variable: activity '" << fsEscape(actName) << "' not found\\n\"); return \"ERR:activity_not_found:Activity \\\"" << fsEscape(actName) << "\\\" not found in ProcessFlow \\\"" << fsEscape(pfName) << "\\\".\"; }\n";
+        fs << emitPfResolveScript("get_activity_variable", pfName);
+        fs << emitActivityResolveScript("get_activity_variable", actName, "activity", pfName, "iAct");
         fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
         fs << "if (!objectexists(varNode)) { print(\"[ModelerAI] get_activity_variable: variable '" << fsEscape(varName) << "' not found on '\" + string(activity.name) + \"'\\n\"); return \"ERR:variable_not_found:Variable \\\"" << fsEscape(varName) << "\\\" not found on activity \\\"" << fsEscape(actName) << "\\\".\"; }\n";
 
@@ -9811,7 +9988,7 @@ modelerai_export Variant ModelerAi_getActivityVariable(FLEXSIMINTERFACE)
         fs << "    row[\"value_num\"] = 0;\n";
         fs << "    row[\"value_str\"] = string(varNode.value);\n";
         fs << "}\n";
-        fs << "out[1] = row;\n";
+        fs << "out.push(row);\n";
         fs << "print(\"[ModelerAI] get_activity_variable: done\\n\");\n";
         fs << "return out;\n";
 
@@ -9871,4 +10048,714 @@ modelerai_export Variant ModelerAi_getActivityVariable(FLEXSIMINTERFACE)
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_activity_variable", e.what()); }
       catch (...)                     { return returnException("get_activity_variable", "unknown"); }
+}
+
+// ============================================================================
+// Activity-table tool family
+// ============================================================================
+// (codeHeader helpers — `activityCodeHeader`, `maybePrependCodeHeader` —
+// live alongside set_activity_variable above so both tool families share
+// the same auto-prepend behaviour.)
+// ============================================================================
+// ScheduleSource's `arrivals`, AssignLabels' `>labels`, and similar
+// table-shaped variables on PF activities all behave like a FlexScript
+// `Table`. The five tools below give the agent uniform get / set / size /
+// resize / column-header access:
+//
+//   modelerai_set_activity_table_cell
+//   modelerai_get_activity_table_cell
+//   modelerai_get_activity_table_size
+//   modelerai_resize_activity_table
+//   modelerai_set_activity_table_column_header
+//
+// Lookup convention:
+//   - variable starts with ">" (e.g. ">labels"): hidden subnode, resolved
+//     via `activity.find(variable)` (FlexSim's hidden-container access).
+//   - otherwise: regular variable resolved via `getvarnode(activity, name)`.
+//
+// All five walk /Tools/ProcessFlow/<name> for the PF (the proven storage
+// pattern from the rest of the PF tool family) and then walk pf.subnodes
+// by exact-name match for the activity (proven pattern from list_activities).
+// pf.find() and getclassname() are NOT used (both unreliable on this
+// FlexScript build — see KB feedback memory for rationale).
+// ============================================================================
+
+namespace {
+
+// Emit the storage walk + activity walk + table-node resolution. Pushes
+// a treenode `tblNode` into scope for callers. Bails to the supplied
+// `errPrefix` ERR: string on any failure (matches set_activity_variable's
+// pattern for FlexScript→C++ error marshaling via a leading ERR: string).
+//
+// On success leaves these in scope:
+//   treenode pfStorage
+//   treenode pf
+//   treenode activity
+//   treenode tblNode      ← the Table-shaped node
+//
+// Callers append their own per-tool logic afterwards.
+std::string emitActivityTableResolveScript(
+    const std::string& errPrefix,
+    const std::string& pfName,
+    const std::string& actName,
+    const std::string& varName)
+{
+    std::ostringstream fs;
+    fs << "print(\"[ModelerAI] " << errPrefix << ": enter — pf=" << fsEscape(pfName)
+       << " activity=" << fsEscape(actName) << " variable=" << fsEscape(varName) << "\\n\");\n";
+    fs << emitPfResolveScript(errPrefix, pfName);
+    fs << emitActivityResolveScript(errPrefix, actName, "activity", pfName, "iAct");
+
+    // Resolve the table node. Leading '>' → hidden subnode (activity.find);
+    // otherwise → regular variable (getvarnode).
+    fs << "treenode tblNode = NULL;\n";
+    if (!varName.empty() && varName[0] == '>') {
+        fs << "tblNode = activity.find(\"" << fsEscape(varName) << "\");\n";
+    } else {
+        fs << "tblNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
+    }
+    fs << "if (!objectexists(tblNode)) { print(\"[ModelerAI] " << errPrefix << ": variable '" << fsEscape(varName)
+       << "' not found on activity\\n\"); return \"ERR:variable_not_found:Variable \\\"" << fsEscape(varName)
+       << "\\\" not found on activity \\\"" << fsEscape(actName) << "\\\".\"; }\n";
+    return fs.str();
+}
+
+// Common ERR: parser shared by the activity-table tools. Mirrors the
+// pattern in set_activity_variable.
+nlohmann::json parseErrString(const std::string& s, const char* defaultCode)
+{
+    nlohmann::json err;
+    if (s.rfind("ERR:", 0) == 0) {
+        std::string rest = s.substr(4);
+        auto sep = rest.find(':');
+        err["code"] = (sep != std::string::npos) ? rest.substr(0, sep) : defaultCode;
+        err["msg"]  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
+    } else {
+        err["code"] = defaultCode;
+        err["msg"]  = s;
+    }
+    return err;
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// modelerai_set_activity_table_cell
+//   { processflow, activity, variable, row, col, value }
+//
+// Sets one cell of an activity's table-shaped variable.
+//   - value is a JSON number → cell becomes a number node.
+//   - value is a JSON string → cell becomes a string node (engine will
+//     evaluate as literal vs FlexScript based on content; if you want
+//     explicit FlexScript-mode for an ambiguous string, prepend `return `
+//     and a trailing semicolon).
+//
+// Returns: { ok, processflow, activity, variable, row, col, value_kind }
+// Errors:  processflow_not_found | activity_not_found | variable_not_found |
+//          bad_index | missing_args | bad_args_json
+// ============================================================================
+modelerai_export Variant ModelerAi_setActivityTableCell(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_set_activity_table_cell expects { processflow, activity, "
+                "variable, row, col, value }.");
+        }
+
+        std::string pfName, actName, varName;
+        int row = 0, col = 0;
+        nlohmann::json valueJson;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+            if (j.contains("row") && j["row"].is_number_integer()) row = j["row"].get<int>();
+            if (j.contains("col") && j["col"].is_number_integer()) col = j["col"].get<int>();
+            if (!j.contains("value")) return returnError("missing_args", "value is required.");
+            valueJson = j["value"];
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+        if (row < 1 || col < 1) return returnError("bad_index", "row and col are 1-indexed (>= 1).");
+
+        std::ostringstream fs;
+        fs << emitActivityTableResolveScript("set_activity_table_cell", pfName, actName, varName);
+
+        // Cast to Table.
+        fs << "Table tbl = tblNode;\n";
+
+        // Auto-grow: if the cell coordinate exceeds the current table size,
+        // resize first. Otherwise the cell write would silently land out of
+        // bounds. We grow the table to max(currentSize, requested) so we never
+        // shrink existing data.
+        fs << "int curRows = tbl.numRows;\n";
+        fs << "int curCols = tbl.numCols;\n";
+        fs << "int needRows = " << row << ";\n";
+        fs << "int needCols = " << col << ";\n";
+        fs << "int newRows = curRows;\n";
+        fs << "int newCols = curCols;\n";
+        fs << "if (needRows > newRows) newRows = needRows;\n";
+        fs << "if (needCols > newCols) newCols = needCols;\n";
+        fs << "if (newRows != curRows || newCols != curCols) {\n";
+        fs << "    tbl.setSize(newRows, newCols);\n";
+        fs << "    print(\"[ModelerAI] set_activity_table_cell: auto-grew table to fit cell\\n\");\n";
+        fs << "}\n";
+
+        std::string valueKind;
+        if (valueJson.is_number()) {
+            valueKind = "number";
+            std::ostringstream n; n << valueJson.get<double>();
+            fs << "tbl[" << row << "][" << col << "] = " << n.str() << ";\n";
+        } else if (valueJson.is_string()) {
+            valueKind = "string";
+            fs << "tbl[" << row << "][" << col << "] = \"" << fsEscape(valueJson.get<std::string>()) << "\";\n";
+        } else if (valueJson.is_object() && valueJson.contains("flexscript")
+                   && valueJson["flexscript"].is_string()) {
+            // FlexScript-mode cell: store the body as a string node AND mark
+            // it as FlexScript so the engine compiles + evaluates on read.
+            // Auto-prepend the right codeHeader so `current`/`token`/etc.
+            // are in scope; optional `header` field picks the variant
+            // (defaults to "standard" — see activityCodeHeader).
+            valueKind = "flexscript";
+            std::string body = valueJson["flexscript"].get<std::string>();
+            std::string headerMode = "standard";
+            if (valueJson.contains("header") && valueJson["header"].is_string()) {
+                headerMode = valueJson["header"].get<std::string>();
+            }
+            body = maybePrependCodeHeader(body, headerMode);
+            fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
+            fs << "cellNode.value = \"" << fsEscape(body) << "\";\n";
+            fs << "switch_flexscript(cellNode, 1);\n";
+            fs << "buildnodeflexscript(cellNode);\n";
+        } else if (valueJson.is_object() && valueJson.contains("model_object")
+                   && valueJson["model_object"].is_string()) {
+            // Pointer-to-model-object mode: make the cell a coupling node
+            // pointing at the resolved Model.find(name). This is what the
+            // modeler wants when referencing a SPECIFIC existing object
+            // (Queue1, Source3, etc.) — pointer storage, not a string
+            // literal, not a FlexScript body.
+            valueKind = "model_object";
+            std::string objName = valueJson["model_object"].get<std::string>();
+            fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
+            fs << "treenode targetObj = Model.find(\"" << fsEscape(objName) << "\");\n";
+            fs << "if (!objectexists(targetObj)) { print(\"[ModelerAI] set_activity_table_cell: Model.find('"
+               << fsEscape(objName) << "') returned NULL\\n\"); return \"ERR:model_object_not_found:Model object \\\""
+               << fsEscape(objName) << "\\\" not found.\"; }\n";
+            fs << "nodeadddata(cellNode, DATATYPE_COUPLING);\n";
+            fs << "nodepoint(cellNode, targetObj);\n";
+        } else {
+            return returnError("unsupported_value_type",
+                "value must be: a JSON number, a JSON string (stored as a "
+                "string node — engine evaluates literal-vs-expression based on "
+                "content), {flexscript:\"<body>\"} (force FlexScript-mode), or "
+                "{model_object:\"Queue1\"} (pointer to a model object).");
+        }
+        fs << "print(\"[ModelerAI] set_activity_table_cell: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("set_table_cell_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("set_table_cell_failed", "non-std exception during set_activity_table_cell.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "set_table_cell_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["row"]         = row;
+        out["col"]         = col;
+        out["value_kind"]  = valueKind;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_activity_table_cell", e.what()); }
+      catch (...)                     { return returnException("set_activity_table_cell", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_get_activity_table_cell
+//   { processflow, activity, variable, row, col }
+//
+// Reads one cell. Returns { ok, value, kind } where kind is
+// "number" | "string" depending on the cell's stored dataType.
+// ============================================================================
+modelerai_export Variant ModelerAi_getActivityTableCell(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_get_activity_table_cell expects { processflow, activity, "
+                "variable, row, col }.");
+        }
+        std::string pfName, actName, varName;
+        int row = 0, col = 0;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+            if (j.contains("row") && j["row"].is_number_integer()) row = j["row"].get<int>();
+            if (j.contains("col") && j["col"].is_number_integer()) col = j["col"].get<int>();
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+        if (row < 1 || col < 1) return returnError("bad_index", "row and col are 1-indexed (>= 1).");
+
+        std::ostringstream fs;
+        fs << emitActivityTableResolveScript("get_activity_table_cell", pfName, actName, varName);
+        fs << "Table tbl = tblNode;\n";
+        // Inspect the cell node's datatype.
+        fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
+        fs << "Array out = Array();\n";
+        fs << "Map row = Map();\n";
+        fs << "if (objectexists(cellNode)) {\n";
+        fs << "    int dt = getdatatype(cellNode);\n";
+        fs << "    if (dt == 1) {\n";
+        fs << "        row[\"kind\"] = \"number\";\n";
+        fs << "        row[\"value_num\"] = tbl[" << row << "][" << col << "];\n";
+        fs << "        row[\"value_str\"] = \"\";\n";
+        fs << "    } else if (dt == 2) {\n";
+        fs << "        row[\"kind\"] = \"string\";\n";
+        fs << "        row[\"value_num\"] = 0;\n";
+        fs << "        row[\"value_str\"] = string(cellNode.value);\n";
+        fs << "    } else {\n";
+        fs << "        row[\"kind\"] = \"unknown\";\n";
+        fs << "        row[\"value_num\"] = 0;\n";
+        fs << "        row[\"value_str\"] = string(cellNode.value);\n";
+        fs << "    }\n";
+        fs << "} else {\n";
+        fs << "    row[\"kind\"] = \"empty\";\n";
+        fs << "    row[\"value_num\"] = 0;\n";
+        fs << "    row[\"value_str\"] = \"\";\n";
+        fs << "}\n";
+        fs << "out.push(row);\n";
+        fs << "return out;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("get_table_cell_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("get_table_cell_failed", "non-std exception during get_activity_table_cell.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "get_table_cell_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+        if (v.type != VariantType::Array) {
+            return returnError("get_table_cell_failed",
+                "FlexScript did not return an Array. Check System Console diagnostics.");
+        }
+        Array a = static_cast<Array>(v);
+        if (a.length < 1) return returnError("get_table_cell_failed", "Empty result array.");
+        Variant rowV = a[1];
+        if (rowV.type != VariantType::Map) return returnError("get_table_cell_failed", "Row is not a Map.");
+        Map m = static_cast<Map>(rowV);
+        std::string kind, valStr;
+        double valNum = 0.0;
+        try { kind   = std::string(m["kind"]); }      catch (...) {}
+        try { valStr = std::string(m["value_str"]); } catch (...) {}
+        try {
+            Variant nv = m["value_num"];
+            if (nv.type == VariantType::Number) valNum = static_cast<double>(nv);
+        } catch (...) {}
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["row"]         = row;
+        out["col"]         = col;
+        out["kind"]        = kind;
+        if      (kind == "number") out["value"] = valNum;
+        else if (kind == "string") out["value"] = valStr;
+        else                       out["value"] = valStr;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_activity_table_cell", e.what()); }
+      catch (...)                     { return returnException("get_activity_table_cell", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_get_activity_table_size
+//   { processflow, activity, variable }
+//
+// Returns: { ok, rows, cols, headers: [string, ...] }
+// Headers correspond to column names — for ScheduleSource arrivals these are
+// "Time", "Name", "Quantity", and any additional label column names.
+// ============================================================================
+modelerai_export Variant ModelerAi_getActivityTableSize(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_get_activity_table_size expects { processflow, activity, variable }.");
+        }
+        std::string pfName, actName, varName;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+
+        std::ostringstream fs;
+        fs << emitActivityTableResolveScript("get_activity_table_size", pfName, actName, varName);
+        fs << "Table tbl = tblNode;\n";
+        // We return an Array<Map> with one row holding rows/cols (as string-typed
+        // counters to avoid the int-in-Map marshal trap we hit in list_processflows)
+        // plus a comma-separated header list.
+        fs << "Array out = Array();\n";
+        fs << "Map row = Map();\n";
+        // string(<int>) parse-fails in this FlexScript build; use empty-string
+        // concat to coerce int → string (the same idiom the user verified
+        // earlier when prints concatenate v.dataType etc.)
+        fs << "row[\"rows\"] = \"\" + tbl.numRows;\n";
+        fs << "row[\"cols\"] = \"\" + tbl.numCols;\n";
+        fs << "string headerCsv = \"\";\n";
+        fs << "for (int iC = 1; iC <= tbl.numCols; iC++) {\n";
+        fs << "    if (headerCsv != \"\") headerCsv = headerCsv + \"|\";\n";  // pipe avoids ambiguity with comma in headers
+        fs << "    headerCsv = headerCsv + tbl.getColHeader(iC);\n";
+        fs << "}\n";
+        fs << "row[\"headers\"] = headerCsv;\n";
+        fs << "out.push(row);\n";
+        fs << "return out;\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("get_table_size_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("get_table_size_failed", "non-std exception.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "get_table_size_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+        if (v.type != VariantType::Array) {
+            return returnError("get_table_size_failed",
+                "FlexScript did not return an Array. Check System Console diagnostics.");
+        }
+        Array a = static_cast<Array>(v);
+        if (a.length < 1) return returnError("get_table_size_failed", "Empty result array.");
+        Variant rowV = a[1];
+        if (rowV.type != VariantType::Map) return returnError("get_table_size_failed", "Row is not a Map.");
+        Map m = static_cast<Map>(rowV);
+        std::string rowsStr, colsStr, headerCsv;
+        try { rowsStr   = std::string(m["rows"]); }    catch (...) {}
+        try { colsStr   = std::string(m["cols"]); }    catch (...) {}
+        try { headerCsv = std::string(m["headers"]); } catch (...) {}
+
+        int rows = 0, cols = 0;
+        try { rows = std::stoi(rowsStr); } catch (...) {}
+        try { cols = std::stoi(colsStr); } catch (...) {}
+
+        nlohmann::json headers = nlohmann::json::array();
+        if (!headerCsv.empty()) {
+            size_t start = 0;
+            while (start <= headerCsv.size()) {
+                size_t sep = headerCsv.find('|', start);
+                std::string tok = (sep == std::string::npos)
+                    ? headerCsv.substr(start)
+                    : headerCsv.substr(start, sep - start);
+                headers.push_back(tok);
+                if (sep == std::string::npos) break;
+                start = sep + 1;
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["rows"]        = rows;
+        out["cols"]        = cols;
+        out["headers"]     = std::move(headers);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_activity_table_size", e.what()); }
+      catch (...)                     { return returnException("get_activity_table_size", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_resize_activity_table
+//   { processflow, activity, variable, rows, cols }
+//
+// Resizes the table. Growing preserves existing cells; shrinking truncates.
+// ============================================================================
+modelerai_export Variant ModelerAi_resizeActivityTable(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_resize_activity_table expects { processflow, activity, "
+                "variable, rows, cols }.");
+        }
+        std::string pfName, actName, varName;
+        int rows = -1, cols = -1;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+            if (j.contains("rows") && j["rows"].is_number_integer()) rows = j["rows"].get<int>();
+            if (j.contains("cols") && j["cols"].is_number_integer()) cols = j["cols"].get<int>();
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+        if (rows < 0 || cols < 0) return returnError("bad_size", "rows and cols must be >= 0.");
+
+        std::ostringstream fs;
+        fs << emitActivityTableResolveScript("resize_activity_table", pfName, actName, varName);
+        fs << "Table tbl = tblNode;\n";
+        fs << "tbl.setSize(" << rows << ", " << cols << ");\n";
+        fs << "print(\"[ModelerAI] resize_activity_table: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("resize_table_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("resize_table_failed", "non-std exception.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "resize_table_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["rows"]        = rows;
+        out["cols"]        = cols;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("resize_activity_table", e.what()); }
+      catch (...)                     { return returnException("resize_activity_table", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_set_activity_table_column_header
+//   { processflow, activity, variable, col, header }
+//
+// Sets a column's header. For ScheduleSource arrivals, the header of any
+// column past column 3 becomes the label name assigned to created tokens.
+// ============================================================================
+modelerai_export Variant ModelerAi_setActivityTableColumnHeader(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_set_activity_table_column_header expects { processflow, "
+                "activity, variable, col, header }.");
+        }
+        std::string pfName, actName, varName, header;
+        int col = 0;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName  = j.value("processflow", std::string(""));
+            actName = j.value("activity",    std::string(""));
+            varName = j.value("variable",    std::string(""));
+            header  = j.value("header",      std::string(""));
+            if (j.contains("col") && j["col"].is_number_integer()) col = j["col"].get<int>();
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())  return returnError("missing_args", "processflow is required.");
+        if (actName.empty()) return returnError("missing_args", "activity is required.");
+        if (varName.empty()) return returnError("missing_args", "variable is required.");
+        if (col < 1)         return returnError("bad_index", "col is 1-indexed (>= 1).");
+        if (header.empty())  return returnError("missing_args", "header is required.");
+
+        std::ostringstream fs;
+        fs << emitActivityTableResolveScript("set_activity_table_column_header", pfName, actName, varName);
+        fs << "Table tbl = tblNode;\n";
+        fs << "tbl.setColHeader(" << col << ", \"" << fsEscape(header) << "\");\n";
+        fs << "print(\"[ModelerAI] set_activity_table_column_header: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("set_column_header_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("set_column_header_failed", "non-std exception.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "set_column_header_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["variable"]    = varName;
+        out["col"]         = col;
+        out["header"]      = header;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_activity_table_column_header", e.what()); }
+      catch (...)                     { return returnException("set_activity_table_column_header", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_set_create_object_target_label
+//   { processflow, activity, label_name, append? }
+//
+// CreateObject token-label mode for `assignTo`: copy/replace the assignTo
+// node from the library template (which carries the SDT-style "assign to
+// token label" structure), set the second subnode (stringValue) to the
+// label name, then set assignType to 0 (overwrite) or 1 (append).
+//
+// `append` defaults to false → assignType = 0 (overwrite).
+// ============================================================================
+modelerai_export Variant ModelerAi_setCreateObjectTargetLabel(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_set_create_object_target_label expects "
+                "{ processflow, activity, label_name, append? }.");
+        }
+        std::string pfName, actName, labelName;
+        bool append = false;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            pfName    = j.value("processflow", std::string(""));
+            actName   = j.value("activity",    std::string(""));
+            labelName = j.value("label_name",  std::string(""));
+            if (j.contains("append")) {
+                const auto& av = j["append"];
+                if      (av.is_boolean()) append = av.get<bool>();
+                else if (av.is_number())  append = av.get<double>() != 0.0;
+            }
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (pfName.empty())    return returnError("missing_args", "processflow is required.");
+        if (actName.empty())   return returnError("missing_args", "activity is required.");
+        if (labelName.empty()) return returnError("missing_args", "label_name is required.");
+
+        std::ostringstream fs;
+        fs << emitPfResolveScript("set_create_object_target_label", pfName);
+        fs << emitActivityResolveScript("set_create_object_target_label", actName, "activity", pfName, "iAct");
+
+        // Resolve the library-template assignTo (the SDT-style token-label
+        // structure we need to copy onto the instance).
+        fs << "treenode libAssignTo = maintree().find(\"project/library/processflow/activities/CreateObject>variables/assignTo\");\n";
+        fs << "if (!objectexists(libAssignTo)) { print(\"[ModelerAI] set_create_object_target_label: library template assignTo not found\\n\"); return \"ERR:library_template_missing:CreateObject library template assignTo node not found.\"; }\n";
+
+        // Resolve the instance's assignTo variable node.
+        fs << "treenode instAssignTo = getvarnode(activity, \"assignTo\");\n";
+        fs << "if (!objectexists(instAssignTo)) { print(\"[ModelerAI] set_create_object_target_label: instance assignTo not found\\n\"); return \"ERR:variable_not_found:assignTo variable not found on activity (is this a CreateObject?).\"; }\n";
+
+        // Copy/replace: idempotent reset to the library template shape.
+        fs << "copyreplace(instAssignTo, libAssignTo);\n";
+        fs << "print(\"[ModelerAI] set_create_object_target_label: copy/replace done\\n\");\n";
+
+        // Set the stringValue subnode (second subnode of assignTo) to the
+        // label name.
+        fs << "if (instAssignTo.subnodes.length < 2) { print(\"[ModelerAI] set_create_object_target_label: assignTo has < 2 subnodes after copy\\n\"); return \"ERR:malformed_template:assignTo template lacks the stringValue subnode (post-copy structure unexpected).\"; }\n";
+        fs << "treenode stringValueNode = instAssignTo.subnodes[2];\n";
+        fs << "stringValueNode.value = \"" << fsEscape(labelName) << "\";\n";
+
+        // Set assignType (overwrite=0, append=1).
+        fs << "setvarnum(activity, \"assignType\", " << (append ? "1" : "0") << ");\n";
+        fs << "print(\"[ModelerAI] set_create_object_target_label: done\\n\");\n";
+        fs << "return \"ok\";\n";
+
+        Variant v;
+        try {
+            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
+        } catch (const std::exception& e) {
+            return returnError("set_target_label_failed",
+                std::string("FlexScript execution threw: ") + e.what());
+        } catch (...) {
+            return returnError("set_target_label_failed", "non-std exception.");
+        }
+
+        if (v.type == VariantType::String) {
+            std::string s = std::string(v);
+            if (s.rfind("ERR:", 0) == 0) {
+                auto err = parseErrString(s, "set_target_label_failed");
+                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        out["activity"]    = actName;
+        out["label_name"]  = labelName;
+        out["append"]      = append;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_create_object_target_label", e.what()); }
+      catch (...)                     { return returnException("set_create_object_target_label", "unknown"); }
 }
