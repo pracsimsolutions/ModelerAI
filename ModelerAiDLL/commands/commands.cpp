@@ -1,3 +1,4 @@
+/**Custom Code*/
 // Copyright (c) 2026 Practical Simulation Solutions.
 // Licensed under the MIT License — see LICENSE.txt at the repo root.
 //
@@ -29,6 +30,21 @@
 
 #include <windows.h>     // CreateEvent / SetEvent / WaitForSingleObject
 
+// ProcessFlow module headers (linked via ProcessFlow.lib) — for native activity
+// creation via the ProcessFlow::createObject class method. Painter.h (pulled in
+// by ProcessFlow.h) drags in Windows crypto headers (Softpub.h) that expect the
+// legacy SAL macros IN/OUT, which FlexSim's headers leave undefined — restore
+// them as no-ops so the include compiles.
+#ifndef IN
+#define IN
+#endif
+#ifndef OUT
+#define OUT
+#endif
+#include "ProcessFlow.h"
+#include "ProcessFlowObject.h"   // ProcessFlowObject::addConnectorIn/Out + full def for casts
+#include "Connector.h"           // Connector::setFromBlock/setToBlock/onCreate
+
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -43,6 +59,12 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+// ProcessFlow module export, linked via ProcessFlow.lib (see module.vcxproj).
+// Global-scope C++ function — mangled ?getactivity@@YAPEAVTreeNode@FlexSim@@VVariant@2@PEBD@Z.
+// Resolves an activity treenode by name within a process flow. First use of a
+// cross-module ProcessFlow export from ModelerAI.
+FlexSim::TreeNode* getactivity(FlexSim::Variant processFlow, const char* name);
 
 namespace {
 
@@ -169,6 +191,44 @@ std::string resolveNameArg(const Variant& v, const char* objField)
         return s;
     }
     return "";
+}
+
+// Resolve a ProcessFlow storage node by name under /Tools/ProcessFlow, honoring
+// a trailing ~N to pick the Nth flow of that name. Returns nullptr if absent.
+treenode resolvePfNode(const std::string& pfName)
+{
+    std::string base = pfName;
+    int idx = 1;
+    auto t = pfName.rfind('~');
+    if (t != std::string::npos) {
+        try { idx = std::stoi(pfName.substr(t + 1)); base = pfName.substr(0, t); } catch (...) {}
+    }
+    treenode storage = node("Tools/ProcessFlow", model());
+    if (!objectexists(storage)) return nullptr;
+    int seen = 0, n = content(storage);
+    for (int i = 1; i <= n; ++i) {
+        treenode c = rank(storage, i);
+        if (c && std::string(getname(c)) == base && ++seen == idx) return c;
+    }
+    return nullptr;
+}
+
+// Resolve a direct child activity of a ProcessFlow by name, honoring ~N.
+treenode resolveActivityNode(treenode pf, const std::string& actName)
+{
+    if (!objectexists(pf)) return nullptr;
+    std::string base = actName;
+    int idx = 1;
+    auto t = actName.rfind('~');
+    if (t != std::string::npos) {
+        try { idx = std::stoi(actName.substr(t + 1)); base = actName.substr(0, t); } catch (...) {}
+    }
+    int seen = 0, n = content(pf);
+    for (int i = 1; i <= n; ++i) {
+        treenode c = rank(pf, i);
+        if (c && std::string(getname(c)) == base && ++seen == idx) return c;
+    }
+    return nullptr;
 }
 
 // ============================================================================
@@ -332,113 +392,59 @@ modelerai_export Variant ModelerAi_createObject(FLEXSIMINTERFACE)
                 "\"AGV::ControlPoint\").");
         }
 
-        // Build the canonical FlexScript and run it.
-        std::string script;
-        script += "Object newObj = Object.create(\"" + fsEscape(className) + "\");\n";
-        script += "if (!objectexists(newObj)) return 0;\n";
-        if (!objName.empty()) {
-            script += "newObj.name = \"" + fsEscape(objName) + "\";\n";
-        }
-        auto emitVec3 = [&](const char* prop, double a, double b, double c) {
-            script += "newObj.setProperty(\""; script += prop; script += "\", Vec3(";
-            script += std::to_string(a); script += ", ";
-            script += std::to_string(b); script += ", ";
-            script += std::to_string(c); script += "));\n";
-        };
-        if (hasLoc)  emitVec3("Location", lx, ly, lz);
-        if (hasRot)  emitVec3("Rotation", rx, ry, rz);
-        if (hasSize) emitVec3("Size",     sx, sy, sz);
-        if (!parentName.empty()) {
-            script += "Object parentObj = Model.find(\"" + fsEscape(parentName) + "\");\n";
-            script += "if (objectexists(parentObj)) newObj.up = parentObj;\n";
-        }
-        // Extra-properties map. Each property gets its own try/catch in
-        // the FlexScript so one bad property name doesn't abort the
-        // create — failures are collected into a `failed` array and
-        // surfaced in the response so the AI can retry the remainders.
-        // Uses the Array(N) form for Vec3/Color values (lowest-common
-        // denominator that handles strict setValue scripts; see
-        // set_property's codegen for the same trick).
-        std::vector<std::string> propertyOrder;
-        if (propertiesMap.is_object() && !propertiesMap.empty()) {
-            script += "Array __failedProps = Array();\n";
-            for (auto it = propertiesMap.begin(); it != propertiesMap.end(); ++it) {
-                std::string propName = it.key();
-                const auto& v = it.value();
-                propertyOrder.push_back(propName);
-                script += "try {\n";
-                if (v.is_boolean()) {
-                    script += "    newObj.setProperty(\"" + fsEscape(propName) + "\", " +
-                              (v.get<bool>() ? std::string("1") : std::string("0")) + ");\n";
-                } else if (v.is_number()) {
-                    std::ostringstream s; s << v.get<double>();
-                    script += "    newObj.setProperty(\"" + fsEscape(propName) + "\", " +
-                              s.str() + ");\n";
-                } else if (v.is_string()) {
-                    script += "    newObj.setProperty(\"" + fsEscape(propName) + "\", \"" +
-                              fsEscape(v.get<std::string>()) + "\");\n";
-                } else if (v.is_array() && v.size() == 3 &&
-                           v[0].is_number() && v[1].is_number() && v[2].is_number()) {
-                    std::ostringstream s;
-                    s << "    Array __vv = Array();"
-                      << " __vv.push(" << v[0].get<double>() << ");"
-                      << " __vv.push(" << v[1].get<double>() << ");"
-                      << " __vv.push(" << v[2].get<double>() << ");\n";
-                    script += s.str();
-                    script += "    newObj.setProperty(\"" + fsEscape(propName) + "\", __vv);\n";
-                } else if (v.is_array() && v.size() == 4 &&
-                           v[0].is_number() && v[1].is_number() &&
-                           v[2].is_number() && v[3].is_number()) {
-                    std::ostringstream s;
-                    s << "    Array __vv = Array();"
-                      << " __vv.push(" << v[0].get<double>() << ");"
-                      << " __vv.push(" << v[1].get<double>() << ");"
-                      << " __vv.push(" << v[2].get<double>() << ");"
-                      << " __vv.push(" << v[3].get<double>() << ");\n";
-                    script += s.str();
-                    script += "    newObj.setProperty(\"" + fsEscape(propName) + "\", __vv);\n";
-                } else {
-                    script += "    __failedProps.push(\"" + fsEscape(propName) +
-                              "\");\n";  // unsupported shape — skip the setProperty
-                }
-                script += "} catch (...) { __failedProps.push(\"" + fsEscape(propName) + "\"); }\n";
-            }
-            // Return a Map carrying both the new object and the failed list.
-            script += "Map __result = Map();\n";
-            script += "__result[\"obj\"]    = newObj;\n";
-            script += "__result[\"failed\"] = __failedProps;\n";
-            script += "return __result;\n";
-        } else {
-            script += "return newObj;\n";
-        }
-
-        Variant v;
-        try {
-            v = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("create_failed",
-                std::string("Object.create / setProperty threw: ") + e.what());
-        } catch (...) {
-            return returnError("create_failed",
-                "Object.create / setProperty threw a non-std exception.");
-        }
-
-        // Two return shapes possible:
-        //   - TreeNode   (the simple no-properties-map path)
-        //   - Map { obj: TreeNode, failed: Array<String> }  (with map)
-        treenode created = nullptr;
+        // Create natively. ObjectDataType::create() instantiates the class by
+        // name and drops the new object straight into the model — replacing the
+        // old Object.create + setProperty FlexScript codegen. Name / spatial /
+        // parent / the extra-properties map are all native C++ now, so one bad
+        // property gets recorded and skipped instead of aborting the whole
+        // create the way the old all-or-nothing executestring did.
         std::vector<std::string> failedProps;
-        if (v.type == VariantType::Map) {
-            Map m = static_cast<Map>(v);
-            Variant objV = m["obj"];
-            if (objV.type == VariantType::TreeNode) created = static_cast<treenode>(objV);
-            Variant failedV = m["failed"];
-            if (failedV.type == VariantType::Array) {
-                Array fa = static_cast<Array>(failedV);
-                for (int i = 1; i <= fa.length; ++i) failedProps.push_back(std::string(fa[i]));
+        ObjectDataType* odt = nullptr;
+        try { odt = ObjectDataType::create(className.c_str()); } catch (...) { odt = nullptr; }
+        treenode created = (odt != nullptr) ? odt->holder : nullptr;
+
+        if (created && objectexists(created)) {
+            if (!objName.empty()) setname(created, objName.c_str());
+            if (hasLoc)  setloc(created, lx, ly, lz);
+            if (hasRot)  setrot(created, rx, ry, rz);
+            if (hasSize) setsize(created, sx, sy, sz);
+            if (!parentName.empty()) {
+                treenode parentObj = model()->find(parentName.c_str());
+                if (objectexists(parentObj)) created->up = parentObj;
             }
-        } else if (v.type == VariantType::TreeNode) {
-            created = static_cast<treenode>(v);
+            // Extra-properties map — native, with per-property recovery.
+            // Vec3/Color values pass as a 3-/4-element Variant Array (there is
+            // no Variant<-Vec3 conversion); setProperty returns 1 on success.
+            if (propertiesMap.is_object() && !propertiesMap.empty()) {
+                for (auto it = propertiesMap.begin(); it != propertiesMap.end(); ++it) {
+                    const std::string propName = it.key();
+                    const auto& pj = it.value();
+                    Variant val;
+                    bool shapeOk = true;
+                    if (pj.is_boolean()) {
+                        val = Variant(pj.get<bool>() ? 1.0 : 0.0);
+                    } else if (pj.is_number()) {
+                        val = Variant(pj.get<double>());
+                    } else if (pj.is_string()) {
+                        val = Variant(pj.get<std::string>().c_str());
+                    } else if (pj.is_array() && (pj.size() == 3 || pj.size() == 4) &&
+                               pj[0].is_number() && pj[1].is_number() && pj[2].is_number() &&
+                               (pj.size() == 3 || pj[3].is_number())) {
+                        Array arr;
+                        for (size_t k = 0; k < pj.size(); ++k) arr.push(Variant(pj[k].get<double>()));
+                        val = Variant(arr);
+                    } else {
+                        shapeOk = false;  // unsupported shape — skip + record
+                    }
+                    if (!shapeOk) { failedProps.push_back(propName); continue; }
+                    try {
+                        if (odt->setProperty(propName.c_str(), val) != 1)
+                            failedProps.push_back(propName);
+                    } catch (...) {
+                        failedProps.push_back(propName);
+                    }
+                }
+            }
         }
 
         if (!created) {
@@ -775,24 +781,23 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
         // a Vec3 literal works for some properties (e.g. Source.Location)
         // but breaks others (e.g. AGV::Path.StartLocation), so the Array
         // form is the lowest-common-denominator that handles both.
-        std::string script;
-        script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-
+        // Build the value as a native Variant and write it with the object's
+        // setProperty (the proven create_object path). Vec3/Color go as a
+        // 3-/4-element Array Variant — the lowest-common-denominator every
+        // Vec3Property/ColorProperty setValue casts correctly.
+        Variant val;
         std::string valueKind;
         if (gotShape == "boolean") {
             valueKind = "boolean";
-            std::string lit = valueJson.get<bool>() ? "1" : "0";
-            script += "obj.setProperty(\"" + fsEscape(propertyName) + "\", " + lit + ");\n";
+            val = Variant(valueJson.get<bool>() ? 1.0 : 0.0);
         } else if (gotShape == "number") {
             valueKind = "number";
-            std::ostringstream s; s << valueJson.get<double>();
-            script += "obj.setProperty(\"" + fsEscape(propertyName) + "\", " + s.str() + ");\n";
+            val = Variant(valueJson.get<double>());
         } else if (gotShape == "string") {
             std::string raw = valueJson.get<std::string>();
             if (wrapAsScript) {
-                // Only wrap if the body isn't already complete. The detection
-                // is intentionally loose — "return " anywhere means the AI
-                // wrote their own headers and return; pass through as-is.
+                // Only wrap if the body isn't already complete ("return "
+                // anywhere → the AI wrote its own headers; pass through as-is).
                 bool alreadyComplete = (raw.find("return ") != std::string::npos);
                 if (!alreadyComplete) {
                     raw = "Object current = ownerobject(c);\n"
@@ -801,10 +806,8 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
                 }
                 valueKind = "flexscript_body";
                 // Scan the FlexScript body for hallucination / freeze-risk
-                // patterns BEFORE writing it. An expression-valued property
-                // (ProcessTime, MTBFMTTR, etc.) is evaluated every time
-                // FlexSim needs the value — a `while (1)` there freezes the
-                // run the moment the property is queried.
+                // patterns BEFORE writing it (expression-valued properties are
+                // evaluated every time FlexSim queries the value).
                 std::string anName, anRem;
                 if (ModelerAi::scanAntiPatterns(raw, anName, anRem)) {
                     nlohmann::json err;
@@ -822,28 +825,22 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
             } else {
                 valueKind = "string";
             }
-            script += "obj.setProperty(\"" + fsEscape(propertyName) + "\", \""
-                      + fsEscape(raw) + "\");\n";
+            val = Variant(raw.c_str());
         } else if (gotShape == "vec3") {
             valueKind = "Vec3";
-            // Array(N) doesn't auto-grow on index assignment; use push().
-            std::ostringstream s;
-            s << "Array v = Array();"
-              << " v.push(" << valueJson[0].get<double>() << ");"
-              << " v.push(" << valueJson[1].get<double>() << ");"
-              << " v.push(" << valueJson[2].get<double>() << ");\n";
-            script += s.str();
-            script += "obj.setProperty(\"" + fsEscape(propertyName) + "\", v);\n";
+            Array v;
+            v.push(Variant(valueJson[0].get<double>()));
+            v.push(Variant(valueJson[1].get<double>()));
+            v.push(Variant(valueJson[2].get<double>()));
+            val = Variant(v);
         } else if (gotShape == "color_rgba") {
             valueKind = "Color";
-            std::ostringstream s;
-            s << "Array v = Array();"
-              << " v.push(" << valueJson[0].get<double>() << ");"
-              << " v.push(" << valueJson[1].get<double>() << ");"
-              << " v.push(" << valueJson[2].get<double>() << ");"
-              << " v.push(" << valueJson[3].get<double>() << ");\n";
-            script += s.str();
-            script += "obj.setProperty(\"" + fsEscape(propertyName) + "\", v);\n";
+            Array v;
+            v.push(Variant(valueJson[0].get<double>()));
+            v.push(Variant(valueJson[1].get<double>()));
+            v.push(Variant(valueJson[2].get<double>()));
+            v.push(Variant(valueJson[3].get<double>()));
+            val = Variant(v);
         } else {
             return returnError("unsupported_value_type",
                 "value must be a number, boolean, string, 3-element [x,y,z] (Vec3), "
@@ -851,10 +848,14 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
                 "not supported by set_property — use a more specific tool, or "
                 "run_script if no curated tool exists.");
         }
-        script += "return obj;\n";
 
+        ObjectDataType* odt = obj->object<ObjectDataType>();
+        if (!odt) {
+            return returnError("setproperty_failed", "could not obtain object data from node.");
+        }
+        int setRc = 0;
         try {
-            executestring(script.c_str(), nullptr, nullptr, Variant());
+            setRc = odt->setProperty(propertyName.c_str(), val);
         } catch (const std::exception& e) {
             return returnError("setproperty_failed",
                 "setProperty(\"" + propertyName + "\", ...) threw: " + e.what() +
@@ -863,6 +864,12 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
         } catch (...) {
             return returnError("setproperty_failed",
                 "setProperty(\"" + propertyName + "\", ...) threw a non-std exception.");
+        }
+        if (setRc != 1) {
+            return returnError("setproperty_failed",
+                "setProperty(\"" + propertyName + "\", ...) returned " + std::to_string(setRc) +
+                " — property '" + propertyName + "' may not be valid for class " +
+                (className.empty() ? std::string("<unknown>") : className) + ".");
         }
 
         nlohmann::json out;
@@ -936,33 +943,26 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        // Convert one JSON element to a FlexScript literal expression
-        // that resolves to a Variant. Used both for the top-level
-        // Number/String/Pointer cases and for Array element conversion.
-        // Returns empty string + sets `err` on failure.
-        auto elemToLiteral = [&](const nlohmann::json& v, std::string& err) -> std::string {
-            if (v.is_boolean()) return v.get<bool>() ? "1" : "0";
-            if (v.is_number()) {
-                std::ostringstream s; s << v.get<double>();
-                return s.str();
-            }
-            if (v.is_string()) {
-                return "\"" + fsEscape(v.get<std::string>()) + "\"";
-            }
+        // Convert one JSON element to a native Variant. Used both for the
+        // top-level Number/String/Pointer cases and for Array elements.
+        // Returns false + sets `err` on failure.
+        auto elemToVariant = [&](const nlohmann::json& v, Variant& out, std::string& err) -> bool {
+            if (v.is_boolean()) { out = Variant(v.get<bool>() ? 1.0 : 0.0); return true; }
+            if (v.is_number())  { out = Variant(v.get<double>()); return true; }
+            if (v.is_string())  { out = Variant(v.get<std::string>().c_str()); return true; }
             if (v.is_object()) {
                 std::string nodePath  = v.value("node_path", std::string(""));
                 std::string objectRef = v.value("object",    std::string(""));
-                if (!nodePath.empty()) {
-                    return "node(\"" + fsEscape(nodePath) + "\", nullptr)";
-                }
-                if (!objectRef.empty()) {
-                    return "Model.find(\"" + fsEscape(objectRef) + "\")";
-                }
-                err = "object element must have `node_path` or `object`";
-                return "";
+                TreeNode* ref = nullptr;
+                if      (!nodePath.empty())  ref = node(nodePath.c_str(), nullptr);
+                else if (!objectRef.empty()) ref = model()->find(objectRef.c_str());
+                else { err = "object element must have `node_path` or `object`"; return false; }
+                if (!objectexists(ref)) { err = "referenced node not found"; return false; }
+                out = Variant(ref);
+                return true;
             }
             err = "unsupported element type";
-            return "";
+            return false;
         };
 
         // Detect label kind from the JSON shape.
@@ -995,48 +995,50 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                 "Unsupported JSON type for label value.");
         }
 
-        // Build the FlexScript script per kind. Each branch must end with
-        // a script that references `treenode lbl` as the asserted label node.
-        std::string script;
-        script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-        script += "treenode lbl = obj.labels.assert(\"" + fsEscape(labelName) + "\");\n";
+        // Native C++ (.1000079 — was one big executestring script). Assert the
+        // label node via assertlabel(); lbl->value is a VariantLValue that
+        // writes through to the node (the native equivalent of FlexScript's
+        // `lbl.value = ...`). Bundle/TrackedVariable use fsvisible bundle
+        // commands + the TrackedVariable::init factory.
+        TreeNode* lbl = assertlabel(obj, labelName.c_str());
+        if (!objectexists(lbl)) {
+            return returnError("assert_label_failed",
+                "Could not assert label '" + labelName + "' on '" + objectName + "'.");
+        }
 
         std::string valueKind;
         switch (kind) {
             case Kind::Number: {
                 valueKind = "number";
-                std::string lit;
-                if (valueJson.is_boolean()) lit = valueJson.get<bool>() ? "1" : "0";
-                else { std::ostringstream s; s << valueJson.get<double>(); lit = s.str(); }
-                script += "lbl.value = " + lit + ";\n";
+                double n = valueJson.is_boolean()
+                    ? (valueJson.get<bool>() ? 1.0 : 0.0)
+                    : valueJson.get<double>();
+                lbl->value = Variant(n);
                 break;
             }
             case Kind::String: {
                 valueKind = "string";
-                script += "lbl.value = \"" + fsEscape(valueJson.get<std::string>()) + "\";\n";
+                lbl->value = Variant(valueJson.get<std::string>().c_str());
                 break;
             }
             case Kind::Pointer: {
                 valueKind = "pointer";
-                std::string err;
-                std::string lit = elemToLiteral(valueJson, err);
-                if (lit.empty()) return returnError("bad_value_shape", err);
-                script += "lbl.value = " + lit + ";\n";
+                Variant pv; std::string err;
+                if (!elemToVariant(valueJson, pv, err))
+                    return returnError("bad_value_shape", err);
+                lbl->value = pv;
                 break;
             }
             case Kind::Array: {
                 valueKind = "array";
-                script += "Array a = Array();\n";
+                Array a;
                 for (const auto& el : valueJson) {
-                    std::string err;
-                    std::string lit = elemToLiteral(el, err);
-                    if (lit.empty()) {
-                        return returnError("bad_array_element",
-                            "Array element error: " + err);
-                    }
-                    script += "a.push(" + lit + ");\n";
+                    Variant ev; std::string err;
+                    if (!elemToVariant(el, ev, err))
+                        return returnError("bad_array_element", "Array element error: " + err);
+                    a.push(ev);
                 }
-                script += "lbl.value = a;\n";
+                lbl->value = Variant(a);
                 break;
             }
             case Kind::FlexScript: {
@@ -1053,13 +1055,12 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                            "Object item = param(1);\n"
                            "return " + body + ";";
                 }
-                // Set the body text, flip the node's FlexScript flag on,
-                // then build/compile the script tree so it can evaluate.
-                // switch_flexscript(node, 1) is the documented "force ON"
-                // form; -1 would query, 0 would force OFF.
-                script += "lbl.value = \"" + fsEscape(body) + "\";\n";
-                script += "switch_flexscript(lbl, 1);\n";
-                script += "buildnodeflexscript(lbl);\n";
+                // Set the body text, flip the node's FlexScript flag on, then
+                // build/compile the script tree so it can evaluate.
+                // switch_flexscript(node, 1) is the documented "force ON" form.
+                lbl->value = Variant(body.c_str());
+                switch_flexscript(lbl, 1);
+                buildnodeflexscript(lbl);
                 break;
             }
             case Kind::Bundle: {
@@ -1073,9 +1074,15 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                     return returnError("bad_value_shape",
                         "Bundle requires a `fields` array.");
                 }
-                // Initialize the bundle. clearbundle resets to empty state.
-                script += "clearbundle(lbl);\n";
-                std::vector<std::string> fieldTypes; // remember for row coercion
+                // Initialize the bundle the way FlexSim's own code does
+                // (AStarNavigator::dumpBlockageData): set the node's dataType to
+                // DATA_BUNDLE directly, THEN clearbundle, THEN addbundlefield.
+                // (.1000082 fix — assertlabel(...,DATA_BUNDLE)/nodeadddata left a
+                // stray default field, so the schema came back malformed.)
+                lbl->dataType = DATA_BUNDLE;
+                clearbundle(lbl);
+                std::vector<std::string> fieldNames;  // for cell addressing by name
+                std::vector<std::string> fieldTypes;  // for row coercion
                 for (const auto& f : spec["fields"]) {
                     if (!f.is_object() || !f.contains("name") || !f.contains("type")) {
                         return returnError("bad_value_shape",
@@ -1083,37 +1090,48 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                     }
                     std::string fname = f.value("name", std::string(""));
                     std::string ftype = f.value("type", std::string(""));
-                    std::string typeMacro;
-                    if      (ftype == "number" || ftype == "double") typeMacro = "BUNDLE_FIELD_TYPE_DOUBLE";
-                    else if (ftype == "int")                          typeMacro = "BUNDLE_FIELD_TYPE_INT";
-                    else if (ftype == "string")                       typeMacro = "BUNDLE_FIELD_TYPE_VARCHAR";
-                    else if (ftype == "node"   || ftype == "pointer") typeMacro = "BUNDLE_FIELD_TYPE_NODEREF";
+                    int typeMacro;
+                    if      (ftype == "number" || ftype == "double") typeMacro = BUNDLE_FIELD_TYPE_DOUBLE;
+                    else if (ftype == "int")                          typeMacro = BUNDLE_FIELD_TYPE_INT;
+                    else if (ftype == "string")                       typeMacro = BUNDLE_FIELD_TYPE_VARCHAR;
+                    else if (ftype == "node"   || ftype == "pointer") typeMacro = BUNDLE_FIELD_TYPE_NODEREF;
                     else {
                         return returnError("bad_value_shape",
                             "Bundle field type '" + ftype + "' unsupported. "
                             "Use one of: number, int, string, node.");
                     }
+                    addbundlefield(lbl, fname.c_str(), typeMacro);
+                    fieldNames.push_back(fname);
                     fieldTypes.push_back(ftype);
-                    script += "addbundlefield(lbl, \"" + fsEscape(fname) + "\", " + typeMacro + ");\n";
                 }
-                // Optional initial rows.
+                // Optional initial rows. Mirror Main_Node.fsx exactly: use the
+                // entry number RETURNED by addbundleentry and a 0-based field
+                // index (setbundlevalue(data, e, j-1, val)). The earlier code
+                // assumed a 1-based rowIdx, which misaligned every row by one
+                // entry and left the real rows empty. setbundlevalue has a
+                // numeric and a string overload — pick by field type.
                 if (spec.contains("rows") && spec["rows"].is_array()) {
-                    int rowIdx = 1;
                     for (const auto& row : spec["rows"]) {
                         if (!row.is_array()) continue;
-                        script += "addbundleentry(lbl, 1);\n";
-                        for (size_t c = 0; c < row.size() && c < fieldTypes.size(); ++c) {
-                            std::string err;
-                            std::string lit = elemToLiteral(row[c], err);
-                            if (lit.empty()) {
-                                return returnError("bad_bundle_row",
-                                    "Bundle row " + std::to_string(rowIdx) +
-                                    " col " + std::to_string(c + 1) + ": " + err);
+                        int e = addbundleentry(lbl);   // entry number to write to
+                        for (size_t c = 0; c < row.size() && c < fieldNames.size(); ++c) {
+                            const nlohmann::json& cell = row[c];
+                            int fieldIdx = static_cast<int>(c);  // 0-based
+                            if (fieldTypes[c] == "string") {
+                                std::string sv = cell.is_string() ? cell.get<std::string>()
+                                    : (cell.is_number() ? std::to_string(cell.get<double>())
+                                                        : std::string(""));
+                                setbundlevalue(lbl, e, fieldIdx, sv.c_str());
+                            } else if (fieldTypes[c] == "node" || fieldTypes[c] == "pointer") {
+                                // Node-ref bundle cells aren't expressible through
+                                // setbundlevalue's numeric/string overloads; leave
+                                // the default (rare — caller can run_script if needed).
+                            } else {
+                                double dv = cell.is_boolean() ? (cell.get<bool>() ? 1.0 : 0.0)
+                                    : (cell.is_number() ? cell.get<double>() : 0.0);
+                                setbundlevalue(lbl, e, fieldIdx, dv);
                             }
-                            script += "setbundlevalue(lbl, " + std::to_string(rowIdx) +
-                                      ", " + std::to_string(c + 1) + ", " + lit + ");\n";
                         }
-                        ++rowIdx;
                     }
                 }
                 break;
@@ -1121,22 +1139,27 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
             case Kind::TrackedVariable: {
                 valueKind = "tracked_variable";
                 const auto& spec = valueJson["tracked_variable"];
-                std::string tvTypeMacro = "STAT_TYPE_TIME_SERIES";
+                // NOTE: the prior FlexScript form referenced STAT_TYPE_LEVEL_HISTORY /
+                // _DISCRETE_VALUE / _DISCRETE_CHANGE, which exist neither as C++
+                // macros nor as FlexScript constants — those branches never worked.
+                // Mapped to the real STAT_TYPE_* macros (allobjects.h).
+                int    tvType     = STAT_TYPE_TIME_SERIES;
                 double startValue = 0.0;
-                int    flags      = -1; // SDK default
+                int    flags      = 0;   // SDK default
                 if (spec.is_object()) {
                     std::string t = spec.value("type", std::string(""));
-                    if      (t == "" || t == "time_series")    tvTypeMacro = "STAT_TYPE_TIME_SERIES";
-                    else if (t == "level_history")             tvTypeMacro = "STAT_TYPE_LEVEL_HISTORY";
-                    else if (t == "discrete_value")            tvTypeMacro = "STAT_TYPE_DISCRETE_VALUE";
-                    else if (t == "discrete_change")           tvTypeMacro = "STAT_TYPE_DISCRETE_CHANGE";
-                    else if (t == "categorical")               tvTypeMacro = "STAT_TYPE_CATEGORICAL";
-                    else if (t == "categorical_combo")         tvTypeMacro = "STAT_TYPE_CATEGORICAL_COMBO";
+                    if      (t == "" || t == "time_series")    tvType = STAT_TYPE_TIME_SERIES;
+                    else if (t == "categorical")               tvType = STAT_TYPE_CATEGORICAL;
+                    else if (t == "categorical_combo")         tvType = STAT_TYPE_CATEGORICAL_COMBO;
+                    else if (t == "level")                     tvType = STAT_TYPE_LEVEL;
+                    else if (t == "cumulative")                tvType = STAT_TYPE_CUMULATIVE;
+                    else if (t == "kinetic_level")             tvType = STAT_TYPE_KINETIC_LEVEL;
+                    else if (t == "pointer")                   tvType = STAT_TYPE_POINTER;
                     else {
                         return returnError("bad_value_shape",
                             "TrackedVariable type '" + t + "' unknown. Use one of: "
-                            "time_series, level_history, discrete_value, discrete_change, "
-                            "categorical, categorical_combo.");
+                            "time_series, categorical, categorical_combo, level, "
+                            "cumulative, kinetic_level, pointer.");
                     }
                     if (spec.contains("start_value") && spec["start_value"].is_number()) {
                         startValue = spec["start_value"].get<double>();
@@ -1145,25 +1168,9 @@ modelerai_export Variant ModelerAi_setLabel(FLEXSIMINTERFACE)
                         flags = spec["flags"].get<int>();
                     }
                 }
-                std::ostringstream s;
-                s << "TrackedVariable.init(lbl, " << tvTypeMacro
-                  << ", " << startValue
-                  << ", " << flags << ");\n";
-                script += s.str();
+                TrackedVariable::init(lbl, tvType, startValue, flags);
                 break;
             }
-        }
-        script += "return obj;\n";
-
-        try {
-            executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("setlabel_failed",
-                "Setting label '" + labelName + "' (kind=" + valueKind +
-                ") threw: " + e.what());
-        } catch (...) {
-            return returnError("setlabel_failed",
-                "Setting label '" + labelName + "' threw a non-std exception.");
         }
 
         nlohmann::json out;
@@ -1218,54 +1225,31 @@ modelerai_export Variant ModelerAi_getLabel(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        // Probe script returns a Map with dt, isScript, plus the value
-        // (or metadata for Bundle / TrackedVariable shapes). Missing label
-        // returns nullvar.
-        std::string script;
-        script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-        script += "string target = \"" + fsEscape(labelName) + "\";\n";
-        script += "treenode lbl = nullvar;\n";
-        script += "for (int i = 1; i <= obj.labels.length; i++) {\n";
-        script += "    treenode l = obj.labels[i];\n";
-        script += "    if (string(getname(l)) == target) { lbl = l; break; }\n";
-        script += "}\n";
-        script += "if (!lbl) return nullvar;\n";
-        script += "Map out = Map();\n";
-        script += "out[\"dt\"] = lbl.dataType;\n";
-        script += "int scrFlag = switch_flexscript(lbl, -1);\n";
-        script += "out[\"isScript\"] = scrFlag;\n";
-        script += "if (lbl.dataType == 6) {\n";  // DATA_BUNDLE
-        script += "    out[\"bundleRows\"]   = getbundlenrentries(lbl);\n";
-        script += "    out[\"bundleFields\"] = getbundlenrfields(lbl);\n";
-        script += "} else if (scrFlag == 1) {\n";
-        script += "    out[\"scriptBody\"] = getnodestr(lbl);\n";
-        script += "} else {\n";
-        script += "    out[\"value\"] = lbl.value;\n";
-        script += "}\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("getlabel_failed",
-                "label lookup threw: " + std::string(e.what()));
-        } catch (...) {
-            return returnError("getlabel_failed", "label lookup threw a non-std exception.");
+        // Find the label by name — native walk of the labels container node's
+        // subnodes (replaces the executestring probe). LabelsArray is name-keyed
+        // only, so walk the container directly and read dataType / value off the
+        // label node; the C++ decode below maps dataType to kind. isScript stays
+        // 0 (parity with the old minimal probe — the rare flexscript-valued
+        // label is reported by its value type, not an explicit "flexscript" tag).
+        treenode lbl = nullptr;
+        TreeNode* labelsNode = labels(obj);
+        if (objectexists(labelsNode)) {
+            int lcount = content(labelsNode);
+            for (int i = 1; i <= lcount; ++i) {
+                TreeNode* l = rank(labelsNode, i);
+                if (l && std::string(getname(l)) == labelName) { lbl = l; break; }
+            }
         }
-
-        if (result.type == VariantType::Null) {
+        if (!objectexists(lbl)) {
             nlohmann::json err;
             err["error"]  = "label_not_found";
             err["object"] = objectName;
             err["label"]  = labelName;
             return returnJson(err);
         }
-        if (result.type != VariantType::Map) {
-            return returnError("getlabel_failed",
-                "probe returned unexpected Variant type "
-                + std::to_string(static_cast<int>(result.type)));
-        }
+        int     dt         = lbl->dataType;
+        int     isScript   = 0;
+        Variant labelValue = lbl->value;
 
         // Local lambda: Variant -> JSON. Shared shape with get_property /
         // list_labels element conversion.
@@ -1329,36 +1313,74 @@ modelerai_export Variant ModelerAi_getLabel(FLEXSIMINTERFACE)
             }
         };
 
-        Map m = static_cast<Map>(result);
-        int dt       = static_cast<int>(static_cast<double>(m["dt"]));
-        int isScript = static_cast<int>(static_cast<double>(m["isScript"]));
-
         nlohmann::json out;
         out["ok"]     = true;
         out["object"] = objectName;
         out["label"]  = labelName;
 
         if (dt == DATA_BUNDLE) {
+            // Native bundle read (.1000080 — was a hardcoded 0/0 stub that
+            // punted to run_script). getbundlenrentries/nrfields give the dims;
+            // getbundlefieldname/type the schema; getbundlevalue the cells.
+            // FlexSim bundle fields AND entries are 0-based (verified against
+            // Main_Node.fsx: getbundlefieldname(t,j-1), getbundlevalue(t,i,j-1)
+            // with the entry loop starting at i=0). getbundlenr* return counts.
             out["value_kind"] = "bundle";
-            int rows   = static_cast<int>(static_cast<double>(m["bundleRows"]));
-            int fields = static_cast<int>(static_cast<double>(m["bundleFields"]));
+            int rows   = getbundlenrentries(lbl);
+            int fields = getbundlenrfields(lbl);
             nlohmann::json b;
             b["row_count"]   = rows;
             b["field_count"] = fields;
-            b["note"]        = "Use FlexSim bundle commands (getbundlevalue, etc.) "
-                               "via run_script to read individual cells.";
+
+            nlohmann::json fieldArr = nlohmann::json::array();
+            for (int f = 0; f < fields; ++f) {
+                nlohmann::json fj;
+                const char* fn = getbundlefieldname(lbl, f);
+                fj["name"] = fn ? std::string(fn) : std::string("");
+                switch (getbundlefieldtype(lbl, f) & BUNDLE_FIELD_TYPE_MASK) {
+                    case BUNDLE_FIELD_TYPE_DOUBLE:
+                    case BUNDLE_FIELD_TYPE_FLOAT:   fj["type"] = "number"; break;
+                    case BUNDLE_FIELD_TYPE_INT:     fj["type"] = "int";    break;
+                    case BUNDLE_FIELD_TYPE_STR:
+                    case BUNDLE_FIELD_TYPE_VARCHAR: fj["type"] = "string"; break;
+                    case BUNDLE_FIELD_TYPE_NODEREF: fj["type"] = "node";   break;
+                    default:                        fj["type"] = "other";  break;
+                }
+                fieldArr.push_back(std::move(fj));
+            }
+            b["fields"] = std::move(fieldArr);
+
+            // Actual rows, capped to keep the payload bounded.
+            const int ROW_CAP = 100;
+            int rowsToRead = rows < ROW_CAP ? rows : ROW_CAP;
+            nlohmann::json rowArr = nlohmann::json::array();
+            for (int r = 0; r < rowsToRead; ++r) {
+                nlohmann::json rowObj = nlohmann::json::object();
+                for (int f = 0; f < fields; ++f) {
+                    const char* fn = getbundlefieldname(lbl, f);
+                    std::string key = fn ? std::string(fn) : ("field" + std::to_string(f));
+                    rowObj[key] = variantToJson(getbundlevalue(lbl, r, f));
+                }
+                rowArr.push_back(std::move(rowObj));
+            }
+            b["rows"] = std::move(rowArr);
+            if (rows > ROW_CAP) b["rows_truncated"] = true;
             out["value"] = std::move(b);
         } else if (isScript == 1) {
             out["value_kind"] = "flexscript";
-            std::string body = std::string(m["scriptBody"]);
+            std::string body;  // isScript is always 0 here (dead branch)
             out["value"] = body;
             out["note"]  = "Value is the raw FlexScript body; not evaluated.";
         } else {
             // Inspect the Variant under "value" for shape detection.
-            Variant v = m["value"];
-            // TrackedVariable: DATA_SIMPLE labels evaluate to a number on
-            // read. We tag them explicitly so AI sees the difference.
-            if (dt == DATA_SIMPLE) {
+            Variant v = labelValue;
+            // A genuine TrackedVariable (DATA_SIMPLE node) evaluates to a Number
+            // on read. But plain Variant labels ALSO land on DATA_SIMPLE when
+            // they hold an Array (verified 2026-06-13: array label dataType==7),
+            // so the bare dt==DATA_SIMPLE test mis-tagged arrays as tracked_variable.
+            // Only tag tracked_variable when the value reads as a number; else
+            // decode by the Variant type.
+            if (dt == DATA_SIMPLE && v.type == VariantType::Number) {
                 out["value_kind"] = "tracked_variable";
                 out["value"]      = variantToJson(v);
                 out["note"]       = "Reading evaluates the TrackedVariable's current value.";
@@ -1424,44 +1446,23 @@ modelerai_export Variant ModelerAi_listLabels(FLEXSIMINTERFACE)
         // For Bundle entries the 4th slot is a 2-element [rowCount, fieldCount].
         // For FlexScript entries the 4th slot is the raw body string.
         // For other kinds it's the actual value (which may evaluate scripts).
-        nlohmann::json labels = nlohmann::json::array();
+        nlohmann::json labelList = nlohmann::json::array();
         try {
-            std::string script;
-            script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-            script += "Array out = Array();\n";
-            script += "for (int i = 1; i <= obj.labels.length; i++) {\n";
-            script += "    treenode l = obj.labels[i];\n";
-            script += "    Array entry = Array();\n";
-            script += "    entry.push(string(getname(l)));\n";
-            script += "    entry.push(l.dataType);\n";
-            script += "    int sf = switch_flexscript(l, -1);\n";
-            script += "    entry.push(sf);\n";
-            script += "    if (l.dataType == 6) {\n";
-            script += "        Array meta = Array();\n";
-            script += "        meta.push(getbundlenrentries(l));\n";
-            script += "        meta.push(getbundlenrfields(l));\n";
-            script += "        entry.push(meta);\n";
-            script += "    } else if (sf == 1) {\n";
-            script += "        entry.push(getnodestr(l));\n";
-            script += "    } else {\n";
-            script += "        entry.push(l.value);\n";
-            script += "    }\n";
-            script += "    out.push(entry);\n";
-            script += "}\n";
-            script += "return out;\n";
-            Variant result = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (result.type == VariantType::Array) {
-                Array outer = static_cast<Array>(result);
-                for (int i = 1; i <= outer.length; ++i) {
-                    Variant tup = outer[i];
-                    if (tup.type != VariantType::Array) continue;
-                    Array p = static_cast<Array>(tup);
-                    if (p.length < 4) continue;
+            // Native walk of the labels container node's subnodes (plain
+            // treenodes) — replaces the executestring enumeration. Per label:
+            // name / dataType / value read directly; the C++ decode below maps
+            // dataType to kind. isScript stays 0 (parity with the old probe).
+            TreeNode* labelsNode = labels(obj);
+            if (objectexists(labelsNode)) {
+                int lcount = content(labelsNode);
+                for (int li = 1; li <= lcount; ++li) {
+                    TreeNode* l = rank(labelsNode, li);
+                    if (!l) continue;
                     nlohmann::json entry;
-                    entry["name"]    = std::string(p[1]);
-                    int dt           = static_cast<int>(static_cast<double>(p[2]));
-                    int isScript     = static_cast<int>(static_cast<double>(p[3]));
-                    Variant val      = p[4];
+                    entry["name"]    = std::string(getname(l));
+                    int dt           = l->dataType;
+                    int isScript     = 0;
+                    Variant val      = l->value;
 
                     std::string kind;
                     nlohmann::json valueJson;
@@ -1478,17 +1479,15 @@ modelerai_export Variant ModelerAi_listLabels(FLEXSIMINTERFACE)
                         kind = "flexscript";
                         if (val.type == VariantType::String) valueJson = std::string(val);
                         else valueJson = nullptr;
-                    } else if (dt == DATA_SIMPLE) {
+                    } else if (dt == DATA_SIMPLE && val.type == VariantType::Number) {
+                        // Genuine TrackedVariable — evaluates to a Number. Array
+                        // labels also report DATA_SIMPLE, so they fall through to
+                        // the type switch below (else they'd mis-tag as TV).
                         kind = "tracked_variable";
-                        // val is the TrackedVariable's evaluated current value.
-                        if (val.type == VariantType::Number) {
-                            double v = static_cast<double>(val);
-                            if (v == static_cast<double>(static_cast<long long>(v))
-                                && v >= -9.2e18 && v <= 9.2e18) valueJson = static_cast<long long>(v);
-                            else valueJson = v;
-                        } else {
-                            valueJson = nullptr;
-                        }
+                        double v = static_cast<double>(val);
+                        if (v == static_cast<double>(static_cast<long long>(v))
+                            && v >= -9.2e18 && v <= 9.2e18) valueJson = static_cast<long long>(v);
+                        else valueJson = v;
                     } else {
                         switch (val.type) {
                             case VariantType::Number: {
@@ -1560,7 +1559,7 @@ modelerai_export Variant ModelerAi_listLabels(FLEXSIMINTERFACE)
                     }
                     entry["value_kind"] = kind;
                     entry["value"]      = std::move(valueJson);
-                    labels.push_back(std::move(entry));
+                    labelList.push_back(std::move(entry));
                 }
             }
         } catch (const std::exception& e) {
@@ -1574,8 +1573,8 @@ modelerai_export Variant ModelerAi_listLabels(FLEXSIMINTERFACE)
         nlohmann::json out;
         out["ok"]          = true;
         out["object"]      = objectName;
-        out["label_count"] = static_cast<int>(labels.size());
-        out["labels"]      = std::move(labels);
+        out["label_count"] = static_cast<int>(labelList.size());
+        out["labels"]      = std::move(labelList);
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("list_labels", e.what()); }
       catch (...)                     { return returnException("list_labels", "unknown"); }
@@ -1616,30 +1615,19 @@ modelerai_export Variant ModelerAi_removeLabel(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        std::string script;
-        script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-        script += "string target = \"" + fsEscape(labelName) + "\";\n";
-        script += "int removed = 0;\n";
-        script += "for (int i = 1; i <= obj.labels.length; i++) {\n";
-        script += "    treenode l = obj.labels[i];\n";
-        script += "    if (string(getname(l)) == target) {\n";
-        script += "        destroyobject(l);\n";
-        script += "        removed = 1;\n";
-        script += "        break;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return removed;\n";
-
+        // Native walk of the labels container node — find by name, destroy.
         bool removed = false;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            removed = (v.type == VariantType::Number && static_cast<double>(v) != 0.0);
-        } catch (const std::exception& e) {
-            return returnError("removelabel_failed",
-                "label destroy threw: " + std::string(e.what()));
-        } catch (...) {
-            return returnError("removelabel_failed",
-                "label destroy threw a non-std exception.");
+        TreeNode* labelsNode = labels(obj);
+        if (objectexists(labelsNode)) {
+            int lcount = content(labelsNode);
+            for (int i = 1; i <= lcount; ++i) {
+                TreeNode* l = rank(labelsNode, i);
+                if (l && std::string(getname(l)) == labelName) {
+                    destroyobject(l);
+                    removed = true;
+                    break;
+                }
+            }
         }
 
         if (!removed) {
@@ -2321,59 +2309,31 @@ modelerai_export Variant ModelerAi_cloneObject(FLEXSIMINTERFACE)
         // Source location — used for offset stacking
         double srcX = xloc(src), srcY = yloc(src), srcZ = zloc(src);
 
+        // Resolve parent container once (existence already validated above).
+        TreeNode* parentObj = parentName.empty() ? nullptr
+                                                  : model()->find(parentName.c_str());
+
         nlohmann::json created = nlohmann::json::array();
         for (int n = 1; n <= count; ++n) {
-            std::string script;
-            script += "Object src = Model.find(\"" + fsEscape(sourceName) + "\");\n";
-            if (!parentName.empty()) {
-                script += "Object parentObj = Model.find(\"" + fsEscape(parentName) + "\");\n";
-                script += "Object newObj = src.copy(parentObj);\n";
-            } else {
-                script += "Object newObj = src.copy();\n";
-            }
-            if (count == 1 && !newName.empty()) {
-                script += "newObj.name = \"" + fsEscape(newName) + "\";\n";
-            }
-            if (hasLoc) {
-                script += "newObj.setProperty(\"Location\", Vec3(";
-                script += std::to_string(lx); script += ", ";
-                script += std::to_string(ly); script += ", ";
-                script += std::to_string(lz); script += "));\n";
-            } else if (hasOffset) {
-                double tx = srcX + dx * n;
-                double ty = srcY + dy * n;
-                double tz = srcZ + dz * n;
-                script += "newObj.setProperty(\"Location\", Vec3(";
-                script += std::to_string(tx); script += ", ";
-                script += std::to_string(ty); script += ", ";
-                script += std::to_string(tz); script += "));\n";
-            }
-            if (copyConnections) {
-                script += "applicationcommand(\"recreateObjectConnections\", newObj, src);\n";
-            }
-            script += "return newObj;\n";
-
-            Variant v;
-            try {
-                v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            } catch (const std::exception& e) {
-                return returnError("clone_failed",
-                    std::string("source.copy() threw on iteration ") +
-                    std::to_string(n) + ": " + e.what());
-            } catch (...) {
-                return returnError("clone_failed",
-                    "source.copy() threw a non-std exception on iteration " +
-                    std::to_string(n));
-            }
-            if (v.type != VariantType::TreeNode) {
-                return returnError("clone_failed",
-                    "source.copy() did not return a treenode on iteration " +
-                    std::to_string(n));
-            }
-            treenode newObj = static_cast<treenode>(v);
+            // Native instance copy (.1000079 — was executestring src.copy()).
+            // TreeNode::copy(destination, flags) is the engine_export method
+            // that backs FlexScript's src.copy(dest); a null destination copies
+            // into the source's own container (parity with bare src.copy()).
+            treenode newObj = src->copy(parentObj, 0);
             if (!objectexists(newObj)) {
                 return returnError("clone_failed",
-                    "source.copy() returned null on iteration " + std::to_string(n));
+                    "src.copy() returned null on iteration " + std::to_string(n));
+            }
+            if (count == 1 && !newName.empty()) {
+                setname(newObj, newName.c_str());
+            }
+            if (hasLoc) {
+                setloc(newObj, lx, ly, lz);
+            } else if (hasOffset) {
+                setloc(newObj, srcX + dx * n, srcY + dy * n, srcZ + dz * n);
+            }
+            if (copyConnections) {
+                applicationcommand("recreateObjectConnections", Variant(newObj), Variant(src));
             }
 
             nlohmann::json e;
@@ -2721,16 +2681,16 @@ modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator(FLEXSIMINTERFA
         // Read current navigator BEFORE — for already-connected detection
         // and to surface the prior binding in the response.
         std::string formerNavName;
-        try {
-            std::string readScript;
-            readScript += "Object te = Model.find(\"" + fsEscape(teName) + "\");\n";
-            readScript += "return te.getProperty(\"Navigator\");\n";
-            Variant cur = executestring(readScript.c_str(), nullptr, nullptr, Variant());
-            if (cur.type == VariantType::TreeNode) {
-                TreeNode* nv = static_cast<TreeNode*>(cur);
-                if (objectexists(nv)) formerNavName = getname(nv);
+        {
+            ObjectDataType* teObj = te->object<ObjectDataType>();
+            if (teObj) {
+                Variant cur = teObj->getProperty("Navigator");
+                if (cur.type == VariantType::TreeNode) {
+                    TreeNode* nv = static_cast<TreeNode*>(cur);
+                    if (objectexists(nv)) formerNavName = std::string(getname(nv));
+                }
             }
-        } catch (...) {}
+        }
 
         // Already on the requested navigator? For non-GIS, that's a true
         // no-op and we should reject as already_connected. For GIS, the
@@ -2756,43 +2716,43 @@ modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator(FLEXSIMINTERFA
             }
         }
 
-        // Mutation
-        std::string script;
-        script += "Object te  = Model.find(\"" + fsEscape(teName)  + "\");\n";
-        script += "Object nav = Model.find(\"" + fsEscape(navName) + "\");\n";
-        script += "te.setProperty(\"Navigator\", nav);\n";
-        if (isGIS) {
-            script += "Object pt = Model.find(\"" + fsEscape(pointName) + "\");\n";
-            script += "contextdragconnection(te, pt, \"A\");\n";
-        }
-        script += "return te;\n";
-
-        try {
-            executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("setprop_failed",
-                std::string("setProperty(\"Navigator\") threw: ") + e.what());
-        } catch (...) {
-            return returnError("setprop_failed",
-                "setProperty(\"Navigator\") threw a non-std exception.");
+        // Mutation — native setProperty("Navigator") + (GIS) native
+        // contextdragconnection. The post-mutation read below verifies the bind.
+        // (`nav` is already resolved earlier in this function.)
+        {
+            ObjectDataType* teObj = te->object<ObjectDataType>();
+            if (!teObj) {
+                return returnError("setprop_failed", "could not obtain TaskExecuter object from node.");
+            }
+            try {
+                teObj->setProperty("Navigator", Variant(nav));
+            } catch (const std::exception& e) {
+                return returnError("setprop_failed",
+                    std::string("setProperty(\"Navigator\") threw: ") + e.what());
+            } catch (...) {
+                return returnError("setprop_failed",
+                    "setProperty(\"Navigator\") threw a non-std exception.");
+            }
+            if (isGIS) {
+                treenode pt = model()->find(pointName.c_str());
+                if (objectexists(pt)) contextdragconnection(te, pt, 'A');
+            }
         }
 
         // POST-MUTATION VERIFICATION
         // 1. Confirm the Navigator property now equals nav.
         std::string nowNavName;
-        try {
-            std::string verifyScript;
-            verifyScript += "Object te = Model.find(\"" + fsEscape(teName) + "\");\n";
-            verifyScript += "return te.getProperty(\"Navigator\");\n";
-            Variant after = executestring(verifyScript.c_str(), nullptr, nullptr, Variant());
+        {
+            ObjectDataType* teObj = te->object<ObjectDataType>();
+            if (!teObj) {
+                return returnError("connect_unverified",
+                    "setProperty completed but could not obtain object for verification.");
+            }
+            Variant after = teObj->getProperty("Navigator");
             if (after.type == VariantType::TreeNode) {
                 TreeNode* nv = static_cast<TreeNode*>(after);
-                if (objectexists(nv)) nowNavName = getname(nv);
+                if (objectexists(nv)) nowNavName = std::string(getname(nv));
             }
-        } catch (...) {
-            return returnError("connect_unverified",
-                "setProperty completed but post-call getProperty failed; "
-                "cannot confirm the navigator binding took effect.");
         }
         if (nowNavName != navName) {
             return returnError("connect_unverified",
@@ -3183,22 +3143,21 @@ modelerai_export Variant ModelerAi_disconnect(FLEXSIMINTERFACE)
             //   (c) reject if `to` doesn't match what's actually set
             std::string actualFormerName;
             std::string actualFormerClass;
-            try {
-                std::string readScript;
-                readScript += "Object te = Model.find(\"" + fsEscape(fromName) + "\");\n";
-                readScript += "return te.getProperty(\"Navigator\");\n";
-                Variant cur = executestring(readScript.c_str(), nullptr, nullptr, Variant());
+            {
+                ObjectDataType* teObj = fromNode->object<ObjectDataType>();
+                if (!teObj) {
+                    return returnError("read_navigator_failed",
+                        "Could not obtain task executer object to read its Navigator.");
+                }
+                Variant cur = teObj->getProperty("Navigator");
                 if (cur.type == VariantType::TreeNode) {
                     TreeNode* nv = static_cast<TreeNode*>(cur);
                     if (objectexists(nv)) {
-                        actualFormerName = getname(nv);
+                        actualFormerName = std::string(getname(nv));
                         TreeNode* nvCls = classobject(nv);
-                        if (nvCls) actualFormerClass = getname(nvCls);
+                        if (nvCls) actualFormerClass = std::string(getname(nvCls));
                     }
                 }
-            } catch (...) {
-                return returnError("read_navigator_failed",
-                    "Could not read task executer's current Navigator before disconnecting.");
             }
 
             // Verify `to` matches the actual current navigator. The AI is
@@ -3225,36 +3184,38 @@ modelerai_export Variant ModelerAi_disconnect(FLEXSIMINTERFACE)
                     "no specific navigator system to leave.");
             }
 
-            // Mutation
-            std::string script;
-            script += "Object obj = Model.find(\"" + fsEscape(fromName) + "\");\n";
-            script += "obj.setProperty(\"Navigator\", Model.find(\"DefaultNavigator\"));\n";
-            script += "return obj;\n";
-            try {
-                executestring(script.c_str(), nullptr, nullptr, Variant());
-            } catch (const std::exception& e) {
-                return returnError("disconnect_failed",
-                    std::string("setProperty(Navigator, DefaultNavigator) threw: ") + e.what());
-            } catch (...) {
-                return returnError("disconnect_failed",
-                    "setProperty(Navigator, DefaultNavigator) threw a non-std exception.");
+            // Mutation — native setProperty back to DefaultNavigator.
+            {
+                ObjectDataType* teObj = fromNode->object<ObjectDataType>();
+                treenode defNav = model()->find("DefaultNavigator");
+                if (!teObj || !objectexists(defNav)) {
+                    return returnError("disconnect_failed",
+                        "could not obtain task executer object or DefaultNavigator node.");
+                }
+                try {
+                    teObj->setProperty("Navigator", Variant(defNav));
+                } catch (const std::exception& e) {
+                    return returnError("disconnect_failed",
+                        std::string("setProperty(Navigator, DefaultNavigator) threw: ") + e.what());
+                } catch (...) {
+                    return returnError("disconnect_failed",
+                        "setProperty(Navigator, DefaultNavigator) threw a non-std exception.");
+                }
             }
 
             // Verify the disconnect actually took.
             std::string nowNavName;
-            try {
-                std::string verifyScript;
-                verifyScript += "Object te = Model.find(\"" + fsEscape(fromName) + "\");\n";
-                verifyScript += "return te.getProperty(\"Navigator\");\n";
-                Variant after = executestring(verifyScript.c_str(), nullptr, nullptr, Variant());
+            {
+                ObjectDataType* teObj = fromNode->object<ObjectDataType>();
+                if (!teObj) {
+                    return returnError("disconnect_unverified",
+                        "setProperty completed but could not obtain object for verification.");
+                }
+                Variant after = teObj->getProperty("Navigator");
                 if (after.type == VariantType::TreeNode) {
                     TreeNode* nv = static_cast<TreeNode*>(after);
-                    if (objectexists(nv)) nowNavName = getname(nv);
+                    if (objectexists(nv)) nowNavName = std::string(getname(nv));
                 }
-            } catch (...) {
-                return returnError("disconnect_unverified",
-                    "setProperty completed but post-call getProperty failed; "
-                    "cannot confirm disconnect took effect.");
             }
             if (nowNavName != "DefaultNavigator") {
                 return returnError("disconnect_unverified",
@@ -3385,10 +3346,8 @@ modelerai_export Variant ModelerAi_inspectConnections(FLEXSIMINTERFACE)
         std::string    navInspectionError;
         if (isclasstype(obj, "TaskExecuter")) {
             try {
-                std::string script;
-                script += "Object o = Model.find(\"" + fsEscape(name) + "\");\n";
-                script += "return o.getProperty(\"Navigator\");\n";
-                Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
+                ObjectDataType* teObj = obj->object<ObjectDataType>();
+                Variant v = teObj ? teObj->getProperty("Navigator") : Variant();
                 if (v.type == VariantType::TreeNode) {
                     TreeNode* nv = static_cast<TreeNode*>(v);
                     if (objectexists(nv)) {
@@ -3990,9 +3949,11 @@ modelerai_export Variant ModelerAi_setParameter(FLEXSIMINTERFACE)
         script += "treenode owningTable = 0;\n";
         script += "for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
         script += "    treenode t = allTables.subnodes[iT];\n";
-        script += "    treenode ps = t.find(\"variables\");\n";
-        script += "    if (!ps) continue;\n";
-        script += "    ps = ps.find(\"parameters\");\n";
+        // The `parameters` container lives in the table's bound >variables
+        // attribute space — reach it with getvarnode, NOT t.find(\"variables\")
+        // (which does not traverse into the > attribute space, the bug that
+        // made set_parameter fail to find any parameter — .1000058 fix).
+        script += "    treenode ps = getvarnode(t, \"parameters\");\n";
         script += "    if (!ps) continue;\n";
         script += "    for (int iX = 1; iX <= ps.subnodes.length; iX++) {\n";
         script += "        treenode p = ps.subnodes[iX];\n";
@@ -4170,54 +4131,45 @@ modelerai_export Variant ModelerAi_removeParameter(FLEXSIMINTERFACE)
             return returnError("missing_args", "name is required.");
         }
 
-        std::string script;
-        script += "treenode allTables = Model.find(\"Tools/ParameterTables\");\n";
-        script += "if (!allTables) return 0;\n";
-        script += "treenode found = 0;\n";
-        script += "string ownerName = \"\";\n";
-        script += "string wantTable = \"" + fsEscape(tableName) + "\";\n";
-        script += "for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
-        script += "    treenode t = allTables.subnodes[iT];\n";
-        script += "    if (wantTable != \"\" && string(getname(t)) != wantTable) continue;\n";
-        script += "    treenode ps = t.find(\"variables\");\n";
-        script += "    if (!ps) continue;\n";
-        script += "    ps = ps.find(\"parameters\");\n";
-        script += "    if (!ps) continue;\n";
-        script += "    for (int iX = 1; iX <= ps.subnodes.length; iX++) {\n";
-        script += "        treenode p = ps.subnodes[iX];\n";
-        script += "        treenode nm = p.find(\"Name\");\n";
-        script += "        if (nm && nm.value == \"" + fsEscape(paramName) + "\") {\n";
-        script += "            found = p;\n";
-        script += "            ownerName = string(getname(t));\n";
-        script += "            break;\n";
-        script += "        }\n";
-        script += "    }\n";
-        script += "    if (found) break;\n";
-        script += "}\n";
-        script += "if (!found) return 0;\n";
-        script += "destroyobject(found);\n";
-        script += "return ownerName;\n";
-
+        // Native (.1000084 — was executestring). Walk Tools/ParameterTables; for
+        // each table (optionally name-filtered) read its bound `parameters` space
+        // via getvarnode and match each parameter's Name node; destroyobject the
+        // hit. getvarnode + destroyobject are fsvisible; TreeNode::find links.
+        TreeNode* allTables = model()->find("Tools/ParameterTables");
+        TreeNode* found = nullptr;
         std::string owner;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::String) owner = std::string(v);
-            else if (v.type == VariantType::Number && static_cast<double>(v) == 0.0) {
-                nlohmann::json err;
-                err["error"] = "not_found";
-                err["name"]  = paramName;
-                if (!tableName.empty()) err["table_name"] = tableName;
-                err["note"]  = tableName.empty()
-                    ? "Parameter not found in any ParameterTable."
-                    : "Parameter not found in the specified table.";
-                return returnJson(err);
+        if (allTables) {
+            int nt = content(allTables);
+            for (int iT = 1; iT <= nt && !found; ++iT) {
+                TreeNode* t = rank(allTables, iT);
+                if (!t) continue;
+                if (!tableName.empty() && std::string(getname(t)) != tableName) continue;
+                TreeNode* ps = getvarnode(t, "parameters");
+                if (!ps) continue;
+                int np = content(ps);
+                for (int iX = 1; iX <= np; ++iX) {
+                    TreeNode* p = rank(ps, iX);
+                    if (!p) continue;
+                    TreeNode* nm = p->find("Name");
+                    if (nm && std::string(nm->value) == paramName) {
+                        found = p;
+                        owner = std::string(getname(t));
+                        break;
+                    }
+                }
             }
-        } catch (const std::exception& e) {
-            return returnError("remove_failed",
-                "ParameterTable walk threw: " + std::string(e.what()));
-        } catch (...) {
-            return returnError("remove_failed", "ParameterTable walk threw a non-std exception.");
         }
+        if (!found) {
+            nlohmann::json err;
+            err["error"] = "not_found";
+            err["name"]  = paramName;
+            if (!tableName.empty()) err["table_name"] = tableName;
+            err["note"]  = tableName.empty()
+                ? "Parameter not found in any ParameterTable."
+                : "Parameter not found in the specified table.";
+            return returnJson(err);
+        }
+        destroyobject(found);
 
         nlohmann::json out;
         out["ok"]         = true;
@@ -4266,15 +4218,11 @@ modelerai_export Variant ModelerAi_notifyRunState(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_resetModel(FLEXSIMINTERFACE)
 {
     try {
-        double finalTime = 0.0;
-        try {
-            Variant v = executestring(
-                "resetmodel(1); applicationcommand(\"switchRunning\", 0); return time();",
-                nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) finalTime = double(v);
-        } catch (const std::exception& e) {
-            return returnError("reset_failed", e.what());
-        }
+        // Native (.1000084 — was executestring). resetmodel/applicationcommand/
+        // time are all fsvisible/engine_export.
+        resetmodel(1);
+        applicationcommand("switchRunning", Variant(0.0));
+        double finalTime = time();
         nlohmann::json out;
         out["ok"]       = true;
         out["sim_time"] = finalTime;
@@ -4335,6 +4283,31 @@ nlohmann::json runStepLoopShared(const char* commandName,
                                  double safetySec,
                                  const std::string& condition)
 {
+    // No condition → run_to_end. Native step loop (.1000084 — eventqty/step/time
+    // all fsvisible). run_until keeps the executestring path below because its
+    // condition is an arbitrary FlexScript expression that must be evaluated by
+    // the FlexScript engine, not C++.
+    if (condition.empty()) {
+        nlohmann::json out;
+        try {
+            resetmodel(1);
+            applicationcommand("switchRunning", Variant(0.0));
+            long long steps = 0;
+            while (eventqty() > 0 && time() <= safetySec) { step(); ++steps; }
+            int reason = (time() > safetySec) ? 2 : 0;
+            out["ok"]                 = true;
+            out["reason"]             = (reason == 2) ? "safety_capped" : "events_drained";
+            out["final_sim_time"]     = time();
+            out["steps_taken"]        = steps;
+            out["safety_sim_seconds"] = safetySec;
+        } catch (const std::exception& e) {
+            out["ok"]            = false;
+            out["error_code"]    = std::string(commandName) + "_failed";
+            out["error_message"] = std::string("step-loop threw: ") + e.what();
+        }
+        return out;
+    }
+
     std::string condExpr = condition.empty() ? std::string("0") : condition;
 
     std::string script;
@@ -4523,14 +4496,9 @@ modelerai_export Variant ModelerAi_runUntil(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_run(FLEXSIMINTERFACE)
 {
     try {
-        double t = 0.0;
-        try {
-            Variant v = executestring("go(); return time();",
-                                      nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) t = double(v);
-        } catch (const std::exception& e) {
-            return returnError("go_failed", e.what());
-        }
+        // Native (.1000084 — was executestring). go() is fsvisible.
+        go();
+        double t = time();
         nlohmann::json out;
         out["ok"]        = true;
         out["run_state"] = "Running";
@@ -4546,16 +4514,13 @@ modelerai_export Variant ModelerAi_run(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_stopModel(FLEXSIMINTERFACE)
 {
     try {
-        double t = 0.0;
-        try {
-            Variant v = executestring(
-                "updatestates(); stop(1); repaintall(); "
-                "applicationcommand(\"switchRunning\", 0); return time();",
-                nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) t = double(v);
-        } catch (const std::exception& e) {
-            return returnError("stop_failed", e.what());
-        }
+        // Native (.1000084 — was executestring). updatestates (allobjects.h),
+        // stop/repaintall (declaration.h), applicationcommand all link.
+        updatestates();
+        stop(1);
+        repaintall();
+        applicationcommand("switchRunning", Variant(0.0));
+        double t = time();
         nlohmann::json out;
         out["ok"]        = true;
         out["run_state"] = "Stopped";
@@ -4587,29 +4552,14 @@ modelerai_export Variant ModelerAi_stepModel(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("step_model", "unknown"); }
 }
 
-// modelerai_get_run_state() — non-blocking status read. Wraps getrunstate()
-// (0=Stopped, 1=Running, 2=Paused) + time().
+// modelerai_get_run_state() — non-blocking status read. Native getrunstate()
+// + time(). getrunstate() is boolean (1=running, 0=not) per the FlexSim command
+// reference — the old "2=Paused" branch was dead code.
 modelerai_export Variant ModelerAi_getRunState(FLEXSIMINTERFACE)
 {
     try {
-        std::string state = "Unknown";
-        double t = 0.0;
-        try {
-            Variant rs = executestring("return getrunstate();",
-                                       nullptr, nullptr, Variant());
-            if (rs.type == VariantType::Number) {
-                int v = static_cast<int>(double(rs));
-                switch (v) {
-                    case 0: state = "Stopped"; break;
-                    case 1: state = "Running"; break;
-                    case 2: state = "Paused";  break;
-                    default: state = "Unknown"; break;
-                }
-            }
-            Variant tv = executestring("return time();",
-                                       nullptr, nullptr, Variant());
-            if (tv.type == VariantType::Number) t = double(tv);
-        } catch (...) {}
+        std::string state = (getrunstate() != 0) ? "Running" : "Stopped";
+        double t = time();
         nlohmann::json out;
         out["ok"]        = true;
         out["run_state"] = state;
@@ -4651,32 +4601,37 @@ modelerai_export Variant ModelerAi_addStopTime(FLEXSIMINTERFACE)
             if (arg2.type == VariantType::Number) enabled = double(arg2);
             if (arg3.type == VariantType::String) label = std::string(arg3);
         } else if (arg1.type == VariantType::String) {
+            // Via applicationcommand the arg always arrives as a string. Parse
+            // it as JSON so bare number "600", array "[600,1,\"lbl\"]", and
+            // object forms all work (.1000058 — previously only "{...}" did).
             std::string s = std::string(arg1);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object()) {
-                        for (const char* k : { "seconds", "model_time" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                seconds = j[k].get<double>();
-                                haveSeconds = true;
-                                break;
-                            }
-                        }
-                        if (j.contains("enabled")) {
-                            if (j["enabled"].is_boolean())
-                                enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
-                            else if (j["enabled"].is_number())
-                                enabled = j["enabled"].get<double>();
-                        }
-                        if (j.contains("label") && j["label"].is_string()) {
-                            label = j["label"].get<std::string>();
+            try {
+                auto j = nlohmann::json::parse(s);
+                if (j.is_number()) {
+                    seconds = j.get<double>(); haveSeconds = true;
+                } else if (j.is_array()) {
+                    if (j.size() >= 1 && j[0].is_number()) { seconds = j[0].get<double>(); haveSeconds = true; }
+                    if (j.size() >= 2 && j[1].is_number()) enabled = j[1].get<double>();
+                    if (j.size() >= 3 && j[2].is_string()) label = j[2].get<std::string>();
+                } else if (j.is_object()) {
+                    for (const char* k : { "seconds", "model_time" }) {
+                        if (j.contains(k) && j[k].is_number()) {
+                            seconds = j[k].get<double>();
+                            haveSeconds = true;
+                            break;
                         }
                     }
-                } catch (...) {}
-            }
+                    if (j.contains("enabled")) {
+                        if (j["enabled"].is_boolean())
+                            enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
+                        else if (j["enabled"].is_number())
+                            enabled = j["enabled"].get<double>();
+                    }
+                    if (j.contains("label") && j["label"].is_string()) {
+                        label = j["label"].get<std::string>();
+                    }
+                }
+            } catch (...) {}
         }
 
         if (!haveSeconds) {
@@ -4690,36 +4645,24 @@ modelerai_export Variant ModelerAi_addStopTime(FLEXSIMINTERFACE)
                 "seconds must be > 0.");
         }
 
-        std::string script;
-        script += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
-        script += "if (!stopTimes) { print(\"add_stop_time: STOP_TIME_NODE not found\"); return 0; }\n";
-        script += "treenode newStop = createcopy(stopTimes.last, stopTimes, 1);\n";
-        script += "setsdtvalue(newStop, \"enabled\", ";
-        script += std::to_string(enabled != 0.0 ? 1 : 0);
-        script += ");\n";
-        script += "function_s(newStop, \"setModelTime\", ";
-        script += std::to_string(seconds);
-        script += ");\n";
-        if (!label.empty()) {
-            script += "setsdtvalue(newStop, \"dateString\", \"";
-            script += fsEscape(label);
-            script += "\");\n";
+        // Native (.1000084 — was executestring). getmodelunit→Variant(TreeNode);
+        // createcopy clones the last entry (always-valid template); setsdtvalue +
+        // function_s("setModelTime") set the fields; stoptime(0,0) clears slot 0.
+        treenode stopTimes = getmodelunit(STOP_TIME_NODE);
+        if (!objectexists(stopTimes)) {
+            return returnError("add_stop_time_failed", "STOP_TIME_NODE not found.");
         }
-        script += "stoptime(0, 0);\n";
-        script += "return newStop;\n";
+        treenode newStop = createcopy(stopTimes->last, stopTimes, 1);
+        if (!objectexists(newStop)) {
+            return returnError("add_stop_time_failed", "createcopy returned null.");
+        }
+        setsdtvalue(newStop, "enabled", Variant(enabled != 0.0 ? 1.0 : 0.0));
+        function_s(newStop, "setModelTime", Variant(seconds));
+        if (!label.empty()) setsdtvalue(newStop, "dateString", Variant(label.c_str()));
+        stoptime(0, 0);
 
         std::string path;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::TreeNode) {
-                treenode n = static_cast<treenode>(v);
-                if (n) {
-                    try { path = std::string(nodetomodelpath(n, 1).c_str()); } catch (...) {}
-                }
-            }
-        } catch (const std::exception& e) {
-            return returnError("add_stop_time_failed", e.what());
-        }
+        if (const char* p = nodetomodelpath_cstr(newStop, 1)) path = p;
 
         if (path.empty()) {
             return returnError("add_stop_time_failed",
@@ -4767,23 +4710,25 @@ modelerai_export Variant ModelerAi_removeStopTime(FLEXSIMINTERFACE)
         if (arg.type == VariantType::Number) {
             modelTime = double(arg); haveModelTime = true;
         } else if (arg.type == VariantType::String) {
+            // Parse the string arg as JSON: bare number "600", array "[600]",
+            // or {"model_time":600} all work (.1000058).
             std::string s = std::string(arg);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object()) {
-                        for (const char* k : { "model_time", "seconds" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                modelTime = j[k].get<double>();
-                                haveModelTime = true;
-                                break;
-                            }
+            try {
+                auto j = nlohmann::json::parse(s);
+                if (j.is_number()) {
+                    modelTime = j.get<double>(); haveModelTime = true;
+                } else if (j.is_array()) {
+                    if (j.size() >= 1 && j[0].is_number()) { modelTime = j[0].get<double>(); haveModelTime = true; }
+                } else if (j.is_object()) {
+                    for (const char* k : { "model_time", "seconds" }) {
+                        if (j.contains(k) && j[k].is_number()) {
+                            modelTime = j[k].get<double>();
+                            haveModelTime = true;
+                            break;
                         }
                     }
-                } catch (...) {}
-            }
+                }
+            } catch (...) {}
         }
 
         if (!haveModelTime) {
@@ -4793,45 +4738,14 @@ modelerai_export Variant ModelerAi_removeStopTime(FLEXSIMINTERFACE)
                 "{\"model_time\": 600}.");
         }
 
-        // Probe script returns a Map with { count, removed, removed_path }.
-        // count == 1 BEFORE remove means we refuse (last-stop protection).
-        std::string script;
-        script += "treenode stopTimes = getmodelunit(STOP_TIME_NODE);\n";
-        script += "if (!stopTimes) { print(\"remove_stop_time: STOP_TIME_NODE not found\"); return 0; }\n";
-        script += "Map out = Map();\n";
-        script += "out[\"count\"]   = stopTimes.subnodes.length;\n";
-        script += "out[\"removed\"] = 0;\n";
-        script += "out[\"path\"]    = \"\";\n";
-        script += "if (stopTimes.subnodes.length == 1) return out;  // last-stop protection\n";
-        script += "for (int i = 1; i <= stopTimes.subnodes.length; i++) {\n";
-        script += "    treenode n = stopTimes.subnodes[i];\n";
-        script += "    if (getsdtvalue(n, \"modelTime\") == ";
-        script += std::to_string(modelTime);
-        script += ") {\n";
-        script += "        out[\"path\"]    = string(nodetomodelpath(n, 1));\n";
-        script += "        n.destroy();\n";
-        script += "        out[\"removed\"] = 1;\n";
-        script += "        break;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "stoptime(0, 0);\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("remove_stop_time_failed", e.what());
+        // Native (.1000084 — was executestring). Last-stop protection BEFORE any
+        // removal; match each entry's modelTime via getsdtvalue and destroyobject
+        // the hit; stoptime(0,0) clears slot 0.
+        treenode stopTimes = getmodelunit(STOP_TIME_NODE);
+        if (!objectexists(stopTimes)) {
+            return returnError("remove_stop_time_failed", "STOP_TIME_NODE not found.");
         }
-        if (result.type != VariantType::Map) {
-            return returnError("remove_stop_time_failed",
-                "FlexScript probe returned wrong type.");
-        }
-        Map m = static_cast<Map>(result);
-        int count   = static_cast<int>(double(m["count"]));
-        int removed = static_cast<int>(double(m["removed"]));
-        std::string path = std::string(m["path"]);
-
+        int count = content(stopTimes);
         if (count == 1) {
             return returnError("last_stop_protected",
                 "Only one stop time remains; refusing to delete it. FlexSim's "
@@ -4839,6 +4753,20 @@ modelerai_export Variant ModelerAi_removeStopTime(FLEXSIMINTERFACE)
                 "template depends on stopTimes.last being valid. Add another "
                 "stop time first, then retry.");
         }
+        int removed = 0;
+        std::string path;
+        for (int i = 1; i <= count; ++i) {
+            treenode n = rank(stopTimes, i);
+            if (!n) continue;
+            Variant mt = getsdtvalue(n, "modelTime");
+            if (mt.type == VariantType::Number && static_cast<double>(mt) == modelTime) {
+                if (const char* p = nodetomodelpath_cstr(n, 1)) path = p;
+                destroyobject(n);
+                removed = 1;
+                break;
+            }
+        }
+        stoptime(0, 0);
 
         nlohmann::json out;
         out["ok"]         = true;
@@ -4884,29 +4812,32 @@ modelerai_export Variant ModelerAi_setWarmupTime(FLEXSIMINTERFACE)
             seconds = double(arg1); haveSeconds = true;
             if (arg2.type == VariantType::Number) enabled = double(arg2);
         } else if (arg1.type == VariantType::String) {
+            // Parse the string arg as JSON: bare "100", "[100,1]", or
+            // {"seconds":100,"enabled":1} all work (.1000058).
             std::string s = std::string(arg1);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object()) {
-                        for (const char* k : { "seconds", "model_time" }) {
-                            if (j.contains(k) && j[k].is_number()) {
-                                seconds = j[k].get<double>();
-                                haveSeconds = true;
-                                break;
-                            }
-                        }
-                        if (j.contains("enabled")) {
-                            if (j["enabled"].is_boolean())
-                                enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
-                            else if (j["enabled"].is_number())
-                                enabled = j["enabled"].get<double>();
+            try {
+                auto j = nlohmann::json::parse(s);
+                if (j.is_number()) {
+                    seconds = j.get<double>(); haveSeconds = true;
+                } else if (j.is_array()) {
+                    if (j.size() >= 1 && j[0].is_number()) { seconds = j[0].get<double>(); haveSeconds = true; }
+                    if (j.size() >= 2 && j[1].is_number()) enabled = j[1].get<double>();
+                } else if (j.is_object()) {
+                    for (const char* k : { "seconds", "model_time" }) {
+                        if (j.contains(k) && j[k].is_number()) {
+                            seconds = j[k].get<double>();
+                            haveSeconds = true;
+                            break;
                         }
                     }
-                } catch (...) {}
-            }
+                    if (j.contains("enabled")) {
+                        if (j["enabled"].is_boolean())
+                            enabled = j["enabled"].get<bool>() ? 1.0 : 0.0;
+                        else if (j["enabled"].is_number())
+                            enabled = j["enabled"].get<double>();
+                    }
+                }
+            } catch (...) {}
         }
 
         if (!haveSeconds) {
@@ -4920,22 +4851,14 @@ modelerai_export Variant ModelerAi_setWarmupTime(FLEXSIMINTERFACE)
                 "seconds must be >= 0.");
         }
 
-        std::string script;
-        script += "treenode wu = getmodelunit(WARMUP_TIME_NODE);\n";
-        script += "if (!wu) { print(\"set_warmup_time: WARMUP_TIME_NODE not found\"); return 0; }\n";
-        script += "setsdtvalue(wu, \"enabled\", ";
-        script += std::to_string(enabled != 0.0 ? 1 : 0);
-        script += ");\n";
-        script += "function_s(wu, \"setModelTime\", ";
-        script += std::to_string(seconds);
-        script += ");\n";
-        script += "return wu;\n";
-
-        try {
-            executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_warmup_failed", e.what());
+        // Native (.1000084 — was executestring). Same getmodelunit + setsdtvalue +
+        // function_s("setModelTime") pattern as add_stop_time.
+        treenode wu = getmodelunit(WARMUP_TIME_NODE);
+        if (!objectexists(wu)) {
+            return returnError("set_warmup_failed", "WARMUP_TIME_NODE not found.");
         }
+        setsdtvalue(wu, "enabled", Variant(enabled != 0.0 ? 1.0 : 0.0));
+        function_s(wu, "setModelTime", Variant(seconds));
 
         nlohmann::json out;
         out["ok"]         = true;
@@ -4964,18 +4887,19 @@ modelerai_export Variant ModelerAi_setRunSpeed(FLEXSIMINTERFACE)
         if (arg.type == VariantType::Number) {
             speed = double(arg); haveSpeed = true;
         } else if (arg.type == VariantType::String) {
+            // Parse the string arg as JSON: bare "16", "[16]", {"speed":16}.
             std::string s = std::string(arg);
-            size_t lead = s.find_first_not_of(" \t\r\n");
-            char head = (lead == std::string::npos) ? '\0' : s[lead];
-            if (head == '{') {
-                try {
-                    auto j = nlohmann::json::parse(s);
-                    if (j.is_object() && j.contains("speed") && j["speed"].is_number()) {
-                        speed = j["speed"].get<double>();
-                        haveSpeed = true;
-                    }
-                } catch (...) {}
-            }
+            try {
+                auto j = nlohmann::json::parse(s);
+                if (j.is_number()) {
+                    speed = j.get<double>(); haveSpeed = true;
+                } else if (j.is_array()) {
+                    if (j.size() >= 1 && j[0].is_number()) { speed = j[0].get<double>(); haveSpeed = true; }
+                } else if (j.is_object() && j.contains("speed") && j["speed"].is_number()) {
+                    speed = j["speed"].get<double>();
+                    haveSpeed = true;
+                }
+            } catch (...) {}
         }
 
         if (!haveSpeed) {
@@ -4989,14 +4913,9 @@ modelerai_export Variant ModelerAi_setRunSpeed(FLEXSIMINTERFACE)
                 "speed must be > 0.");
         }
 
-        std::string script = "runspeed(" + std::to_string(speed) + "); return runspeed();";
-        double actual = speed;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) actual = double(v);
-        } catch (const std::exception& e) {
-            return returnError("set_run_speed_failed", e.what());
-        }
+        // Native (.1000084 — was executestring). runspeed(n) sets and returns
+        // the new speed (fsvisible: runspeed(double n1, double n2=-1)).
+        double actual = runspeed(speed);
 
         nlohmann::json out;
         out["ok"]        = true;
@@ -5130,10 +5049,8 @@ modelerai_export Variant ModelerAi_createPerformanceMeasure(FLEXSIMINTERFACE)
         script += "    for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
         script += "        treenode t = allTables.subnodes[iT];\n";
         script += "        if (t == tbl) continue;\n";
-        script += "        treenode pms = t.find(\"variables\");\n";
-        script += "        if (!pms) continue;\n";
-        script += "        pms = pms.find(\"performanceMeasures\");\n";
-        script += "        if (!pms) continue;\n";
+        script += "        treenode pms = getvarnode(t, \"performanceMeasures\");\n";  // was t.find("variables").find(...)
+        script += "        if (!objectexists(pms)) continue;\n";
         script += "        for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
         script += "            treenode pm = pms.subnodes[iP];\n";
         script += "            treenode nm = pm.find(\"Name\");\n";
@@ -5147,11 +5064,12 @@ modelerai_export Variant ModelerAi_createPerformanceMeasure(FLEXSIMINTERFACE)
         script += "if (crossTable) { print(\"create_pm: name '"; script += fsEscape(name);
         script += "' already exists in another PM table: \" + crossTable.name + \". Names must be unique.\"); return 0; }\n";
 
-        // Same-table duplicate handling.
-        script += "treenode pset = tbl.find(\"variables\");\n";
-        script += "if (!pset) pset = tbl.subnodes.assert(\"variables\");\n";
-        script += "treenode pms = pset.find(\"performanceMeasures\");\n";
-        script += "if (!pms) pms = pset.subnodes.assert(\"performanceMeasures\");\n";
+        // Same-table duplicate handling. Use the bound var accessor
+        // (getvarnode) — tbl.find("variables") can't traverse the bound
+        // attribute space, so the old path created a SHADOW "variables"
+        // subnode that Model.performanceMeasures could never see.
+        script += "treenode pms = getvarnode(tbl, \"performanceMeasures\");\n";
+        script += "if (!objectexists(pms)) { print(\"create_pm: performanceMeasures var node missing on table\"); return 0; }\n";
         script += "treenode existing = 0;\n";
         script += "for (int iX = 1; iX <= pms.subnodes.length; iX++) {\n";
         script += "    treenode p = pms.subnodes[iX];\n";
@@ -5236,35 +5154,40 @@ modelerai_export Variant ModelerAi_createPerformanceMeasure(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_deletePerformanceMeasure(FLEXSIMINTERFACE)
 {
     try {
-        std::string name = strParam(param(1));
+        // resolveNameArg accepts a bare string OR {name:"..."} — strParam did
+        // not parse the JSON object form, so {name:"X"} arrived as the literal
+        // string and was used wholesale as the PM name (.1000058 fix).
+        std::string name = resolveNameArg(param(1), "name");
         if (name.empty()) {
             return returnError("missing_name",
                 "modelerai_delete_performance_measure(name) requires a name.");
         }
 
-        std::string script;
-        script += "treenode allTables = Model.find(\"Tools/PerformanceMeasureTables\");\n";
-        script += "if (!allTables) return 0;\n";
-        script += "for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
-        script += "    treenode t = allTables.subnodes[iT];\n";
-        script += "    treenode pms = t.find(\"variables\");\n";
-        script += "    if (!pms) continue;\n";
-        script += "    pms = pms.find(\"performanceMeasures\");\n";
-        script += "    if (!pms) continue;\n";
-        script += "    for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
-        script += "        treenode pm = pms.subnodes[iP];\n";
-        script += "        treenode nm = pm.find(\"Name\");\n";
-        script += "        if (nm && nm.value == \""; script += fsEscape(name); script += "\") { pm.destroy(); return 1; }\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return 0;\n";
-
+        // Native (.1000084 — was executestring). Walk Tools/PerformanceMeasureTables;
+        // performanceMeasures lives in each table's bound >variables space, reached
+        // via getvarnode (NOT t.find("variables") — the .1000058 traversal bug).
+        // Match each PM's Name node and destroyobject the hit.
+        TreeNode* allTables = model()->find("Tools/PerformanceMeasureTables");
         bool removed = false;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) removed = (double(v) > 0);
-        } catch (const std::exception& e) {
-            return returnError("delete_pm_failed", e.what());
+        if (allTables) {
+            int nt = content(allTables);
+            for (int iT = 1; iT <= nt && !removed; ++iT) {
+                TreeNode* t = rank(allTables, iT);
+                if (!t) continue;
+                TreeNode* pms = getvarnode(t, "performanceMeasures");
+                if (!pms) continue;
+                int np = content(pms);
+                for (int iP = 1; iP <= np; ++iP) {
+                    TreeNode* pm = rank(pms, iP);
+                    if (!pm) continue;
+                    TreeNode* nm = pm->find("Name");
+                    if (nm && std::string(nm->value) == name) {
+                        destroyobject(pm);
+                        removed = true;
+                        break;
+                    }
+                }
+            }
         }
 
         nlohmann::json out;
@@ -5288,56 +5211,27 @@ modelerai_export Variant ModelerAi_listPerformanceMeasures(FLEXSIMINTERFACE)
     try {
         // We'll evaluate per-table in C++ rather than have FlexScript build a
         // big nested Map — easier marshalling.
-        std::string script;
-        script += "treenode container = Model.find(\"Tools/PerformanceMeasureTables\");\n";
-        script += "if (!container) return Array();\n";
-        script += "Array out = Array();\n";
-        script += "for (int iT = 1; iT <= container.subnodes.length; iT++) {\n";
-        script += "    treenode t = container.subnodes[iT];\n";
-        script += "    treenode pms = t.find(\"variables\");\n";
-        script += "    if (!pms) continue;\n";
-        script += "    pms = pms.find(\"performanceMeasures\");\n";
-        script += "    if (!pms) continue;\n";
-        script += "    for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
-        script += "        treenode pm = pms.subnodes[iP];\n";
-        script += "        Map row = Map();\n";
-        script += "        row[\"table\"] = string(t.name);\n";
-        script += "        treenode nm = pm.find(\"Name\");\n";
-        script += "        row[\"name\"]  = nm ? string(nm.value) : \"\";\n";
-        script += "        treenode ds = pm.find(\"Description\");\n";
-        script += "        if (ds) row[\"description\"] = string(ds.value);\n";
-        script += "        treenode du = pm.find(\"Display Units\");\n";
-        script += "        if (du) row[\"units\"] = string(du.value);\n";
-        script += "        treenode v  = pm.find(\"Value\");\n";
-        script += "        if (v) {\n";
-        script += "            treenode r = v.find(\"reference\");\n";
-        script += "            if (r && objectexists(r.value)) row[\"reference_path\"] = string(nodetomodelpath(r.value, 1));\n";
-        script += "        }\n";
-        script += "        out.push(row);\n";  // NOT out[out.length+1] — that throws on empty 1-based arrays
-        script += "    }\n";
-        script += "}\n";
-        script += "return out;\n";
-
+        // Use the engine accessor API (Model.performanceMeasures.tableNames /
+        // .names(table)) — the same pattern list_parameters uses. The previous
+        // hand-rolled tree-walk via Model.find(...)/find("variables")/
+        // find("performanceMeasures") did NOT traverse the table's bound
+        // `>variables` attribute space, so it returned zero rows even when PMs
+        // existed (.1000058 fix).
+        // Native (.1000084 — was executestring). Pure enumeration via the engine
+        // accessor Model::getPerformanceMeasures().tableNames / .names(table) —
+        // both engine_export (no PM body evaluation here; metadata only).
         nlohmann::json results = nlohmann::json::array();
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Array) {
-                Array a = static_cast<Array>(v);
-                for (int i = 1; i <= a.length; ++i) {
-                    Variant rowV = a[i];
-                    if (rowV.type != VariantType::Map) continue;
-                    Map m = static_cast<Map>(rowV);
-                    nlohmann::json row;
-                    try { row["table"] = std::string(m["table"]); } catch (...) {}
-                    try { row["name"]  = std::string(m["name"]);  } catch (...) {}
-                    try { Variant d = m["description"]; if (d.type == VariantType::String) row["description"] = std::string(d); } catch (...) {}
-                    try { Variant u = m["units"];       if (u.type == VariantType::String) row["units"]       = std::string(u); } catch (...) {}
-                    try { Variant r = m["reference_path"]; if (r.type == VariantType::String) row["reference_path"] = std::string(r); } catch (...) {}
-                    results.push_back(std::move(row));
-                }
+        PerformanceMeasures pms = Model::getPerformanceMeasures();
+        Array tableNames = pms.tableNames;
+        for (int t = 1; t <= tableNames.length; ++t) {
+            std::string tn = std::string(tableNames[t]);
+            Array names = pms.names(tn.c_str());
+            for (int i = 1; i <= names.length; ++i) {
+                nlohmann::json row;
+                row["table"] = tn;
+                row["name"]  = std::string(names[i]);
+                results.push_back(std::move(row));
             }
-        } catch (const std::exception& e) {
-            return returnError("list_pm_failed", e.what());
         }
 
         nlohmann::json out;
@@ -5403,7 +5297,9 @@ nlohmann::json pmValueToJson(const Variant& v)
 modelerai_export Variant ModelerAi_getPerformanceMeasure(FLEXSIMINTERFACE)
 {
     try {
-        std::string name = strParam(param(1));
+        // Accept bare string OR {name:"..."} (.1000058 fix — was strParam,
+        // which left the JSON object form unparsed).
+        std::string name = resolveNameArg(param(1), "name");
         if (name.empty()) {
             return returnError("missing_name",
                 "modelerai_get_performance_measure(name) requires a name.");
@@ -5437,21 +5333,15 @@ modelerai_export Variant ModelerAi_getPerformanceMeasures(FLEXSIMINTERFACE)
     try {
         // First enumerate names. We evaluate one-at-a-time in C++ so a single
         // bad PM script doesn't kill the whole snapshot.
+        // Enumerate via the engine accessor (same fix as list_performance_
+        // measures — the tree-walk didn't traverse the bound >variables space).
         std::string listScript;
-        listScript += "treenode container = Model.find(\"Tools/PerformanceMeasureTables\");\n";
-        listScript += "if (!container) return Array();\n";
+        listScript += "Array tableNames = Model.performanceMeasures.tableNames;\n";
         listScript += "Array out = Array();\n";
-        listScript += "for (int iT = 1; iT <= container.subnodes.length; iT++) {\n";
-        listScript += "    treenode t = container.subnodes[iT];\n";
-        listScript += "    treenode pms = t.find(\"variables\");\n";
-        listScript += "    if (!pms) continue;\n";
-        listScript += "    pms = pms.find(\"performanceMeasures\");\n";
-        listScript += "    if (!pms) continue;\n";
-        listScript += "    for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
-        listScript += "        treenode pm = pms.subnodes[iP];\n";
-        listScript += "        treenode nm = pm.find(\"Name\");\n";
-        listScript += "        if (nm && string(nm.value) != \"\") out.push(string(nm.value));\n";  // NOT out[out.length+1] — throws on empty 1-based arrays
-        listScript += "    }\n";
+        listScript += "for (int t = 1; t <= tableNames.length; t++) {\n";
+        listScript += "    Array names = Model.performanceMeasures.names(string(tableNames[t]));\n";
+        listScript += "    for (int i = 1; i <= names.length; i++)\n";
+        listScript += "        if (string(names[i]) != \"\") out.push(string(names[i]));\n";
         listScript += "}\n";
         listScript += "return out;\n";
 
@@ -5503,7 +5393,10 @@ modelerai_export Variant ModelerAi_getPerformanceMeasures(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_getObjectStats(FLEXSIMINTERFACE)
 {
     try {
-        std::string objName = strParam(param(1));
+        // Accept bare string OR {object:"..."} (.1000058 fix — was strParam,
+        // which left the JSON object form unparsed and used the whole arg
+        // string as the object name).
+        std::string objName = resolveNameArg(param(1), "object");
         double verbose      = numParam(param(2), 0.0);
         (void)verbose;  // reserved for future expansion
         if (objName.empty()) {
@@ -5511,93 +5404,78 @@ modelerai_export Variant ModelerAi_getObjectStats(FLEXSIMINTERFACE)
                 "modelerai_get_object_stats(object_name) requires a name.");
         }
 
-        // Uses the same accessors as FlexSim's PerformanceMeasure picklists
-        // (Examples/Performacne measure picklists.fsx): getoutput/getinput
-        // for counts, getstat(obj, "Content"/"Staytime", STAT_MIN/MAX/AVERAGE)
-        // for content + staytime, getvarnum(obj, "totaltraveldist") for
-        // movers, and defaultstatelist walking for state times.
+        // Native C++ (.1000079 — was executestring building a FlexScript Map).
+        // Uses the same accessors as FlexSim's PerformanceMeasure picklists:
+        // getinput/getoutput for counts, getstat(obj,"Content"/"Staytime",
+        // STAT_*) for content + staytime, getvarnum(obj,"totaltraveldist")
+        // for movers, defaultstatelist walking for state times. All of these
+        // are fsvisible free functions that link from the module DLL.
         //
-        // Percentage calcs use Model.statisticalTime (excludes warmup) NOT
-        // time(). For throughput rate we use time() since that's the wall
-        // sim time the user cares about.
-        std::string script;
-        script += "treenode o = Model.find(\""; script += fsEscape(objName); script += "\");\n";
-        script += "if (!objectexists(o)) { print(\"get_object_stats: object not found: "; script += fsEscape(objName); script += "\"); return 0; }\n";
-        script += "Object obj = o;\n";
-        script += "Map out = Map();\n";
-        script += "out[\"object_name\"] = \""; script += fsEscape(objName); script += "\";\n";
-        script += "treenode cls = classobject(o);\n";
-        script += "if (cls) out[\"class_name\"] = string(getname(cls));\n";
-        // Throughput counts via the modern accessor form. Sinks RECEIVE
-        // items, so for Sink "throughput" the meaningful number is
-        // input_count; for Source / Processor / Queue it's output_count.
-        // We return both so the AI can pick the right one for the class.
-        script += "try {\n";
-        script += "    out[\"input_count\"]  = obj.stats.input.value;\n";
-        script += "    out[\"output_count\"] = obj.stats.output.value;\n";
-        script += "} catch (...) {}\n";
-        // Content stats via getstat (matches GUI picklist).
-        script += "try {\n";
-        script += "    out[\"content_current\"] = obj.stats.content.value;\n";
-        script += "    out[\"content_min\"]     = getstat(obj, \"Content\", STAT_MIN);\n";
-        script += "    out[\"content_max\"]     = getstat(obj, \"Content\", STAT_MAX);\n";
-        script += "    out[\"content_avg\"]     = getstat(obj, \"Content\", STAT_AVERAGE);\n";
-        script += "} catch (...) {}\n";
-        // Throughput per hour. We can't know if this object is a Sink
-        // without doing class detection, so we compute "released per hour"
-        // from output count. AI uses class_name to interpret: Sink reads
-        // input_count for throughput, Source/Queue/Processor read
-        // throughput_per_hour.
-        script += "try {\n";
-        script += "    double simHours = time() / 3600.0;\n";
-        script += "    if (simHours > 0.0) out[\"throughput_per_hour\"] = obj.stats.output.value / simHours;\n";
-        script += "} catch (...) {}\n";
-        // Staytime via getstat — Min/Max/Average.
-        script += "try {\n";
-        script += "    out[\"staytime_min\"]  = getstat(obj, \"Staytime\", STAT_MIN);\n";
-        script += "    out[\"staytime_max\"]  = getstat(obj, \"Staytime\", STAT_MAX);\n";
-        script += "    out[\"staytime_mean\"] = getstat(obj, \"Staytime\", STAT_AVERAGE);\n";
-        script += "} catch (...) {}\n";
-        // Total travel distance — present on TaskExecuters / movers.
-        script += "try {\n";
-        script += "    out[\"total_travel_distance\"] = getvarnum(obj, \"totaltraveldist\");\n";
-        script += "} catch (...) {}\n";
-        // State times: walk defaultstatelist to get every state name, query
-        // the time-at-value for each, compute percentage of statisticalTime.
-        // Skipped if statisticalTime == 0 (model never ran or warmup not finished).
-        script += "try {\n";
-        script += "    treenode dsl = node(\"MAIN:/project/exec/globals/defaultstatelist\");\n";
-        script += "    if (dsl && Model.statisticalTime > 0) {\n";
-        script += "        Map sm = Map();\n";
-        script += "        for (int i = 1; i <= content(dsl); i++) {\n";
-        script += "            string sn = string(getnodename(rank(dsl, i)));\n";
-        script += "            if (sn == \"\") continue;\n";
-        script += "            double t = getstat(obj, \"State\", STAT_TIME_AT_VALUE, 0, sn);\n";
-        script += "            if (t > 0) sm[sn] = 100.0 * t / Model.statisticalTime;\n";
-        script += "        }\n";
-        script += "        out[\"state_percent\"] = sm;\n";
-        script += "    }\n";
-        script += "} catch (...) {}\n";
-        script += "out[\"sim_time\"]         = time();\n";
-        script += "out[\"statistical_time\"] = Model.statisticalTime;\n";
-        script += "return out;\n";
-
-        nlohmann::json result;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Map) {
-                result = pmValueToJson(v);  // same marshaller works for Maps
-            } else {
-                return returnError("object_not_found",
-                    "Object '" + objName + "' did not resolve.");
-            }
-        } catch (const std::exception& e) {
-            return returnError("get_stats_failed", e.what());
+        // Percentage calcs use statisticaltime() (excludes warmup) NOT time();
+        // throughput rate uses time() since that's the wall sim time.
+        TreeNode* o = model()->find(objName.c_str());
+        if (!o || !objectexists(o)) {
+            return returnError("object_not_found",
+                "Object '" + objName + "' did not resolve.");
         }
+
+        nlohmann::json stats;
+        stats["object_name"] = objName;
+        if (TreeNode* cls = classobject(o)) {
+            if (objectexists(cls)) stats["class_name"] = std::string(getname(cls));
+        }
+
+        // Throughput counts. Sinks RECEIVE items (read input_count); Source/
+        // Processor/Queue read output_count. We return both.
+        stats["input_count"]  = getinput(o);
+        stats["output_count"] = getoutput(o);
+
+        // Content stats via getstat (matches GUI picklist).
+        stats["content_current"] = getstat(o, "Content", STAT_CURRENT);
+        stats["content_min"]     = getstat(o, "Content", STAT_MIN);
+        stats["content_max"]     = getstat(o, "Content", STAT_MAX);
+        stats["content_avg"]     = getstat(o, "Content", STAT_AVERAGE);
+
+        // Throughput per hour from output count.
+        double simTime  = time();
+        double simHours = simTime / 3600.0;
+        if (simHours > 0.0) stats["throughput_per_hour"] = getoutput(o) / simHours;
+
+        // Staytime via getstat — Min/Max/Average.
+        stats["staytime_min"]  = getstat(o, "Staytime", STAT_MIN);
+        stats["staytime_max"]  = getstat(o, "Staytime", STAT_MAX);
+        stats["staytime_mean"] = getstat(o, "Staytime", STAT_AVERAGE);
+
+        // Total travel distance — only TaskExecuters/movers have the var.
+        if (TreeNode* ttd = getvarnode(o, "totaltraveldist")) {
+            if (objectexists(ttd)) stats["total_travel_distance"] = getvarnum(o, "totaltraveldist");
+        }
+
+        // State times: walk defaultstatelist, percent of statisticaltime().
+        double statTime = statisticaltime();
+        if (statTime > 0.0) {
+            if (TreeNode* dsl = node("MAIN:/project/exec/globals/defaultstatelist")) {
+                nlohmann::json sm = nlohmann::json::object();
+                int sc = content(dsl);
+                for (int i = 1; i <= sc; ++i) {
+                    TreeNode* sn = rank(dsl, i);
+                    if (!sn) continue;
+                    std::string stateName = std::string(getname(sn));
+                    if (stateName.empty()) continue;
+                    double t = getstat(o, "State", STAT_TIME_AT_VALUE,
+                                       Variant(0.0), Variant(stateName.c_str()));
+                    if (t > 0.0) sm[stateName] = 100.0 * t / statTime;
+                }
+                if (!sm.empty()) stats["state_percent"] = std::move(sm);
+            }
+        }
+
+        stats["sim_time"]         = simTime;
+        stats["statistical_time"] = statTime;
 
         nlohmann::json out;
         out["ok"]    = true;
-        out["stats"] = std::move(result);
+        out["stats"] = std::move(stats);
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_object_stats", e.what()); }
       catch (...)                     { return returnException("get_object_stats", "unknown"); }
@@ -5612,78 +5490,65 @@ modelerai_export Variant ModelerAi_getObjectStats(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_getModelSummary(FLEXSIMINTERFACE)
 {
     try {
-        std::string script;
-        script += "Map out = Map();\n";
-        script += "out[\"sim_time\"] = time();\n";
-        // Run state.
-        script += "int rs = getrunstate();\n";
-        script += "out[\"run_state\"] = rs == 0 ? \"Stopped\" : (rs == 1 ? \"Running\" : (rs == 2 ? \"Paused\" : \"Unknown\"));\n";
-        // Walk model children, group by class.
-        script += "Map classCounts = Map();\n";
-        script += "double totalCreated = 0;\n";
-        script += "double totalSunk    = 0;\n";
-        script += "Array stuckObjects = Array();\n";
-        script += "treenode root = model();\n";
-        // FlexScript has NO try/catch — wrapping the loop body in one
-        // makes the whole script fail to compile, executestring returns
-        // 0, and the caller sees "Summary script did not return a Map."
-        // (which was the actual failure surfacing as summary_failed in
-        // the trace). Use defensive checks instead.
-        script += "for (int i = 1; i <= root.subnodes.length; i++) {\n";
-        script += "    treenode o = root.subnodes[i];\n";
-        script += "    if (!o) continue;\n";
-        script += "    treenode cls = classobject(o);\n";
-        script += "    if (!cls) continue;\n";
-        script += "    string cn = string(getname(cls));\n";
-        script += "    if (cn.length == 0) continue;\n";
-        // Map[missing] yields null on newer FlexScript; double-cast it to 0
-        // first so the +1 increment never sees a null arithmetic operand.
-        script += "    double cur = classCounts[cn];\n";
-        script += "    classCounts[cn] = cur + 1;\n";
-        // Totals + stuck-objects check, gated on class name so we only
-        // touch .stats.* on classes that actually expose them.
-        script += "    if (cn == \"Source\") {\n";
-        script += "        Object oo = o;\n";
-        script += "        totalCreated = totalCreated + oo.stats.output.value;\n";
-        script += "    }\n";
-        script += "    if (cn == \"Sink\") {\n";
-        script += "        Object oo = o;\n";
-        script += "        totalSunk = totalSunk + oo.stats.input.value;\n";
-        script += "    }\n";
-        script += "    if (rs == 0 && (cn == \"Queue\" || cn == \"Processor\" || cn == \"Combiner\" || cn == \"Separator\" || cn == \"BasicFR\")) {\n";
-        script += "        Object oo = o;\n";
-        script += "        double cnt = oo.stats.content.value;\n";
-        script += "        if (cnt > 0) {\n";
-        script += "            Map s = Map();\n";
-        script += "            s[\"name\"]    = string(getname(o));\n";
-        script += "            s[\"class\"]   = cn;\n";
-        script += "            s[\"content\"] = cnt;\n";
-        script += "            stuckObjects.push(s);\n";
-        script += "        }\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "out[\"class_counts\"]   = classCounts;\n";
-        script += "out[\"total_created\"]  = totalCreated;\n";
-        script += "out[\"total_sunk\"]     = totalSunk;\n";
-        script += "out[\"flow_balance\"]   = totalCreated - totalSunk - 0;\n";
-        script += "out[\"stuck_objects\"]  = stuckObjects;\n";
-        script += "return out;\n";
+        // Native C++ (.1000079 — was executestring building a FlexScript Map).
+        // Walk the model's direct children, group by class, accumulate
+        // Source output / Sink input, and (when stopped) flag any FR holding
+        // content as "stuck". All accessors are fsvisible free functions.
+        nlohmann::json summary;
+        double simTime = time();
+        summary["sim_time"] = simTime;
 
-        nlohmann::json result;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Map) {
-                result = pmValueToJson(v);
-            } else {
-                return returnError("summary_failed", "Summary script did not return a Map.");
+        int rs = getrunstate();   // boolean 0/1 — no "Paused" state
+        summary["run_state"] = rs == 0 ? "Stopped" : "Running";
+
+        nlohmann::json classCounts = nlohmann::json::object();
+        double totalCreated = 0.0;
+        double totalSunk    = 0.0;
+        nlohmann::json stuckObjects = nlohmann::json::array();
+
+        TreeNode* root = model();
+        int n = content(root);
+        for (int i = 1; i <= n; ++i) {
+            TreeNode* o = rank(root, i);
+            if (!o) continue;
+            TreeNode* cls = classobject(o);
+            if (!cls) continue;
+            std::string cn = std::string(getname(cls));
+            if (cn.empty()) continue;
+
+            // Per-class count.
+            if (classCounts.contains(cn))
+                classCounts[cn] = classCounts[cn].get<double>() + 1.0;
+            else
+                classCounts[cn] = 1.0;
+
+            // Totals + stuck-objects check, gated on class name so we only
+            // read stats on classes that actually expose them.
+            if (cn == "Source") totalCreated += getoutput(o);
+            if (cn == "Sink")   totalSunk    += getinput(o);
+
+            if (rs == 0 && (cn == "Queue" || cn == "Processor" ||
+                            cn == "Combiner" || cn == "Separator" || cn == "BasicFR")) {
+                double cnt = getstat(o, "Content", STAT_CURRENT);
+                if (cnt > 0.0) {
+                    nlohmann::json s;
+                    s["name"]    = std::string(getname(o));
+                    s["class"]   = cn;
+                    s["content"] = cnt;
+                    stuckObjects.push_back(std::move(s));
+                }
             }
-        } catch (const std::exception& e) {
-            return returnError("summary_failed", e.what());
         }
+
+        summary["class_counts"]  = std::move(classCounts);
+        summary["total_created"] = totalCreated;
+        summary["total_sunk"]    = totalSunk;
+        summary["flow_balance"]  = totalCreated - totalSunk;
+        summary["stuck_objects"] = std::move(stuckObjects);
 
         nlohmann::json out;
         out["ok"]      = true;
-        out["summary"] = std::move(result);
+        out["summary"] = std::move(summary);
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_model_summary", e.what()); }
       catch (...)                     { return returnException("get_model_summary", "unknown"); }
@@ -5758,24 +5623,16 @@ modelerai_export Variant ModelerAi_getProperty(FLEXSIMINTERFACE)
             return returnJson(err);
         }
 
-        // Generate a script that returns the value in a JSON-friendly shape.
-        // Vec3/Color unpack to arrays; everything else returns the raw value.
-        std::string kind = schemaEntry ? schemaEntry->value_kind : std::string("");
-        std::string script;
-        script += "Object obj = Model.find(\"" + fsEscape(objectName) + "\");\n";
-        if (kind == "vec3") {
-            script += "Vec3 v = obj.getProperty(\"" + fsEscape(propertyName) + "\");\n";
-            script += "Array a = Array(); a.push(v.x); a.push(v.y); a.push(v.z); return a;\n";
-        } else if (kind == "color_rgba") {
-            script += "Color c = obj.getProperty(\"" + fsEscape(propertyName) + "\");\n";
-            script += "Array a = Array(); a.push(c.r); a.push(c.g); a.push(c.b); a.push(c.a); return a;\n";
-        } else {
-            script += "return obj.getProperty(\"" + fsEscape(propertyName) + "\");\n";
+        // Native read via ObjectDataType::getProperty. The Variant→JSON switch
+        // below handles every shape, including Array (Vec3/Color come back as a
+        // numeric Array Variant). schemaEntry still drives value_kind reporting.
+        ObjectDataType* odt = obj->object<ObjectDataType>();
+        if (!odt) {
+            return returnError("getproperty_failed", "could not obtain object data from node.");
         }
-
         Variant result;
         try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
+            result = odt->getProperty(propertyName.c_str());
         } catch (const std::exception& e) {
             return returnError("getproperty_failed",
                 "getProperty(\"" + propertyName + "\") threw: " + e.what());
@@ -6011,6 +5868,29 @@ std::string resolveMemberSnippet(const std::string& memberName)
     s += "if (!objectexists(obj)) obj = Tools.get(\"Group\", \"" + fsEscape(memberName) + "\");\n";
     return s;
 }
+
+// Native equivalents of the group resolvers above (Group::global doesn't link,
+// so resolve the group node by name under Tools/Groups). .1000084+ migration.
+TreeNode* resolveGroupNode(const std::string& groupName)
+{
+    if (TreeNode* groups = model()->find("Tools/Groups")) {
+        int n = content(groups);
+        for (int i = 1; i <= n; ++i) {
+            TreeNode* c = rank(groups, i);
+            if (c && std::string(getname(c)) == groupName) return c;
+        }
+    }
+    return nullptr;
+}
+
+// Member resolve: Model.find first (the common "Op1" case), then fall back to a
+// Group node so the AI can nest groups by passing a group name as a member.
+TreeNode* resolveMemberToNode(const std::string& memberName)
+{
+    TreeNode* obj = model()->find(memberName.c_str());
+    if (objectexists(obj)) return obj;
+    return resolveGroupNode(memberName);
+}
 } // namespace
 
 // modelerai_create_group({ name, members? }) — idempotent: returns the
@@ -6041,84 +5921,43 @@ modelerai_export Variant ModelerAi_createGroup(FLEXSIMINTERFACE)
             return returnError("missing_name", "name is required.");
         }
 
-        // Build the create-or-assert script. Tools.get returns null if the
-        // group doesn't exist; only call Tools.create in that case so we're
-        // idempotent on the name.
-        std::string script;
-        script += "treenode existing = Tools.get(\"Group\", \"" + fsEscape(groupName) + "\");\n";
-        script += "Map out = Map();\n";
-        script += "if (existing) {\n";
-        script += "    out[\"existing\"] = 1;\n";
-        script += "    out[\"node\"]     = existing;\n";
-        script += "} else {\n";
-        script += "    treenode g = Tools.create(\"Group\");\n";
-        script += "    setname(g, \"" + fsEscape(groupName) + "\");\n";
-        script += "    out[\"existing\"] = 0;\n";
-        script += "    out[\"node\"]     = g;\n";
-        script += "}\n";
-        // Optionally add initial members. The Group(name) reference works
-        // for both newly-created and pre-existing groups.
-        if (!initialMembers.empty()) {
-            script += "Group gref = Group(\"" + fsEscape(groupName) + "\");\n";
-            script += "double addedCount   = 0;\n";
-            script += "double skippedCount = 0;\n";
-            script += "Array notFound = Array();\n";
-            for (const auto& m : initialMembers) {
-                script += "{\n";
-                script += resolveMemberSnippet(m);
-                script += "    if (!objectexists(obj)) { notFound.push(\"" + fsEscape(m) + "\"); }\n";
-                script += "    else if (gref.isMember(obj, 0)) { skippedCount = skippedCount + 1; }\n";
-                script += "    else { gref.addMember(obj); addedCount = addedCount + 1; }\n";
-                script += "}\n";
+        // Native (.1000084 — was executestring). Idempotent on name: resolveGroupNode
+        // checks existence (no Tools::get needed); Tools::create("Group") makes a
+        // new one when absent. Members use object<Group>() + addMember (the proven
+        // group_add_member path). Tools::create is the one static factory here —
+        // build-test confirms linkage (like ObjectDataType::create).
+        treenode existing = resolveGroupNode(groupName);
+        bool wasExisting  = objectexists(existing);
+        treenode gNode    = existing;
+        if (!wasExisting) {
+            gNode = Tools::create("Group");
+            if (!objectexists(gNode)) {
+                return returnError("create_group_failed", "Tools::create(\"Group\") returned null.");
             }
-            script += "out[\"added\"]      = addedCount;\n";
-            script += "out[\"skipped\"]    = skippedCount;\n";
-            script += "out[\"not_found\"]  = notFound;\n";
+            setname(gNode, groupName.c_str());
         }
-        script += "out[\"member_count\"] = Group(\"" + fsEscape(groupName) + "\").length;\n";
-        script += "return out;\n";
+        Group* gref = gNode->object<Group>();
+        if (!gref) return returnError("create_group_failed", "node is not a Group.");
 
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("create_group_failed", e.what());
-        } catch (...) {
-            return returnError("create_group_failed", "non-std exception.");
+        int added = 0, skipped = 0;
+        nlohmann::json nf = nlohmann::json::array();
+        for (const auto& m : initialMembers) {
+            TreeNode* obj = resolveMemberToNode(m);
+            if (!objectexists(obj))          nf.push_back(m);
+            else if (gref->isMember(obj, 0)) ++skipped;
+            else { gref->addMember(obj);     ++added; }
         }
 
         nlohmann::json out;
-        out["ok"]   = true;
-        out["name"] = groupName;
-        if (result.type == VariantType::Map) {
-            try {
-                Map m = static_cast<Map>(result);
-                Variant existingV = m["existing"];
-                out["existing"] = (static_cast<double>(existingV) != 0.0);
-                Variant nodeV = m["node"];
-                if (nodeV.type == VariantType::TreeNode) {
-                    TreeNode* n = static_cast<TreeNode*>(nodeV);
-                    if (objectexists(n)) {
-                        try {
-                            const char* p = nodetomodelpath_cstr(n, 1);
-                            if (p) out["path"] = std::string(p);
-                        } catch (...) {}
-                    }
-                }
-                Variant memCountV = m["member_count"];
-                out["member_count"] = (int)static_cast<double>(memCountV);
-                if (!initialMembers.empty()) {
-                    out["added"]   = (int)static_cast<double>(m["added"]);
-                    out["skipped"] = (int)static_cast<double>(m["skipped"]);
-                    nlohmann::json nf = nlohmann::json::array();
-                    Variant nfV = m["not_found"];
-                    if (nfV.type == VariantType::Array) {
-                        Array a = static_cast<Array>(nfV);
-                        for (int i = 1; i <= a.length; ++i) nf.push_back(std::string(a[i]));
-                    }
-                    out["not_found"] = std::move(nf);
-                }
-            } catch (...) {}
+        out["ok"]       = true;
+        out["name"]     = groupName;
+        out["existing"] = wasExisting;
+        if (const char* p = nodetomodelpath_cstr(gNode, 1)) out["path"] = std::string(p);
+        out["member_count"] = gref->length();
+        if (!initialMembers.empty()) {
+            out["added"]     = added;
+            out["skipped"]   = skipped;
+            out["not_found"] = std::move(nf);
         }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("create_group", e.what()); }
@@ -6167,54 +6006,33 @@ modelerai_export Variant ModelerAi_groupAddMember(FLEXSIMINTERFACE)
         if (a.group.empty())         return returnError("missing_group",   "group is required.");
         if (a.members.empty())       return returnError("missing_member",  "pass `member` or `members`.");
 
-        std::string script;
-        script += "treenode g = Tools.get(\"Group\", \"" + fsEscape(a.group) + "\");\n";
-        script += "if (!g) return -1;\n";
-        script += "Group gref = Group(\"" + fsEscape(a.group) + "\");\n";
-        script += "Map out = Map();\n";
-        script += "double addedCount   = 0;\n";
-        script += "double skippedCount = 0;\n";
-        script += "Array notFound = Array();\n";
-        for (const auto& m : a.members) {
-            script += "{\n";
-            script += resolveMemberSnippet(m);
-            script += "    if (!objectexists(obj)) { notFound.push(\"" + fsEscape(m) + "\"); }\n";
-            script += "    else if (gref.isMember(obj, 0)) { skippedCount = skippedCount + 1; }\n";
-            script += "    else { gref.addMember(obj); addedCount = addedCount + 1; }\n";
-            script += "}\n";
-        }
-        script += "out[\"added\"]      = addedCount;\n";
-        script += "out[\"skipped\"]    = skippedCount;\n";
-        script += "out[\"not_found\"]  = notFound;\n";
-        script += "out[\"total_after\"]= gref.length;\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("add_member_failed", e.what()); }
-          catch (...) { return returnError("add_member_failed", "non-std exception."); }
-        if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
+        // Native (.1000084 — was executestring). Group::global doesn't link, so
+        // resolve the group node by name and use the engine_export instance
+        // methods isMember/addMember/length (proven via list_groups).
+        TreeNode* gNode = resolveGroupNode(a.group);
+        if (!gNode) {
             return returnError("group_not_found",
                 "Group '" + a.group + "' does not exist. Use modelerai_create_group first.");
         }
-        if (result.type != VariantType::Map) {
-            return returnError("add_member_failed", "script returned wrong type.");
+        Group* gref = gNode->object<Group>();
+        if (!gref) return returnError("add_member_failed", "'" + a.group + "' is not a Group.");
+
+        int added = 0, skipped = 0;
+        nlohmann::json nf = nlohmann::json::array();
+        for (const auto& m : a.members) {
+            TreeNode* obj = resolveMemberToNode(m);
+            if (!objectexists(obj))            nf.push_back(m);
+            else if (gref->isMember(obj, 0))   ++skipped;
+            else { gref->addMember(obj);       ++added; }
         }
-        Map m = static_cast<Map>(result);
+
         nlohmann::json out;
         out["ok"]          = true;
         out["group"]       = a.group;
-        out["added"]       = (int)static_cast<double>(m["added"]);
-        out["skipped"]     = (int)static_cast<double>(m["skipped"]);
-        nlohmann::json nf = nlohmann::json::array();
-        Variant nfV = m["not_found"];
-        if (nfV.type == VariantType::Array) {
-            Array arr = static_cast<Array>(nfV);
-            for (int i = 1; i <= arr.length; ++i) nf.push_back(std::string(arr[i]));
-        }
+        out["added"]       = added;
+        out["skipped"]     = skipped;
         out["not_found"]   = std::move(nf);
-        out["total_after"] = (int)static_cast<double>(m["total_after"]);
+        out["total_after"] = gref->length();
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("group_add_member", e.what()); }
       catch (...)                     { return returnException("group_add_member", "unknown"); }
@@ -6229,54 +6047,30 @@ modelerai_export Variant ModelerAi_groupRemoveMember(FLEXSIMINTERFACE)
         if (a.group.empty())   return returnError("missing_group",  "group is required.");
         if (a.members.empty()) return returnError("missing_member", "pass `member` or `members`.");
 
-        std::string script;
-        script += "treenode g = Tools.get(\"Group\", \"" + fsEscape(a.group) + "\");\n";
-        script += "if (!g) return -1;\n";
-        script += "Group gref = Group(\"" + fsEscape(a.group) + "\");\n";
-        script += "Map out = Map();\n";
-        script += "double removedCount  = 0;\n";
-        script += "double notMemberCount = 0;\n";
-        script += "Array notFound = Array();\n";
-        for (const auto& m : a.members) {
-            script += "{\n";
-            script += resolveMemberSnippet(m);
-            script += "    if (!objectexists(obj)) { notFound.push(\"" + fsEscape(m) + "\"); }\n";
-            script += "    else if (!gref.isMember(obj, 0)) { notMemberCount = notMemberCount + 1; }\n";
-            script += "    else { gref.removeMember(obj); removedCount = removedCount + 1; }\n";
-            script += "}\n";
+        // Native (.1000084 — was executestring). Same pattern as add_member.
+        TreeNode* gNode = resolveGroupNode(a.group);
+        if (!gNode) {
+            return returnError("group_not_found", "Group '" + a.group + "' does not exist.");
         }
-        script += "out[\"removed\"]    = removedCount;\n";
-        script += "out[\"not_member\"] = notMemberCount;\n";
-        script += "out[\"not_found\"]  = notFound;\n";
-        script += "out[\"total_after\"]= gref.length;\n";
-        script += "return out;\n";
+        Group* gref = gNode->object<Group>();
+        if (!gref) return returnError("remove_member_failed", "'" + a.group + "' is not a Group.");
 
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("remove_member_failed", e.what()); }
-          catch (...) { return returnError("remove_member_failed", "non-std exception."); }
-        if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
-            return returnError("group_not_found",
-                "Group '" + a.group + "' does not exist.");
+        int removed = 0, notMember = 0;
+        nlohmann::json nf = nlohmann::json::array();
+        for (const auto& m : a.members) {
+            TreeNode* obj = resolveMemberToNode(m);
+            if (!objectexists(obj))             nf.push_back(m);
+            else if (!gref->isMember(obj, 0))   ++notMember;
+            else { gref->removeMember(obj);     ++removed; }
         }
-        if (result.type != VariantType::Map) {
-            return returnError("remove_member_failed", "script returned wrong type.");
-        }
-        Map m = static_cast<Map>(result);
+
         nlohmann::json out;
         out["ok"]          = true;
         out["group"]       = a.group;
-        out["removed"]     = (int)static_cast<double>(m["removed"]);
-        out["not_member"]  = (int)static_cast<double>(m["not_member"]);
-        nlohmann::json nf = nlohmann::json::array();
-        Variant nfV = m["not_found"];
-        if (nfV.type == VariantType::Array) {
-            Array arr = static_cast<Array>(nfV);
-            for (int i = 1; i <= arr.length; ++i) nf.push_back(std::string(arr[i]));
-        }
+        out["removed"]     = removed;
+        out["not_member"]  = notMember;
         out["not_found"]   = std::move(nf);
-        out["total_after"] = (int)static_cast<double>(m["total_after"]);
+        out["total_after"] = gref->length();
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("group_remove_member", e.what()); }
       catch (...)                     { return returnException("group_remove_member", "unknown"); }
@@ -6286,38 +6080,21 @@ modelerai_export Variant ModelerAi_groupRemoveMember(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_listGroups(FLEXSIMINTERFACE)
 {
     try {
-        // Groups live under model().find("Tools/Groups"). The folder may
-        // not exist yet on a brand-new model — handle null cleanly.
-        std::string script;
-        script += "treenode root = model().find(\"Tools/Groups\");\n";
-        script += "Array out = Array();\n";
-        script += "if (root) {\n";
-        script += "    for (int i = 1; i <= root.subnodes.length; i++) {\n";
-        script += "        treenode g = root.subnodes[i];\n";
-        script += "        Map entry = Map();\n";
-        script += "        entry[\"name\"] = string(getname(g));\n";
-        script += "        entry[\"member_count\"] = Group(string(getname(g))).length;\n";
-        script += "        out.push(entry);\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("list_groups_failed", e.what()); }
-          catch (...) { return returnError("list_groups_failed", "non-std exception."); }
-
+        // Groups live under model().find("Tools/Groups"). The folder may not
+        // exist yet on a brand-new model — handle null cleanly. Native walk:
+        // each subnode is a Group; member count via Group::length() (an
+        // engine_export instance method — links). Group::global() does NOT
+        // link, so we get the Group* from the node via object<Group>().
         nlohmann::json groups = nlohmann::json::array();
-        if (result.type == VariantType::Array) {
-            Array a = static_cast<Array>(result);
-            for (int i = 1; i <= a.length; ++i) {
-                Variant ev = a[i];
-                if (ev.type != VariantType::Map) continue;
-                Map m = static_cast<Map>(ev);
+        if (TreeNode* root = model()->find("Tools/Groups")) {
+            int n = content(root);
+            for (int i = 1; i <= n; ++i) {
+                TreeNode* gNode = rank(root, i);
+                if (!gNode) continue;
+                Group* g = gNode->object<Group>();
                 nlohmann::json e;
-                e["name"]         = std::string(m["name"]);
-                e["member_count"] = (int)static_cast<double>(m["member_count"]);
+                e["name"]         = std::string(getname(gNode));
+                e["member_count"] = g ? g->length() : 0;
                 groups.push_back(std::move(e));
             }
         }
@@ -6612,6 +6389,42 @@ nlohmann::json cellVariantToJson(const Variant& v, std::string& outKind)
     }
 }
 
+// JSON cell value -> native Variant for the Variant cell kinds (number, bool,
+// string, null, {node_path|object} pointer, array of those). Returns false +
+// sets err on an unsupported shape. (.1000084 native replacement for the
+// Variant branch of cellJsonToFlexScript — writes go through tbl[r][c]=Variant.)
+bool cellJsonToVariant(const nlohmann::json& v, Variant& out, std::string& err)
+{
+    if (v.is_null())    { out = Variant(); return true; }
+    if (v.is_boolean()) { out = Variant(v.get<bool>() ? 1.0 : 0.0); return true; }
+    if (v.is_number())  { out = Variant(v.get<double>()); return true; }
+    if (v.is_string())  { out = Variant(v.get<std::string>().c_str()); return true; }
+    if (v.is_object()) {
+        std::string nodePath  = v.value("node_path", std::string(""));
+        std::string objectRef = v.value("object",    std::string(""));
+        TreeNode* ref = nullptr;
+        if      (!nodePath.empty())  ref = node(nodePath.c_str(), nullptr);
+        else if (!objectRef.empty()) ref = model()->find(objectRef.c_str());
+        else { err = "object cell must have node_path or object"; return false; }
+        if (!objectexists(ref)) { err = "referenced node not found"; return false; }
+        out = Variant(ref);
+        return true;
+    }
+    if (v.is_array()) {
+        Array a;
+        for (const auto& e : v) {
+            if (e.is_array()) { err = "nested arrays are not supported in a cell"; return false; }
+            Variant ev; std::string e2;
+            if (!cellJsonToVariant(e, ev, e2)) { err = "array element: " + e2; return false; }
+            a.push(ev);
+        }
+        out = Variant(a);
+        return true;
+    }
+    err = "unsupported cell value type";
+    return false;
+}
+
 } // namespace
 
 // modelerai_create_global_table({ name, rows?, cols?, row_headers?, col_headers?, cells? })
@@ -6652,86 +6465,49 @@ modelerai_export Variant ModelerAi_createGlobalTable(FLEXSIMINTERFACE)
         if (rows < 0) rows = 0;
         if (cols < 0) cols = 0;
 
-        std::string script;
-        script += "treenode existing = Tools.get(\"GlobalTable\", \"" + fsEscape(tableName) + "\");\n";
-        script += "Map out = Map();\n";
-        script += "if (existing) {\n";
-        script += "    out[\"existing\"] = 1;\n";
-        script += "    out[\"node\"]     = existing;\n";
-        script += "} else {\n";
-        script += "    treenode t = Tools.create(\"GlobalTable\");\n";
-        script += "    setname(t, \"" + fsEscape(tableName) + "\");\n";
-        script += "    out[\"existing\"] = 0;\n";
-        script += "    out[\"node\"]     = t;\n";
-        script += "}\n";
-        // Resize if dims given. setSize is no-op on the same size.
-        if (rows > 0 && cols > 0) {
-            script += "Table(\"" + fsEscape(tableName) + "\").setSize(" +
-                      std::to_string(rows) + ", " + std::to_string(cols) + ");\n";
+        // Native (.1000084 — was executestring). reftable checks existence (no
+        // Tools::get); Tools::create("GlobalTable") makes a new one; Table handles
+        // size/headers; cells write via tbl[r][c]=Variant (cellJsonToVariant).
+        treenode existing = reftable(tableName.c_str());
+        bool wasExisting  = objectexists(existing);
+        treenode tnode    = existing;
+        if (!wasExisting) {
+            tnode = Tools::create("GlobalTable");
+            if (!objectexists(tnode)) {
+                return returnError("create_table_failed", "Tools::create(\"GlobalTable\") returned null.");
+            }
+            setname(tnode, tableName.c_str());
         }
-        // Headers.
-        for (size_t r = 0; r < rowHeaders.size(); ++r) {
-            script += "Table(\"" + fsEscape(tableName) + "\").setRowHeader(" +
-                      std::to_string(r + 1) + ", \"" + fsEscape(rowHeaders[r]) + "\");\n";
-        }
-        for (size_t c = 0; c < colHeaders.size(); ++c) {
-            script += "Table(\"" + fsEscape(tableName) + "\").setColHeader(" +
-                      std::to_string(c + 1) + ", \"" + fsEscape(colHeaders[c]) + "\");\n";
-        }
-        // Initial cell values (1-indexed in FlexScript; cells[r][c] in JSON
-        // are 0-indexed in our parser, so add 1 when emitting).
+        Table tbl(tnode);
+        if (rows > 0 && cols > 0) tbl.setSize(rows, cols, 0, 0);
+        for (size_t r = 0; r < rowHeaders.size(); ++r) tbl.setRowHeader((int)r + 1, rowHeaders[r].c_str());
+        for (size_t c = 0; c < colHeaders.size(); ++c) tbl.setColHeader((int)c + 1, colHeaders[c].c_str());
+
+        // Initial cell values (cells[r][c] are 0-indexed in JSON → +1 for the
+        // 1-indexed table subscript).
         int cellsWritten = 0, cellsSkipped = 0;
         if (cells.is_array()) {
             for (size_t r = 0; r < cells.size(); ++r) {
                 const auto& row = cells[r];
                 if (!row.is_array()) continue;
                 for (size_t c = 0; c < row.size(); ++c) {
-                    std::string setup, expr, kind, err;
-                    std::string tag = std::to_string(r) + "_" + std::to_string(c);
-                    if (!cellJsonToFlexScript(row[c], tag, setup, expr, kind, err)) {
-                        ++cellsSkipped; continue;
-                    }
-                    script += setup;
-                    script += "Table(\"" + fsEscape(tableName) + "\")[" +
-                              std::to_string(r + 1) + "][" + std::to_string(c + 1) +
-                              "] = " + expr + ";\n";
+                    Variant cv; std::string err;
+                    if (!cellJsonToVariant(row[c], cv, err)) { ++cellsSkipped; continue; }
+                    tbl[(int)r + 1][(int)c + 1] = cv;
                     ++cellsWritten;
                 }
             }
         }
-        script += "out[\"num_rows\"] = Table(\"" + fsEscape(tableName) + "\").numRows;\n";
-        script += "out[\"num_cols\"] = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("create_table_failed", e.what()); }
-          catch (...) { return returnError("create_table_failed", "non-std exception."); }
 
         nlohmann::json out;
         out["ok"]            = true;
         out["name"]          = tableName;
+        out["existing"]      = wasExisting;
         out["cells_written"] = cellsWritten;
         out["cells_skipped"] = cellsSkipped;
-        if (result.type == VariantType::Map) {
-            try {
-                Map m = static_cast<Map>(result);
-                out["existing"] = (static_cast<double>(m["existing"]) != 0.0);
-                Variant nodeV = m["node"];
-                if (nodeV.type == VariantType::TreeNode) {
-                    TreeNode* n = static_cast<TreeNode*>(nodeV);
-                    if (objectexists(n)) {
-                        try {
-                            const char* p = nodetomodelpath_cstr(n, 1);
-                            if (p) out["path"] = std::string(p);
-                        } catch (...) {}
-                    }
-                }
-                out["num_rows"] = (int)static_cast<double>(m["num_rows"]);
-                out["num_cols"] = (int)static_cast<double>(m["num_cols"]);
-            } catch (...) {}
-        }
+        if (const char* p = nodetomodelpath_cstr(tnode, 1)) out["path"] = std::string(p);
+        out["num_rows"] = tbl.numRows;
+        out["num_cols"] = tbl.numCols;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("create_global_table", e.what()); }
       catch (...)                     { return returnException("create_global_table", "unknown"); }
@@ -6752,44 +6528,34 @@ modelerai_export Variant ModelerAi_resizeGlobalTable(FLEXSIMINTERFACE)
         try {
             auto j = nlohmann::json::parse(std::string(arg));
             if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
-            tableName = j.value("name", std::string(""));
+            // Accept either `table` (matches set/get_global_table_cell) or
+            // `name` (.1000058 — was `name`-only, inconsistent with the rest
+            // of the global-table family).
+            tableName = j.value("table", std::string(""));
+            if (tableName.empty()) tableName = j.value("name", std::string(""));
             if (j.contains("rows") && j["rows"].is_number_integer()) rows = j["rows"].get<int>();
             if (j.contains("cols") && j["cols"].is_number_integer()) cols = j["cols"].get<int>();
             overwrite = j.value("overwrite", false);
         } catch (const std::exception& e) {
             return returnError("bad_args_json", std::string("parse: ") + e.what());
         }
-        if (tableName.empty()) return returnError("missing_name", "name is required.");
+        if (tableName.empty()) return returnError("missing_name", "table (or name) is required.");
         if (rows < 0 || cols < 0) return returnError("bad_dims", "rows and cols must be >= 0.");
 
-        std::string script;
-        script += "treenode t = Tools.get(\"GlobalTable\", \"" + fsEscape(tableName) + "\");\n";
-        script += "if (!t) return -1;\n";
-        script += "Table(\"" + fsEscape(tableName) + "\").setSize(" +
-                  std::to_string(rows) + ", " + std::to_string(cols) + ", 0, " +
-                  std::string(overwrite ? "1" : "0") + ");\n";
-        script += "Map out = Map();\n";
-        script += "out[\"num_rows\"] = Table(\"" + fsEscape(tableName) + "\").numRows;\n";
-        script += "out[\"num_cols\"] = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("resize_table_failed", e.what()); }
-          catch (...) { return returnError("resize_table_failed", "non-std exception."); }
-        if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
+        // Native: reftable() resolves the GlobalTable by name (null if absent);
+        // settablesize() resizes; gettablerows/cols read back. (Was Tools.get +
+        // Table(name).setSize through executestring.)
+        treenode t = reftable(tableName.c_str());
+        if (!objectexists(t)) {
             return returnError("table_not_found",
                 "GlobalTable '" + tableName + "' does not exist. Use modelerai_create_global_table first.");
         }
+        settablesize(tableName.c_str(), rows, cols, 0, overwrite ? 1 : 0);
         nlohmann::json out;
-        out["ok"]   = true;
-        out["name"] = tableName;
-        if (result.type == VariantType::Map) {
-            Map m = static_cast<Map>(result);
-            out["num_rows"] = (int)static_cast<double>(m["num_rows"]);
-            out["num_cols"] = (int)static_cast<double>(m["num_cols"]);
-        }
+        out["ok"]       = true;
+        out["name"]     = tableName;
+        out["num_rows"] = gettablerows(tableName.c_str());
+        out["num_cols"] = gettablecols(tableName.c_str());
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("resize_global_table", e.what()); }
       catch (...)                     { return returnException("resize_global_table", "unknown"); }
@@ -6853,147 +6619,142 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
             else if (valueJson.contains("tracked_variable")) kindEnum = Kind::TrackedVariable;
         }
 
-        std::string cellWriteScript;  // emitted after the cellNode declaration
-        std::string outKind;          // value_kind reported to caller
-
-        if (kindEnum == Kind::Variant) {
-            std::string setup, expr, err;
-            if (!cellJsonToFlexScript(valueJson, "set", setup, expr, outKind, err)) {
-                return returnError("unsupported_value_type",
-                    "value must be a FlexSim Variant or kind-tagged object — "
-                    "Number, String, TreeNode ({node_path|object}), Array, null, "
-                    "{flexscript:\"...\"}, {bundle:{...}}, or {tracked_variable:{...}}. ("
-                    + err + ")");
-            }
-            cellWriteScript += setup;
-            cellWriteScript += "Table(\"" + fsEscape(tableName) + "\")[" +
-                               std::to_string(row) + "][" + std::to_string(col) +
-                               "] = " + expr + ";\n";
-        } else if (kindEnum == Kind::FlexScript) {
-            outKind = "flexscript";
-            if (!valueJson["flexscript"].is_string()) {
-                return returnError("bad_value_shape", "{flexscript} must be a string body.");
-            }
-            std::string body = valueJson["flexscript"].get<std::string>();
-            if (body.find("return ") == std::string::npos) {
-                body = "Object current = ownerobject(c);\n"
-                       "Object item = param(1);\n"
-                       "return " + body + ";";
-            }
-            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
-                               "\").cell(" + std::to_string(row) + ", " +
-                               std::to_string(col) + ");\n";
-            cellWriteScript += "cellNode.value = \"" + fsEscape(body) + "\";\n";
-            cellWriteScript += "switch_flexscript(cellNode, 1);\n";
-            cellWriteScript += "buildnodeflexscript(cellNode);\n";
-        } else if (kindEnum == Kind::Bundle) {
-            outKind = "bundle";
-            const auto& spec = valueJson["bundle"];
-            if (!spec.is_object()) {
-                return returnError("bad_value_shape",
-                    "{bundle} must be an object with fields + optional rows.");
-            }
-            if (!spec.contains("fields") || !spec["fields"].is_array()) {
-                return returnError("bad_value_shape", "Bundle requires a `fields` array.");
-            }
-            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
-                               "\").cell(" + std::to_string(row) + ", " +
-                               std::to_string(col) + ");\n";
-            cellWriteScript += "clearbundle(cellNode);\n";
-            std::vector<std::string> fieldTypes;
-            for (const auto& f : spec["fields"]) {
-                if (!f.is_object() || !f.contains("name") || !f.contains("type")) {
-                    return returnError("bad_value_shape",
-                        "Each bundle field needs `name` and `type`.");
-                }
-                std::string fname = f.value("name", std::string(""));
-                std::string ftype = f.value("type", std::string(""));
-                std::string typeMacro;
-                if      (ftype == "number" || ftype == "double") typeMacro = "BUNDLE_FIELD_TYPE_DOUBLE";
-                else if (ftype == "int")                          typeMacro = "BUNDLE_FIELD_TYPE_INT";
-                else if (ftype == "string")                       typeMacro = "BUNDLE_FIELD_TYPE_VARCHAR";
-                else if (ftype == "node"   || ftype == "pointer") typeMacro = "BUNDLE_FIELD_TYPE_NODEREF";
-                else {
-                    return returnError("bad_value_shape",
-                        "Bundle field type '" + ftype + "' unsupported. "
-                        "Use one of: number, int, string, node.");
-                }
-                fieldTypes.push_back(ftype);
-                cellWriteScript += "addbundlefield(cellNode, \"" + fsEscape(fname) +
-                                   "\", " + typeMacro + ");\n";
-            }
-            if (spec.contains("rows") && spec["rows"].is_array()) {
-                int rowIdx = 1;
-                for (const auto& rowVals : spec["rows"]) {
-                    if (!rowVals.is_array()) continue;
-                    cellWriteScript += "addbundleentry(cellNode, 1);\n";
-                    for (size_t c = 0; c < rowVals.size() && c < fieldTypes.size(); ++c) {
-                        std::string elSetup, elExpr, elKind, elErr;
-                        std::string elTag = "br" + std::to_string(rowIdx) +
-                                            "c" + std::to_string(c + 1);
-                        if (!cellJsonToFlexScript(rowVals[c], elTag,
-                                                  elSetup, elExpr, elKind, elErr)) {
-                            return returnError("bad_bundle_row",
-                                "Bundle row " + std::to_string(rowIdx) +
-                                " col " + std::to_string(c + 1) + ": " + elErr);
-                        }
-                        cellWriteScript += elSetup;
-                        cellWriteScript += "setbundlevalue(cellNode, " +
-                                           std::to_string(rowIdx) + ", " +
-                                           std::to_string(c + 1) + ", " + elExpr + ");\n";
-                    }
-                    ++rowIdx;
-                }
-            }
-        } else { // TrackedVariable
-            outKind = "tracked_variable";
-            const auto& spec = valueJson["tracked_variable"];
-            std::string tvTypeMacro = "STAT_TYPE_TIME_SERIES";
-            double startValue = 0.0;
-            int    flags      = -1;
-            if (spec.is_object()) {
-                std::string t = spec.value("type", std::string(""));
-                if      (t == "" || t == "time_series")    tvTypeMacro = "STAT_TYPE_TIME_SERIES";
-                else if (t == "level_history")             tvTypeMacro = "STAT_TYPE_LEVEL_HISTORY";
-                else if (t == "discrete_value")            tvTypeMacro = "STAT_TYPE_DISCRETE_VALUE";
-                else if (t == "discrete_change")           tvTypeMacro = "STAT_TYPE_DISCRETE_CHANGE";
-                else if (t == "categorical")               tvTypeMacro = "STAT_TYPE_CATEGORICAL";
-                else if (t == "categorical_combo")         tvTypeMacro = "STAT_TYPE_CATEGORICAL_COMBO";
-                else {
-                    return returnError("bad_value_shape",
-                        "TrackedVariable type '" + t + "' unknown. Use one of: "
-                        "time_series, level_history, discrete_value, discrete_change, "
-                        "categorical, categorical_combo.");
-                }
-                if (spec.contains("start_value") && spec["start_value"].is_number()) {
-                    startValue = spec["start_value"].get<double>();
-                }
-                if (spec.contains("flags") && spec["flags"].is_number_integer()) {
-                    flags = spec["flags"].get<int>();
-                }
-            }
-            cellWriteScript += "treenode cellNode = Table(\"" + fsEscape(tableName) +
-                               "\").cell(" + std::to_string(row) + ", " +
-                               std::to_string(col) + ");\n";
-            std::ostringstream s;
-            s << "TrackedVariable.init(cellNode, " << tvTypeMacro
-              << ", " << startValue
-              << ", " << flags << ");\n";
-            cellWriteScript += s.str();
+        // Native (.1000084 — was executestring). Resolve via reftable(); Variant
+        // kinds write through tbl[r][c]=Variant (works on tree- AND bundle-backed
+        // tables); structural kinds mutate the cell tree node (tree-backed only —
+        // tbl.cell() throws on bundle-backed tables, surfaced via the catch).
+        treenode tnode = reftable(tableName.c_str());
+        if (!objectexists(tnode)) {
+            return returnError("table_not_found",
+                "GlobalTable '" + tableName + "' does not exist. Use modelerai_create_global_table first.");
+        }
+        Table tbl(tnode);
+        if (row > tbl.numRows || col > tbl.numCols) {
+            nlohmann::json err;
+            err["error"]   = "index_out_of_range";
+            err["table"]   = tableName;
+            err["row"]     = row;
+            err["col"]     = col;
+            err["message"] = "row/col exceed table dimensions; call resize first.";
+            return returnJson(err);
         }
 
-        std::string script;
-        script += "treenode t = Tools.get(\"GlobalTable\", \"" + fsEscape(tableName) + "\");\n";
-        script += "if (!t) return -1;\n";
-        script += "int nr = Table(\"" + fsEscape(tableName) + "\").numRows;\n";
-        script += "int nc = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
-        script += "if (" + std::to_string(row) + " > nr || " + std::to_string(col) + " > nc) return -2;\n";
-        script += cellWriteScript;
-        script += "return 1;\n";
-
-        Variant result;
+        std::string outKind;
         try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
+            if (kindEnum == Kind::Variant) {
+                Variant cv; std::string err;
+                if (!cellJsonToVariant(valueJson, cv, err)) {
+                    return returnError("unsupported_value_type",
+                        "value must be a FlexSim Variant or kind-tagged object — "
+                        "Number, String, TreeNode ({node_path|object}), Array, null, "
+                        "{flexscript:\"...\"}, {bundle:{...}}, or {tracked_variable:{...}}. ("
+                        + err + ")");
+                }
+                cellVariantToJson(cv, outKind);   // report the resolved kind
+                tbl[row][col] = cv;
+            } else if (kindEnum == Kind::FlexScript) {
+                outKind = "flexscript";
+                if (!valueJson["flexscript"].is_string()) {
+                    return returnError("bad_value_shape", "{flexscript} must be a string body.");
+                }
+                std::string body = valueJson["flexscript"].get<std::string>();
+                if (body.find("return ") == std::string::npos) {
+                    body = "Object current = ownerobject(c);\n"
+                           "Object item = param(1);\n"
+                           "return " + body + ";";
+                }
+                TreeNode* cellNode = tbl.cell(row, col);
+                cellNode->value = Variant(body.c_str());
+                switch_flexscript(cellNode, 1);
+                buildnodeflexscript(cellNode);
+            } else if (kindEnum == Kind::Bundle) {
+                outKind = "bundle";
+                const auto& spec = valueJson["bundle"];
+                if (!spec.is_object()) {
+                    return returnError("bad_value_shape",
+                        "{bundle} must be an object with fields + optional rows.");
+                }
+                if (!spec.contains("fields") || !spec["fields"].is_array()) {
+                    return returnError("bad_value_shape", "Bundle requires a `fields` array.");
+                }
+                TreeNode* cellNode = tbl.cell(row, col);
+                cellNode->dataType = DATA_BUNDLE;   // make it a bundle before fields
+                clearbundle(cellNode);
+                std::vector<std::string> fieldNames, fieldTypes;
+                for (const auto& f : spec["fields"]) {
+                    if (!f.is_object() || !f.contains("name") || !f.contains("type")) {
+                        return returnError("bad_value_shape",
+                            "Each bundle field needs `name` and `type`.");
+                    }
+                    std::string fname = f.value("name", std::string(""));
+                    std::string ftype = f.value("type", std::string(""));
+                    int typeMacro;
+                    if      (ftype == "number" || ftype == "double") typeMacro = BUNDLE_FIELD_TYPE_DOUBLE;
+                    else if (ftype == "int")                          typeMacro = BUNDLE_FIELD_TYPE_INT;
+                    else if (ftype == "string")                       typeMacro = BUNDLE_FIELD_TYPE_VARCHAR;
+                    else if (ftype == "node"   || ftype == "pointer") typeMacro = BUNDLE_FIELD_TYPE_NODEREF;
+                    else {
+                        return returnError("bad_value_shape",
+                            "Bundle field type '" + ftype + "' unsupported. "
+                            "Use one of: number, int, string, node.");
+                    }
+                    addbundlefield(cellNode, fname.c_str(), typeMacro);
+                    fieldNames.push_back(fname);
+                    fieldTypes.push_back(ftype);
+                }
+                if (spec.contains("rows") && spec["rows"].is_array()) {
+                    for (const auto& rowVals : spec["rows"]) {
+                        if (!rowVals.is_array()) continue;
+                        int e = addbundleentry(cellNode);   // entry number (0-based)
+                        for (size_t c = 0; c < rowVals.size() && c < fieldNames.size(); ++c) {
+                            const nlohmann::json& cell = rowVals[c];
+                            int fieldIdx = static_cast<int>(c);   // 0-based
+                            if (fieldTypes[c] == "string") {
+                                std::string sv = cell.is_string() ? cell.get<std::string>()
+                                    : (cell.is_number() ? std::to_string(cell.get<double>())
+                                                        : std::string(""));
+                                setbundlevalue(cellNode, e, fieldIdx, sv.c_str());
+                            } else if (fieldTypes[c] == "node" || fieldTypes[c] == "pointer") {
+                                // node-ref cells not expressible via setbundlevalue overloads
+                            } else {
+                                double dv = cell.is_boolean() ? (cell.get<bool>() ? 1.0 : 0.0)
+                                    : (cell.is_number() ? cell.get<double>() : 0.0);
+                                setbundlevalue(cellNode, e, fieldIdx, dv);
+                            }
+                        }
+                    }
+                }
+            } else { // TrackedVariable
+                outKind = "tracked_variable";
+                const auto& spec = valueJson["tracked_variable"];
+                int    tvType     = STAT_TYPE_TIME_SERIES;
+                double startValue = 0.0;
+                int    flags      = 0;
+                if (spec.is_object()) {
+                    std::string t = spec.value("type", std::string(""));
+                    if      (t == "" || t == "time_series")    tvType = STAT_TYPE_TIME_SERIES;
+                    else if (t == "categorical")               tvType = STAT_TYPE_CATEGORICAL;
+                    else if (t == "categorical_combo")         tvType = STAT_TYPE_CATEGORICAL_COMBO;
+                    else if (t == "level")                     tvType = STAT_TYPE_LEVEL;
+                    else if (t == "cumulative")                tvType = STAT_TYPE_CUMULATIVE;
+                    else if (t == "kinetic_level")             tvType = STAT_TYPE_KINETIC_LEVEL;
+                    else if (t == "pointer")                   tvType = STAT_TYPE_POINTER;
+                    else {
+                        return returnError("bad_value_shape",
+                            "TrackedVariable type '" + t + "' unknown. Use one of: "
+                            "time_series, categorical, categorical_combo, level, "
+                            "cumulative, kinetic_level, pointer.");
+                    }
+                    if (spec.contains("start_value") && spec["start_value"].is_number()) {
+                        startValue = spec["start_value"].get<double>();
+                    }
+                    if (spec.contains("flags") && spec["flags"].is_number_integer()) {
+                        flags = spec["flags"].get<int>();
+                    }
+                }
+                TreeNode* cellNode = tbl.cell(row, col);
+                TrackedVariable::init(cellNode, tvType, startValue, flags);
+            }
         } catch (const std::exception& e) {
             return returnError("set_cell_failed",
                 "kind=" + outKind + ": " + e.what() +
@@ -7001,19 +6762,7 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
                     ? " (structural kinds require a tree-backed table; Table.cell() throws on bundle-backed tables)"
                     : ""));
         } catch (...) { return returnError("set_cell_failed", "non-std exception."); }
-        if (result.type == VariantType::Number) {
-            double v = static_cast<double>(result);
-            if (v == -1) return returnError("table_not_found", "GlobalTable '" + tableName + "' does not exist.");
-            if (v == -2) {
-                nlohmann::json err;
-                err["error"]   = "index_out_of_range";
-                err["table"]   = tableName;
-                err["row"]     = row;
-                err["col"]     = col;
-                err["message"] = "row/col exceed table dimensions; call resize first.";
-                return returnJson(err);
-            }
-        }
+
         nlohmann::json out;
         out["ok"]         = true;
         out["table"]      = tableName;
@@ -7056,55 +6805,22 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
         // Probe: dispatch on whether the table itself is bundle-backed
         // (DATA_BUNDLE on the table tools node — Table.cell() would throw)
         // or tree-backed (probe per-cell node for kind metadata).
-        std::string script;
-        script += "treenode t = Tools.get(\"GlobalTable\", \"" + fsEscape(tableName) + "\");\n";
-        script += "if (!t) return -1;\n";
-        script += "int nr = Table(\"" + fsEscape(tableName) + "\").numRows;\n";
-        script += "int nc = Table(\"" + fsEscape(tableName) + "\").numCols;\n";
-        script += "if (" + std::to_string(row) + " > nr || " + std::to_string(col) + " > nc) return -2;\n";
-        script += "Map out = Map();\n";
-        script += "if (t.dataType == 6) {\n";  // DATA_BUNDLE on the table itself
-        script += "    out[\"tableBundle\"] = 1;\n";
-        script += "    out[\"value\"] = Table(\"" + fsEscape(tableName) + "\")[" +
-                  std::to_string(row) + "][" + std::to_string(col) + "];\n";
-        script += "} else {\n";
-        script += "    treenode cellNode = Table(\"" + fsEscape(tableName) + "\").cell(" +
-                  std::to_string(row) + ", " + std::to_string(col) + ");\n";
-        script += "    int scrFlag = switch_flexscript(cellNode, -1);\n";
-        script += "    out[\"dt\"]       = cellNode.dataType;\n";
-        script += "    out[\"isScript\"] = scrFlag;\n";
-        script += "    if (cellNode.dataType == 6) {\n";  // DATA_BUNDLE on the cell
-        script += "        out[\"bundleRows\"]   = getbundlenrentries(cellNode);\n";
-        script += "        out[\"bundleFields\"] = getbundlenrfields(cellNode);\n";
-        script += "    } else if (scrFlag == 1) {\n";
-        script += "        out[\"scriptBody\"] = getnodestr(cellNode);\n";
-        script += "    } else {\n";
-        script += "        out[\"value\"] = cellNode.value;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("get_cell_failed", e.what()); }
-          catch (...) { return returnError("get_cell_failed", "non-std exception."); }
-        if (result.type == VariantType::Number) {
-            double v = static_cast<double>(result);
-            if (v == -1) return returnError("table_not_found", "GlobalTable '" + tableName + "' does not exist.");
-            if (v == -2) {
-                nlohmann::json err;
-                err["error"] = "index_out_of_range";
-                err["table"] = tableName;
-                err["row"]   = row;
-                err["col"]   = col;
-                return returnJson(err);
-            }
+        // Native (.1000084 — was executestring). reftable() resolves the table;
+        // a DATA_BUNDLE table exposes only the Variant value (tbl.cell() throws
+        // on it); tree-backed cells are probed for flexscript / bundle / TV.
+        treenode tnode = reftable(tableName.c_str());
+        if (!objectexists(tnode)) {
+            return returnError("table_not_found", "GlobalTable '" + tableName + "' does not exist.");
         }
-        if (result.type != VariantType::Map) {
-            return returnError("get_cell_failed", "script returned wrong type.");
+        Table tbl(tnode);
+        if (row > tbl.numRows || col > tbl.numCols) {
+            nlohmann::json err;
+            err["error"] = "index_out_of_range";
+            err["table"] = tableName;
+            err["row"]   = row;
+            err["col"]   = col;
+            return returnJson(err);
         }
-        Map m = static_cast<Map>(result);
 
         nlohmann::json out;
         out["ok"]    = true;
@@ -7112,12 +6828,10 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
         out["row"]   = row;
         out["col"]   = col;
 
-        // Bundle-backed table: structural metadata unavailable; report
-        // Variant value only and tag the storage.
-        Variant tableBundle = m["tableBundle"];
-        if (tableBundle.type == VariantType::Number &&
-            static_cast<double>(tableBundle) == 1.0) {
-            Variant cell = m["value"];
+        // Bundle-backed table: structural metadata unavailable; report the
+        // Variant value via the subscript (which routes around cell()).
+        if (tnode->dataType == DATA_BUNDLE) {
+            Variant cell = tbl[row][col];
             std::string kind;
             nlohmann::json valueJson = cellVariantToJson(cell, kind);
             out["table_storage"] = "bundle";
@@ -7126,40 +6840,41 @@ modelerai_export Variant ModelerAi_getGlobalTableCell(FLEXSIMINTERFACE)
             return returnJson(out);
         }
 
-        // Tree-backed table: branch on the cell's structural kind.
-        int dt       = static_cast<int>(static_cast<double>(m["dt"]));
-        int isScript = static_cast<int>(static_cast<double>(m["isScript"]));
+        // Tree-backed table: branch on the cell node's structural kind.
         out["table_storage"] = "tree";
+        TreeNode* cellNode = tbl.cell(row, col);
+        int scrFlag = switch_flexscript(cellNode, -1);   // -1 = query flag
+        int dt      = cellNode->dataType;
 
         if (dt == DATA_BUNDLE) {
-            int rows   = static_cast<int>(static_cast<double>(m["bundleRows"]));
-            int fields = static_cast<int>(static_cast<double>(m["bundleFields"]));
             nlohmann::json b;
-            b["row_count"]   = rows;
-            b["field_count"] = fields;
+            b["row_count"]   = getbundlenrentries(cellNode);
+            b["field_count"] = getbundlenrfields(cellNode);
             b["note"]        = "Use FlexSim bundle commands (getbundlevalue, etc.) "
                                "via run_script to read individual cells.";
             out["value_kind"] = "bundle";
             out["value"]      = std::move(b);
-        } else if (isScript == 1) {
-            std::string body = std::string(m["scriptBody"]);
+        } else if (scrFlag == 1) {
             out["value_kind"] = "flexscript";
-            out["value"]      = body;
+            out["value"]      = std::string(cellNode->value);
             out["note"]       = "Value is the raw FlexScript body; not evaluated.";
-        } else if (dt == DATA_SIMPLE) {
-            // TrackedVariable: DATA_SIMPLE on a cell evaluates to a Number.
-            Variant cell = m["value"];
-            std::string kind;
-            nlohmann::json valueJson = cellVariantToJson(cell, kind);
-            out["value_kind"] = "tracked_variable";
-            out["value"]      = std::move(valueJson);
-            out["note"]       = "Reading evaluates the TrackedVariable's current value.";
         } else {
-            Variant cell = m["value"];
-            std::string kind;
-            nlohmann::json valueJson = cellVariantToJson(cell, kind);
-            out["value_kind"] = kind;
-            out["value"]      = std::move(valueJson);
+            Variant cell = cellNode->value;
+            if (dt == DATA_SIMPLE && cell.type == VariantType::Number) {
+                // Genuine TrackedVariable — evaluates to a Number (array cells
+                // also report DATA_SIMPLE, so they fall through; parity with
+                // the get_label fix, 2026-06-13).
+                std::string kind;
+                nlohmann::json valueJson = cellVariantToJson(cell, kind);
+                out["value_kind"] = "tracked_variable";
+                out["value"]      = std::move(valueJson);
+                out["note"]       = "Reading evaluates the TrackedVariable's current value.";
+            } else {
+                std::string kind;
+                nlohmann::json valueJson = cellVariantToJson(cell, kind);
+                out["value_kind"] = kind;
+                out["value"]      = std::move(valueJson);
+            }
         }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_global_table_cell", e.what()); }
@@ -7195,32 +6910,17 @@ modelerai_export Variant ModelerAi_getParameter(FLEXSIMINTERFACE)
             return returnError("missing_name", "Pass { name: \"X\" } or a bare name string.");
         }
 
-        // Probe + read in one go. -1 means parameter doesn't exist.
-        std::string script;
-        script += "Map out = Map();\n";
-        script += "Array allNames = Model.parameters.names();\n";
-        script += "int found = 0;\n";
-        script += "for (int i = 1; i <= allNames.length; i++) {\n";
-        script += "    if (string(allNames[i]) == \"" + fsEscape(name) + "\") { found = 1; break; }\n";
-        script += "}\n";
-        script += "if (!found) return -1;\n";
-        script += "out[\"value\"] = Model.parameters[\"" + fsEscape(name) + "\"].value;\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("get_parameter_failed", e.what()); }
-          catch (...) { return returnError("get_parameter_failed", "non-std exception."); }
-        if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
+        // Native (.1000084 — was executestring). Model::getParameters() is the
+        // native accessor; findNode resolves the parameter node by name (null =
+        // not found); ->value reads the current value (parameters store values,
+        // they don't evaluate code like PMs).
+        Parameters params = Model::getParameters();
+        treenode pNode = params.findNode(name.c_str());
+        if (!objectexists(pNode)) {
             return returnError("parameter_not_found",
                 "No parameter named '" + name + "'. Call modelerai_list_parameters to see what's defined.");
         }
-        if (result.type != VariantType::Map) {
-            return returnError("get_parameter_failed", "script returned wrong type.");
-        }
-        Map m = static_cast<Map>(result);
-        Variant v = m["value"];
+        Variant v = pNode->value;
         nlohmann::json valueJson;
         std::string kind;
         switch (v.type) {
@@ -7277,43 +6977,22 @@ modelerai_export Variant ModelerAi_listParameters(FLEXSIMINTERFACE)
             }
         }
 
-        std::string script;
-        script += "Array tableNames = Model.parameters.tableNames;\n";
-        script += "Array out = Array();\n";
-        script += "for (int t = 1; t <= tableNames.length; t++) {\n";
-        script += "    string tn = string(tableNames[t]);\n";
-        if (!tableFilter.empty()) {
-            script += "    if (tn != \"" + fsEscape(tableFilter) + "\") continue;\n";
-        }
-        script += "    Array names = Model.parameters.names(tn);\n";
-        script += "    for (int i = 1; i <= names.length; i++) {\n";
-        script += "        string nm = string(names[i]);\n";
-        script += "        Map entry = Map();\n";
-        script += "        entry[\"name\"]  = nm;\n";
-        script += "        entry[\"table\"] = tn;\n";
-        script += "        entry[\"value\"] = Model.parameters[nm].value;\n";
-        script += "        out.push(entry);\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("list_parameters_failed", e.what()); }
-          catch (...) { return returnError("list_parameters_failed", "non-std exception."); }
-
+        // Native (.1000084 — was executestring). Model::getParameters() enumerates
+        // tables/names (engine_export); findNode(name)->value reads each value.
+        Parameters paramsAcc = Model::getParameters();
+        Array tableNames = paramsAcc.tableNames;
         nlohmann::json params = nlohmann::json::array();
-        if (result.type == VariantType::Array) {
-            Array a = static_cast<Array>(result);
-            for (int i = 1; i <= a.length; ++i) {
-                Variant ev = a[i];
-                if (ev.type != VariantType::Map) continue;
-                Map m = static_cast<Map>(ev);
+        for (int t = 1; t <= tableNames.length; ++t) {
+            std::string tn = std::string(tableNames[t]);
+            if (!tableFilter.empty() && tn != tableFilter) continue;
+            Array names = paramsAcc.names(tn.c_str());
+            for (int i = 1; i <= names.length; ++i) {
+                std::string nm = std::string(names[i]);
                 nlohmann::json p;
-                p["name"]  = std::string(m["name"]);
-                p["table"] = std::string(m["table"]);
-                Variant val = m["value"];
+                p["name"]  = nm;
+                p["table"] = tn;
+                treenode pNode = paramsAcc.findNode(nm.c_str());
+                Variant val = objectexists(pNode) ? pNode->value : Variant();
                 std::string kind;
                 switch (val.type) {
                     case VariantType::Number: {
@@ -7524,53 +7203,45 @@ modelerai_export Variant ModelerAi_getObjectInfo(FLEXSIMINTERFACE)
             }
         } catch (...) {}
 
-        // Group memberships + label count via a one-shot script.
-        std::string script;
-        script += "Object o = Model.find(\"" + fsEscape(objectName) + "\");\n";
-        script += "Map info = Map();\n";
-        script += "Array groups = Array();\n";
-        script += "treenode tg = model().find(\"Tools/Groups\");\n";
-        script += "if (tg) {\n";
-        script += "    for (int i = 1; i <= tg.subnodes.length; i++) {\n";
-        script += "        treenode g = tg.subnodes[i];\n";
-        script += "        string nm = string(getname(g));\n";
-        script += "        if (Group(nm).isMember(o, 0)) groups.push(nm);\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "info[\"groups\"]      = groups;\n";
-        script += "info[\"label_count\"] = o.labels.length;\n";
-        script += "Array labelNames = Array();\n";
-        script += "for (int i = 1; i <= o.labels.length; i++) {\n";
-        script += "    labelNames.push(string(getname(o.labels[i])));\n";
-        script += "}\n";
-        script += "info[\"label_names\"] = labelNames;\n";
-        script += "info[\"subnode_count\"] = o.subnodes.length;\n";
-        script += "return info;\n";
-
+        // Group memberships — native: walk Tools/Groups and test membership
+        // via Group::global(name)->isMember(). (Was an executestring probe
+        // that died on the LabelsArray compile error below, silently dropping
+        // all four fields.)
         try {
-            Variant infoV = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (infoV.type == VariantType::Map) {
-                Map m = static_cast<Map>(infoV);
-                Variant gV = m["groups"];
-                if (gV.type == VariantType::Array) {
-                    nlohmann::json gjs = nlohmann::json::array();
-                    Array ga = static_cast<Array>(gV);
-                    for (int i = 1; i <= ga.length; ++i) gjs.push_back(std::string(ga[i]));
-                    out["groups"] = std::move(gjs);
+            if (TreeNode* gRoot = model()->find("Tools/Groups")) {
+                nlohmann::json groups = nlohmann::json::array();
+                int gcount = content(gRoot);
+                for (int i = 1; i <= gcount; ++i) {
+                    TreeNode* gNode = rank(gRoot, i);
+                    if (!gNode) continue;
+                    Group* g = gNode->object<Group>();
+                    if (g && g->isMember(obj, 0)) groups.push_back(std::string(getname(gNode)));
                 }
-                out["label_count"]   = (int)static_cast<double>(m["label_count"]);
-                out["subnode_count"] = (int)static_cast<double>(m["subnode_count"]);
-                Variant lV = m["label_names"];
-                if (lV.type == VariantType::Array) {
-                    nlohmann::json ljs = nlohmann::json::array();
-                    Array la = static_cast<Array>(lV);
-                    for (int i = 1; i <= la.length; ++i) ljs.push_back(std::string(la[i]));
-                    out["label_names"] = std::move(ljs);
+                out["groups"] = std::move(groups);
+            }
+        } catch (...) {}
+
+        // Labels — native: walk the labels container node's subnodes as plain
+        // treenodes. This sidesteps the LabelsArray .length/[int] compile error
+        // (Object.labels has no length/index) that broke the old probe.
+        try {
+            TreeNode* labelsNode = labels(obj);
+            nlohmann::json labelNames = nlohmann::json::array();
+            if (objectexists(labelsNode)) {
+                int lcount = content(labelsNode);
+                for (int i = 1; i <= lcount; ++i) {
+                    TreeNode* l = rank(labelsNode, i);
+                    if (l) labelNames.push_back(std::string(getname(l)));
                 }
             }
-        } catch (...) {
-            // soft fail — caller still has the basic info above
-        }
+            out["label_count"] = static_cast<int>(labelNames.size());
+            out["label_names"] = std::move(labelNames);
+        } catch (...) {}
+
+        // Subnode count — native.
+        try {
+            out["subnode_count"] = content(obj);
+        } catch (...) {}
 
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_object_info", e.what()); }
@@ -7581,39 +7252,19 @@ modelerai_export Variant ModelerAi_getObjectInfo(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_listGlobalTables(FLEXSIMINTERFACE)
 {
     try {
-        std::string script;
-        script += "treenode root = model().find(\"Tools/GlobalTables\");\n";
-        script += "Array out = Array();\n";
-        script += "if (root) {\n";
-        script += "    for (int i = 1; i <= root.subnodes.length; i++) {\n";
-        script += "        treenode t = root.subnodes[i];\n";
-        script += "        string nm = string(getname(t));\n";
-        script += "        Map entry = Map();\n";
-        script += "        entry[\"name\"]     = nm;\n";
-        script += "        entry[\"num_rows\"] = Table(nm).numRows;\n";
-        script += "        entry[\"num_cols\"] = Table(nm).numCols;\n";
-        script += "        out.push(entry);\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("list_tables_failed", e.what()); }
-          catch (...) { return returnError("list_tables_failed", "non-std exception."); }
-
+        // Native: walk Tools/GlobalTables subnodes; dims via the name-based
+        // gettablerows/gettablecols free functions (mirror Table(nm).numRows).
         nlohmann::json tables = nlohmann::json::array();
-        if (result.type == VariantType::Array) {
-            Array a = static_cast<Array>(result);
-            for (int i = 1; i <= a.length; ++i) {
-                Variant ev = a[i];
-                if (ev.type != VariantType::Map) continue;
-                Map m = static_cast<Map>(ev);
+        if (TreeNode* root = model()->find("Tools/GlobalTables")) {
+            int n = content(root);
+            for (int i = 1; i <= n; ++i) {
+                TreeNode* t = rank(root, i);
+                if (!t) continue;
+                std::string nm(getname(t));
                 nlohmann::json e;
-                e["name"]     = std::string(m["name"]);
-                e["num_rows"] = (int)static_cast<double>(m["num_rows"]);
-                e["num_cols"] = (int)static_cast<double>(m["num_cols"]);
+                e["name"]     = nm;
+                e["num_rows"] = gettablerows(nm.c_str());
+                e["num_cols"] = gettablecols(nm.c_str());
                 tables.push_back(std::move(e));
             }
         }
@@ -7667,19 +7318,20 @@ Variant deleteToolByName(const Variant& arg,
             std::string("Pass { name: \"X\" } or a bare name string for ") + toolName + ".");
     }
 
-    std::string script;
-    script += "treenode t = Tools.get(\"" + std::string(toolType) + "\", \"" + fsEscape(name) + "\");\n";
-    script += "if (!t) return -1;\n";
-    script += "destroyobject(t);\n";
-    script += "return 1;\n";
-
-    Variant result;
-    try {
-        result = executestring(script.c_str(), nullptr, nullptr, Variant());
-    } catch (const std::exception& e) { return returnError(failCode, e.what()); }
-      catch (...) { return returnError(failCode, "non-std exception."); }
-
-    if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
+    // Native (.1000084 — was executestring). Tools.get(toolType,name) resolves
+    // under Tools/<toolType>s (Groups / GlobalTables); resolve that node by name
+    // and destroyobject it (the fsvisible delete — same path the UI uses).
+    (void)failCode;
+    std::string folder = std::string("Tools/") + toolType + "s";
+    TreeNode* t = nullptr;
+    if (TreeNode* root = model()->find(folder.c_str())) {
+        int n = content(root);
+        for (int i = 1; i <= n; ++i) {
+            TreeNode* c = rank(root, i);
+            if (c && std::string(getname(c)) == name) { t = c; break; }
+        }
+    }
+    if (!objectexists(t)) {
         nlohmann::json err;
         err["ok"]            = false;
         err["error_code"]    = notFoundCode;
@@ -7687,6 +7339,7 @@ Variant deleteToolByName(const Variant& arg,
         err["name"]          = name;
         return returnJson(err);
     }
+    destroyobject(t);
     nlohmann::json out;
     out["ok"]      = true;
     out["deleted"] = true;
@@ -7775,6 +7428,65 @@ modelerai_export Variant ModelerAi_deleteGlobalTable(FLEXSIMINTERFACE)
 // pick name" vs "live coupling to the pick definition".
 // ============================================================================
 // ----------------------------------------------------------------------------
+// Shared native helpers for the trigger tools. enumerateEvents /
+// assertEventWithCode stay as function_s calls (proven event dispatch + the
+// exact scratch-tree shape the walks expect); all the logic is native C++.
+namespace {
+
+// Create a scratch node under MAIN:/project/exec/globals and enumerate obj's
+// events into it (function_s). Returns the scratch — caller destroyobject()s it.
+treenode enumerateEventsScratch(treenode obj, const char* scratchName)
+{
+    treenode globals = node("MAIN:/project/exec/globals");
+    if (!objectexists(globals)) return nullptr;
+    treenode tmp = assertsubnode(globals, scratchName);
+    for (int p = 0; p < 4096 && content(tmp) > 0; ++p) {  // bounded purge of leftovers
+        treenode f = rank(tmp, 1);
+        if (!f) break;
+        destroyobject(f);
+    }
+    function_s(obj, "enumerateEvents", Variant(tmp));
+    return tmp;
+}
+
+struct TriggerMatch {
+    bool        matched = false;
+    std::string header;          // codeHeader of the matched event
+    std::string availableNames;  // comma-joined names of all enumerated events
+    int         enumCount = 0;
+    treenode    storage = nullptr;  // per-instance storage (reference target), null if unset
+};
+
+// Enumerate obj's events, match by name, extract header + reference storage +
+// the available-names list. Destroys the scratch before returning (storage is
+// the coupling target, which lives outside the scratch and survives).
+TriggerMatch matchTrigger(treenode obj, const std::string& triggerName)
+{
+    TriggerMatch m;
+    treenode tmp = enumerateEventsScratch(obj, "__mai_trigger_tmp__");
+    if (!objectexists(tmp)) return m;
+    m.enumCount = content(tmp);
+    for (int i = 1; i <= m.enumCount; ++i) {
+        treenode entry = rank(tmp, i);
+        if (!entry) continue;
+        treenode nameNode = entry->find("name");
+        if (!nameNode) continue;
+        std::string evName = std::string(nameNode->value.toString());
+        if (!m.availableNames.empty()) m.availableNames += ", ";
+        m.availableNames += evName;
+        if (evName == triggerName) {
+            m.matched = true;
+            treenode hdr = entry->find("codeHeader");
+            if (hdr) m.header = std::string(hdr->value.toString());
+            m.storage = couplingTarget(entry->find("reference"));
+        }
+    }
+    destroyobject(tmp);
+    return m;
+}
+
+} // namespace
+
 modelerai_export Variant ModelerAi_setTrigger(FLEXSIMINTERFACE)
 {
     try {
@@ -7827,113 +7539,28 @@ modelerai_export Variant ModelerAi_setTrigger(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        // Build a FlexScript script that does the whole flow in one
-        // shot — enumerate, validate, codeHeader lookup, assertEventWithCode,
-        // write. Mirrors the established pattern in set_label / add_parameter.
-        std::string script;
-
-        // --- find object + create scratch ---
-        // Scratch lives under MAIN:/project/exec/globals (per-process, not
-        // saved with the model). Asserted under a clearly-namespaced name so
-        // a leftover scratch from a previous failed call doesn't leak data.
-        script += "Object obj = Model.find(\"";
-        script += fsEscape(objectName);
-        script += "\");\n";
-        script += "treenode globals = node(\"MAIN:/project/exec/globals\");\n";
-        script += "treenode tmp = globals.subnodes.assert(\"__mai_set_trigger_tmp__\");\n";
-        // Bounded purge — FlexScript has no try/catch, so an unbounded
-        // `while (x.subnodes.length) x.subnodes[1].destroy();` will freeze
-        // the engine if destroy() ever fails to decrement. Cap at 4096 —
-        // any object with that many events is already pathological.
-        script += "for (int __pX = 0; __pX < 4096 && tmp.subnodes.length; __pX++) tmp.subnodes[1].destroy();\n";
-
-        // Enumerate events without a type filter. Earlier we passed `8`
-        // assuming EVENT_TYPE_TRIGGER, but that returned 0 entries in
-        // practice on Source/Queue/Processor — either the constant differs
-        // from 8 in this FlexSim build or `enumerateEvents` interprets the
-        // 4th arg differently than `EVENT_TYPE_*`. The 3-arg form returns
-        // every declared event on the object's class; we match by name
-        // and don't care about its event-type category.
-        script += "function_s(obj, \"enumerateEvents\", tmp);\n";
-
-        // Locate the matching entry; collect available names as a fallback
-        // payload for the not-found case. Scripts ALWAYS return an Array so
-        // executestring never lands in the C++ "expected Array return"
-        // branch — first slot is a status string ("ok" / "not_found").
-        script += "treenode match = 0;\n";
-        script += "string header = \"\";\n";
-        script += "string availableNames = \"\";\n";
-        script += "for (int iX = 1; iX <= tmp.subnodes.length; iX++) {\n";
-        script += "    treenode entry = tmp.subnodes[iX];\n";
-        script += "    treenode nameNode = entry.find(\"name\");\n";
-        script += "    if (!nameNode) continue;\n";
-        script += "    string evName = nameNode.value;\n";
-        script += "    if (availableNames.length) availableNames += \", \";\n";
-        script += "    availableNames += evName;\n";
-        script += "    if (evName == \""; script += fsEscape(triggerName); script += "\") {\n";
-        script += "        match = entry;\n";
-        script += "        treenode hdrNode = entry.find(\"codeHeader\");\n";
-        script += "        if (hdrNode) header = hdrNode.value;\n";
-        script += "    }\n";
-        script += "}\n";
-
-        script += "Array ret = Array();\n";
-        script += "if (!match) {\n";
-        script += "    ret.push(\"not_found\");\n";
-        script += "    ret.push(availableNames);\n";
-        script += "    ret.push(tmp.subnodes.length);\n";
-        script += "    tmp.destroy();\n";
-        script += "    return ret;\n";
-        script += "}\n";
-
-        script += "treenode storage = function_s(obj, \"assertEventWithCode\", \"";
-        script += fsEscape(triggerName);
-        script += "\");\n";
-
-        // codeHeader strings end with \n; just concatenate.
-        script += "string finalCode = header + \"";
-        script += fsEscape(code);
-        script += "\";\n";
-        script += "storage.value = finalCode;\n";
-
-        script += "ret.push(\"ok\");\n";
-        script += "ret.push(nodetopath(storage));\n";
-        script += "ret.push(finalCode);\n";
-        script += "ret.push(header);\n";
-        script += "tmp.destroy();\n";
-        script += "return ret;\n";
-
-        Variant scriptResult;
-        try {
-            scriptResult = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_trigger_failed",
-                "Setting trigger '" + triggerName + "' on '" + objectName +
-                "' threw: " + (e.what() ? e.what() : ""));
-        } catch (...) {
-            return returnError("set_trigger_failed",
-                "Setting trigger '" + triggerName + "' threw a non-std exception.");
-        }
-
-        if (scriptResult.type != VariantType::Array) {
-            return returnError("set_trigger_failed",
-                "Internal: script returned " +
-                std::to_string(static_cast<int>(scriptResult.type)) +
-                " instead of Array. enumerateEvents may have failed on this object.");
-        }
-        Array ret = (Array)scriptResult;
-        std::string status = ret.length >= 1 ? (std::string)(ret[1].toString()) : "";
-        if (status == "not_found") {
-            std::string availableNames = ret.length >= 2 ? (std::string)(ret[2].toString()) : "";
-            int enumCount             = ret.length >= 3 ? static_cast<int>(static_cast<double>(ret[3])) : 0;
+        // Native: enumerate + match (function_s enumerate, C++ logic), then
+        // assert the per-instance storage node and write header + body.
+        TriggerMatch tm = matchTrigger(obj, triggerName);
+        if (!tm.matched) {
             return returnError("trigger_not_found",
                 "Trigger '" + triggerName + "' is not enumerated on this object. "
-                "enumerateEvents returned " + std::to_string(enumCount) + " entries. "
-                "Available: " + availableNames);
+                "enumerateEvents returned " + std::to_string(tm.enumCount) + " entries. "
+                "Available: " + tm.availableNames);
         }
-        std::string storagePath  = ret.length >= 2 ? (std::string)(ret[2].toString()) : "";
-        std::string finalCode    = ret.length >= 3 ? (std::string)(ret[3].toString()) : "";
-        std::string headerOnly   = ret.length >= 4 ? (std::string)(ret[4].toString()) : "";
+        Variant storageV = function_s(obj, "assertEventWithCode", Variant(triggerName.c_str()));
+        treenode storage = (storageV.type == VariantType::TreeNode) ? static_cast<treenode>(storageV) : nullptr;
+        if (!objectexists(storage)) {
+            return returnError("set_trigger_failed",
+                "assertEventWithCode returned no storage node for '" + triggerName + "'.");
+        }
+        // codeHeader strings end with \n; just concatenate the user body.
+        std::string finalCode  = tm.header + code;
+        std::string headerOnly = tm.header;
+        storage->value = Variant(finalCode.c_str());
+        std::string storagePath;
+        const char* sp = nodetomodelpath_cstr(storage, 1);
+        if (sp) storagePath = sp;
 
         nlohmann::json out;
         out["ok"]            = true;
@@ -7995,112 +7622,30 @@ modelerai_export Variant ModelerAi_getTrigger(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        std::string script;
-        script += "Object obj = Model.find(\""; script += fsEscape(objectName); script += "\");\n";
-        script += "treenode globals = node(\"MAIN:/project/exec/globals\");\n";
-        script += "treenode tmp = globals.subnodes.assert(\"__mai_get_trigger_tmp__\");\n";
-        // Bounded purge — FlexScript has no try/catch, so an unbounded
-        // `while (x.subnodes.length) x.subnodes[1].destroy();` will freeze
-        // the engine if destroy() ever fails to decrement. Cap at 4096 —
-        // any object with that many events is already pathological.
-        script += "for (int __pX = 0; __pX < 4096 && tmp.subnodes.length; __pX++) tmp.subnodes[1].destroy();\n";
-        // No type filter — see comment in set_trigger above.
-        script += "function_s(obj, \"enumerateEvents\", tmp);\n";
-
-        script += "treenode match = 0;\n";
-        script += "string header = \"\";\n";
-        script += "string availableNames = \"\";\n";
-        script += "treenode reference = 0;\n";
-        script += "for (int iX = 1; iX <= tmp.subnodes.length; iX++) {\n";
-        script += "    treenode entry = tmp.subnodes[iX];\n";
-        script += "    treenode nameNode = entry.find(\"name\");\n";
-        script += "    if (!nameNode) continue;\n";
-        script += "    string evName = nameNode.value;\n";
-        script += "    if (availableNames.length) availableNames += \", \";\n";
-        script += "    availableNames += evName;\n";
-        script += "    if (evName == \""; script += fsEscape(triggerName); script += "\") {\n";
-        script += "        match = entry;\n";
-        script += "        treenode hdrNode = entry.find(\"codeHeader\");\n";
-        script += "        if (hdrNode) header = hdrNode.value;\n";
-        script += "        reference = entry.find(\"reference\");\n";
-        script += "    }\n";
-        script += "}\n";
-
-        script += "Array ret = Array();\n";
-        script += "if (!match) {\n";
-        script += "    ret.push(\"not_found\");\n";
-        script += "    ret.push(availableNames);\n";
-        script += "    ret.push(tmp.subnodes.length);\n";
-        script += "    tmp.destroy();\n";
-        script += "    return ret;\n";
-        script += "}\n";
-
-        // Coupling: `.value` on a DATA_POINTERCOUPLING node returns the
-        // target node, or nullvar when there's no target.
-        script += "treenode storage = 0;\n";
-        script += "if (reference) storage = reference.value;\n";
-
-        script += "int isSet = 0;\n";
-        script += "string storagePath = \"\";\n";
-        script += "string storedCode = \"\";\n";
-        script += "string userCode = \"\";\n";
-        script += "int headerMatch = 0;\n";
-        script += "if (storage) {\n";
-        script += "    isSet = 1;\n";
-        script += "    storagePath = nodetopath(storage);\n";
-        script += "    storedCode = storage.value;\n";
-        script += "    if (header.length > 0 && storedCode.startsWith(header)) {\n";
-        script += "        headerMatch = 1;\n";
-        script += "        userCode = storedCode.substr(header.length + 1, storedCode.length - header.length);\n";
-        script += "    } else {\n";
-        script += "        userCode = storedCode;\n";
-        script += "    }\n";
-        script += "}\n";
-
-        script += "ret.push(\"ok\");\n";
-        script += "ret.push(isSet);\n";
-        script += "ret.push(storagePath);\n";
-        script += "ret.push(header);\n";
-        script += "ret.push(storedCode);\n";
-        script += "ret.push(userCode);\n";
-        script += "ret.push(headerMatch);\n";
-        script += "tmp.destroy();\n";
-        script += "return ret;\n";
-
-        Variant scriptResult;
-        try {
-            scriptResult = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("get_trigger_failed",
-                "Getting trigger '" + triggerName + "' on '" + objectName + "' threw: " +
-                (e.what() ? e.what() : ""));
-        } catch (...) {
-            return returnError("get_trigger_failed",
-                "Getting trigger '" + triggerName + "' threw a non-std exception.");
-        }
-
-        if (scriptResult.type != VariantType::Array) {
-            return returnError("get_trigger_failed",
-                "Internal: script returned " +
-                std::to_string(static_cast<int>(scriptResult.type)) +
-                " instead of Array.");
-        }
-        Array ret = (Array)scriptResult;
-        std::string status = ret.length >= 1 ? (std::string)(ret[1].toString()) : "";
-        if (status == "not_found") {
-            std::string availableNames = ret.length >= 2 ? (std::string)(ret[2].toString()) : "";
-            int enumCount             = ret.length >= 3 ? static_cast<int>(static_cast<double>(ret[3])) : 0;
+        // Native: enumerate + match, then read the per-instance storage (the
+        // reference coupling target) and strip the codeHeader prefix.
+        TriggerMatch tm = matchTrigger(obj, triggerName);
+        if (!tm.matched) {
             return returnError("trigger_not_found",
                 "Trigger '" + triggerName + "' is not enumerated on this object. "
-                "enumerateEvents returned " + std::to_string(enumCount) + " entries. "
-                "Available: " + availableNames);
+                "enumerateEvents returned " + std::to_string(tm.enumCount) + " entries. "
+                "Available: " + tm.availableNames);
         }
-        int isSet              = ret.length >= 2 ? static_cast<int>(static_cast<double>(ret[2])) : 0;
-        std::string storagePath = ret.length >= 3 ? (std::string)(ret[3].toString()) : "";
-        std::string headerOnly  = ret.length >= 4 ? (std::string)(ret[4].toString()) : "";
-        std::string storedCode  = ret.length >= 5 ? (std::string)(ret[5].toString()) : "";
-        std::string userCode    = ret.length >= 6 ? (std::string)(ret[6].toString()) : "";
-        int headerMatch         = ret.length >= 7 ? static_cast<int>(static_cast<double>(ret[7])) : 0;
+        bool isSet = objectexists(tm.storage);
+        std::string headerOnly = tm.header;
+        std::string storagePath, storedCode, userCode;
+        bool headerMatch = false;
+        if (isSet) {
+            const char* sp = nodetomodelpath_cstr(tm.storage, 1);
+            if (sp) storagePath = sp;
+            storedCode = std::string(tm.storage->value.toString());
+            if (!tm.header.empty() && storedCode.rfind(tm.header, 0) == 0) {
+                headerMatch = true;
+                userCode = storedCode.substr(tm.header.size());
+            } else {
+                userCode = storedCode;
+            }
+        }
 
         nlohmann::json out;
         out["ok"]            = true;
@@ -8168,40 +7713,12 @@ modelerai_export Variant ModelerAi_listTriggers(FLEXSIMINTERFACE)
         // Enumerate to a scratch node, then walk it from C++ — we want
         // per-entry param sub-arrays which is awkward to round-trip as a
         // single FlexScript Array. C++ navigation keeps the structure clean.
-        std::string script;
-        script += "Object obj = Model.find(\""; script += fsEscape(objectName); script += "\");\n";
-        script += "treenode globals = node(\"MAIN:/project/exec/globals\");\n";
-        script += "treenode tmp = globals.subnodes.assert(\"__mai_list_triggers_tmp__\");\n";
-        // Bounded purge — FlexScript has no try/catch, so an unbounded
-        // `while (x.subnodes.length) x.subnodes[1].destroy();` will freeze
-        // the engine if destroy() ever fails to decrement. Cap at 4096 —
-        // any object with that many events is already pathological.
-        script += "for (int __pX = 0; __pX < 4096 && tmp.subnodes.length; __pX++) tmp.subnodes[1].destroy();\n";
-        // No type filter — earlier `, 8)` (assuming EVENT_TYPE_TRIGGER=8)
-        // returned zero entries on every FixedResource. Return everything;
-        // the AI uses event names directly.
-        script += "function_s(obj, \"enumerateEvents\", tmp);\n";
-        script += "return nodetopath(tmp);\n";
-
-        Variant scriptResult;
-        try {
-            scriptResult = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
+        // Native: enumerate the object's events into a scratch node, then walk
+        // it directly below (no nodetopath → re-find bounce).
+        treenode tmp = enumerateEventsScratch(obj, "__mai_list_triggers_tmp__");
+        if (!objectexists(tmp)) {
             return returnError("list_triggers_failed",
-                std::string("enumerateEvents threw: ") + (e.what() ? e.what() : ""));
-        } catch (...) {
-            return returnError("list_triggers_failed",
-                "enumerateEvents threw a non-std exception.");
-        }
-        std::string tmpPath = (std::string)scriptResult.toString();
-        TreeNode* tmp = nullptr;
-        try { tmp = model()->find(tmpPath.c_str()); } catch (...) {}
-        if (!tmp) {
-            try { tmp = node(tmpPath.c_str(), nullptr); } catch (...) {}
-        }
-        if (!tmp) {
-            return returnError("list_triggers_failed",
-                "Could not resolve scratch node at '" + tmpPath + "' after enumeration.");
+                "Could not create/enumerate the scratch node (MAIN:/project/exec/globals missing?).");
         }
 
         nlohmann::json triggers = nlohmann::json::array();
@@ -8350,85 +7867,18 @@ modelerai_export Variant ModelerAi_removeTrigger(FLEXSIMINTERFACE)
                 "Object '" + objectName + "' did not resolve via Model.find.");
         }
 
-        std::string script;
-        script += "Object obj = Model.find(\""; script += fsEscape(objectName); script += "\");\n";
-        script += "treenode globals = node(\"MAIN:/project/exec/globals\");\n";
-        script += "treenode tmp = globals.subnodes.assert(\"__mai_remove_trigger_tmp__\");\n";
-        // Bounded purge — FlexScript has no try/catch, so an unbounded
-        // `while (x.subnodes.length) x.subnodes[1].destroy();` will freeze
-        // the engine if destroy() ever fails to decrement. Cap at 4096 —
-        // any object with that many events is already pathological.
-        script += "for (int __pX = 0; __pX < 4096 && tmp.subnodes.length; __pX++) tmp.subnodes[1].destroy();\n";
-        // No type filter — see set_trigger above.
-        script += "function_s(obj, \"enumerateEvents\", tmp);\n";
-
-        script += "treenode match = 0;\n";
-        script += "string availableNames = \"\";\n";
-        script += "treenode reference = 0;\n";
-        script += "for (int iX = 1; iX <= tmp.subnodes.length; iX++) {\n";
-        script += "    treenode entry = tmp.subnodes[iX];\n";
-        script += "    treenode nameNode = entry.find(\"name\");\n";
-        script += "    if (!nameNode) continue;\n";
-        script += "    string evName = nameNode.value;\n";
-        script += "    if (availableNames.length) availableNames += \", \";\n";
-        script += "    availableNames += evName;\n";
-        script += "    if (evName == \""; script += fsEscape(triggerName); script += "\") {\n";
-        script += "        match = entry;\n";
-        script += "        reference = entry.find(\"reference\");\n";
-        script += "    }\n";
-        script += "}\n";
-
-        script += "Array ret = Array();\n";
-        script += "if (!match) {\n";
-        script += "    ret.push(\"not_found\");\n";
-        script += "    ret.push(availableNames);\n";
-        script += "    ret.push(tmp.subnodes.length);\n";
-        script += "    tmp.destroy();\n";
-        script += "    return ret;\n";
-        script += "}\n";
-
-        script += "treenode storage = 0;\n";
-        script += "if (reference) storage = reference.value;\n";
-        script += "int wasSet = storage ? 1 : 0;\n";
-        script += "int removed = 0;\n";
-        script += "if (storage) { storage.destroy(); removed = 1; }\n";
-
-        script += "ret.push(\"ok\");\n";
-        script += "ret.push(wasSet);\n";
-        script += "ret.push(removed);\n";
-        script += "tmp.destroy();\n";
-        script += "return ret;\n";
-
-        Variant scriptResult;
-        try {
-            scriptResult = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("remove_trigger_failed",
-                "Removing trigger '" + triggerName + "' on '" + objectName + "' threw: " +
-                (e.what() ? e.what() : ""));
-        } catch (...) {
-            return returnError("remove_trigger_failed",
-                "Removing trigger '" + triggerName + "' threw a non-std exception.");
-        }
-
-        if (scriptResult.type != VariantType::Array) {
-            return returnError("remove_trigger_failed",
-                "Internal: script returned " +
-                std::to_string(static_cast<int>(scriptResult.type)) +
-                " instead of Array.");
-        }
-        Array ret = (Array)scriptResult;
-        std::string status = ret.length >= 1 ? (std::string)(ret[1].toString()) : "";
-        if (status == "not_found") {
-            std::string availableNames = ret.length >= 2 ? (std::string)(ret[2].toString()) : "";
-            int enumCount             = ret.length >= 3 ? static_cast<int>(static_cast<double>(ret[3])) : 0;
+        // Native: enumerate + match, then destroy the per-instance storage node
+        // (the reference coupling target) — the inverse of assertEventWithCode.
+        TriggerMatch tm = matchTrigger(obj, triggerName);
+        if (!tm.matched) {
             return returnError("trigger_not_found",
                 "Trigger '" + triggerName + "' is not enumerated on this object. "
-                "enumerateEvents returned " + std::to_string(enumCount) + " entries. "
-                "Available: " + availableNames);
+                "enumerateEvents returned " + std::to_string(tm.enumCount) + " entries. "
+                "Available: " + tm.availableNames);
         }
-        int wasSet  = ret.length >= 2 ? static_cast<int>(static_cast<double>(ret[2])) : 0;
-        int removed = ret.length >= 3 ? static_cast<int>(static_cast<double>(ret[3])) : 0;
+        bool wasSet  = objectexists(tm.storage);
+        bool removed = false;
+        if (wasSet) { destroyobject(tm.storage); removed = true; }
 
         nlohmann::json out;
         out["ok"]      = true;
@@ -8637,113 +8087,121 @@ modelerai_export Variant ModelerAi_createProcessFlow(FLEXSIMINTERFACE)
             else if (kind == "sub_flow") category = "Sub Flow";
         }
 
-        // Build the FlexScript that performs the actual creation.
-        std::ostringstream fs;
-        fs << "treenode pf;\n";
-
-        if (kind == "person") {
-            // Person flow has its own app command that handles toolbox placement.
-            fs << "pf = applicationcommand(\"addPersonFlow\");\n";
+        // Native creation. applicationcommand("addprocessflow", type) does the
+        // WHOLE job — instantiate + toolbox/sidebar registration + type setup
+        // (via its internal postaddprocessflow). type ints from
+        // ProcessFlowDefinitions.h: GENERAL=0, OBJECT=1, SUB_FLOW=3, PERSON=4
+        // (person is NOT a separate addPersonFlow command — that double-created).
+        // We deliberately do NOT register a toolbox coupling ourselves
+        // (addprocessflow already does — doing it twice duplicated the flow) and
+        // do NOT open the view (that's a separate tool now).
+        int pfType = (kind == "object") ? 1 : (kind == "sub_flow") ? 3 : (kind == "person") ? 4 : 0;
+        treenode pf = nullptr;
+        if (!templatePath.empty()) {
+            treenode tmpl = node(templatePath.c_str());
+            Variant v = applicationcommand("loadprocessflowtemplate", Variant(tmpl));
+            if (v.type == VariantType::TreeNode) pf = static_cast<treenode>(v);
         } else {
-            // General / Object / Sub Flow: use the toolbox folder + PF_TYPE_*.
-            fs << "treenode toolsTree = node(\"VIEW:/standardviews/modelingutilities/Toolbox/ToolsTree\");\n";
-            fs << "treenode toolbox = assertsubnode(assertsubnode(node(\"Tools\", model()), \"Toolbox\"), \"ProcessFlow\");\n";
-            fs << "treenode folder = assertsubnode(toolbox, getvarnode(toolsTree, \"PFTypes\").find(\""
-               << fsEscape(category) << "\").value);\n";
-            fs << "switch_expanded(toolbox, 1);\n";
-            fs << "switch_expanded(folder, 1);\n";
+            Variant v = applicationcommand("addprocessflow", Variant((double)pfType));
+            if (v.type == VariantType::TreeNode) pf = static_cast<treenode>(v);
+        }
 
-            if (!templatePath.empty()) {
-                fs << "pf = applicationcommand(\"loadprocessflowtemplate\", node(\""
-                   << fsEscape(templatePath) << "\"));\n";
-            } else {
-                // Map kind to the FlexSim PF_TYPE_* constant.
-                std::string typeConst;
-                if      (kind == "general")  typeConst = "PF_TYPE_GENERAL";
-                else if (kind == "object")   typeConst = "PF_TYPE_OBJECT";
-                else if (kind == "sub_flow") typeConst = "PF_TYPE_SUB_FLOW";
-                fs << "pf = applicationcommand(\"addprocessflow\", " << typeConst << ");\n";
-            }
+        if (!objectexists(pf)) {
+            return returnError("create_failed",
+                "ProcessFlow creation returned no treenode. Possible causes: model "
+                "limit reached, invalid template path, or ProcessFlow module not loaded.");
+        }
 
-            // Attach: general always self-attaches; object attaches to target if given.
-            if (kind == "general") {
-                fs << "if (objectexists(pf)) function_s(pf, \"attachObject\", pf);\n";
-            } else if (kind == "object" && !attachedTo.empty()) {
-                fs << "treenode __target = Model.find(\"" << fsEscape(attachedTo) << "\");\n";
-                fs << "if (objectexists(pf) && objectexists(__target)) "
-                      "function_s(pf, \"attachObject\", __target);\n";
-            }
-
-            // Register the shortcut coupling in the toolbox folder so the
-            // ProcessFlow appears in the sidebar list.
-            fs << "if (objectexists(pf)) {\n";
-            fs << "    nodepoint(nodeadddata(nodeinsertinto(folder), DATATYPE_COUPLING), pf);\n";
-            fs << "}\n";
+        // Attach. A GENERAL flow must be attached to ITSELF to get its runtime
+        // instance (under >stats/instances) — without it the flow has no
+        // instance and the engine treats it like an object flow awaiting an
+        // attachment, so it won't run. addprocessflow does NOT do this for
+        // general (it only attaches when an instanceObject is passed). An
+        // OBJECT flow attaches to its target. Both use the same attachObject
+        // call FlexSim's own addprocessflow uses.
+        if (kind == "general") {
+            function_s(pf, "attachObject", Variant(pf));
+        } else if (kind == "object" && !attachedTo.empty()) {
+            treenode target = model()->find(attachedTo.c_str());
+            if (objectexists(target)) function_s(pf, "attachObject", Variant(target));
         }
 
         // Optional rename.
-        if (!desiredName.empty()) {
-            fs << "if (objectexists(pf)) setname(pf, \"" << fsEscape(desiredName) << "\");\n";
-        }
+        if (!desiredName.empty()) setname(pf, desiredName.c_str());
 
-        // Optional view open.
-        if (openView) {
-            fs << "if (objectexists(pf)) applicationcommand(\"openprocessflowview\", pf);\n";
-        }
-
-        fs << "return pf;\n";
-
-        // Execute.
-        Variant result;
-        try {
-            result = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("create_pf_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("create_pf_failed", "non-std exception during ProcessFlow creation.");
-        }
-
-        if (result.type != VariantType::TreeNode) {
-            return returnError("create_failed",
-                "ProcessFlow creation returned no treenode. "
-                "Possible causes: model limit reached, invalid template path, "
-                "or FlexSim ProcessFlow module not loaded.");
-        }
-        treenode pf = static_cast<treenode>(result);
-        if (!objectexists(pf)) {
-            return returnError("create_failed",
-                "ProcessFlow creation returned a null treenode.");
-        }
-
-        // Build response. We return the path-tail as `name` (rather than
-        // .name, which can collide and lose the `~N` disambiguator). The
-        // agent uses this name verbatim in subsequent tool calls; every PF
-        // tool's lookup parses `~N` to find the right match in storage.
+        // Build response. Path-tail is the canonical name (preserves ~N, which
+        // .name would lose); every PF tool's lookup parses ~N from it.
         nlohmann::json out;
         out["ok"]   = true;
         out["kind"] = kind;
         std::string fullPath;
-        try {
-            const char* p = nodetomodelpath_cstr(pf, 1);
-            if (p) fullPath = p;
-        } catch (...) {}
+        const char* p = nodetomodelpath_cstr(pf, 1);
+        if (p) fullPath = p;
         if (!fullPath.empty()) {
             out["path"] = fullPath;
-            // Extract last path segment as the canonical name.
             size_t lastSlash = fullPath.find_last_of('/');
-            out["name"] = (lastSlash != std::string::npos)
-                ? fullPath.substr(lastSlash + 1)
-                : fullPath;
+            out["name"] = (lastSlash != std::string::npos) ? fullPath.substr(lastSlash + 1) : fullPath;
         } else {
             out["name"] = std::string(getname(pf));
         }
-        if (kind == "object" && !attachedTo.empty()) {
-            out["attached_to"] = attachedTo;
-        }
+        if (kind == "object" && !attachedTo.empty()) out["attached_to"] = attachedTo;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("create_processflow", e.what()); }
       catch (...)                     { return returnException("create_processflow", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_open_processflow_view({ processflow })
+//
+// Opens the ProcessFlow view/window for an existing flow. Separate from
+// create_processflow (which no longer auto-opens a view). Native: resolve the
+// PF storage node by name (~N selects among duplicates), then
+// applicationcommand("openprocessflowview", pf) — a direct C++ call.
+// ============================================================================
+modelerai_export Variant ModelerAi_openProcessFlowView(FLEXSIMINTERFACE)
+{
+    try {
+        std::string pfName = resolveNameArg(param(1), "processflow");
+        if (pfName.empty()) {
+            return returnError("missing_args",
+                "modelerai_open_processflow_view expects { processflow: \"Name\" } "
+                "or a bare name string.");
+        }
+
+        // Resolve the PF storage node (flat list under Tools/ProcessFlow; a
+        // trailing ~N selects the Nth flow of that name).
+        std::string base = pfName;
+        int idx = 1;
+        auto tilde = pfName.rfind('~');
+        if (tilde != std::string::npos) {
+            try { idx = std::stoi(pfName.substr(tilde + 1)); base = pfName.substr(0, tilde); } catch (...) {}
+        }
+        treenode pfStorage = model()->find("Tools/ProcessFlow");
+        treenode pf = nullptr;
+        if (objectexists(pfStorage)) {
+            int seen = 0, n = content(pfStorage);
+            for (int i = 1; i <= n; ++i) {
+                treenode c = rank(pfStorage, i);
+                if (c && std::string(getname(c)) == base && ++seen == idx) { pf = c; break; }
+            }
+        }
+        if (!objectexists(pf)) {
+            return returnError("not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
+        }
+
+        Variant viewV = applicationcommand("openprocessflowview", Variant(pf));
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["processflow"] = pfName;
+        const char* p = nodetomodelpath_cstr(pf, 1);
+        if (p) out["path"] = std::string(p);
+        out["view_opened"] = (viewV.type == VariantType::TreeNode
+                              && objectexists(static_cast<treenode>(viewV)));
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("open_processflow_view", e.what()); }
+      catch (...)                     { return returnException("open_processflow_view", "unknown"); }
 }
 
 // ============================================================================
@@ -8772,78 +8230,40 @@ modelerai_export Variant ModelerAi_listProcessFlows(FLEXSIMINTERFACE)
         // the sub_flow/object/person branches mirror delete_processflow's
         // (which has used them in production) but the non-general branches
         // haven't been independently re-verified post-fix.
-        std::string script;
-        script += "print(\"[ModelerAI] list_processflows: enter\\n\");\n";
-        // ROOT CAUSE (found .1000052): the real bug behind every
-        // Array-returning PF tool was `out[out.length + 1] = row;` — on a
-        // 1-based FlexScript array that's empty (length 0), index 1 is out
-        // of bounds, so the assignment THREW "Array index out of bounds".
-        // executestring swallowed the throw as a generic failure (showing
-        // count:0); a direct applicationcommand surfaced it as a hard throw.
-        // Fix: `out.push(row)`. NEVER a Map-marshaling problem — confirmed
-        // by list_activities (Array<Map>) working with the same push fix,
-        // so list_processflows is back on the clean Array<Map> form.
-        script += "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
-        script += "if (!objectexists(pfStorage)) { print(\"[ModelerAI] list_processflows: /Tools/ProcessFlow node missing — model has no PFs yet\\n\"); return Array(); }\n";
-        script += "print(\"[ModelerAI] list_processflows: walking pfStorage subnodes\\n\");\n";
-        script += "Array out = Array();\n";
-        script += "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-        script += "    treenode pf = pfStorage.subnodes[iP];\n";
-        script += "    if (!objectexists(pf)) continue;\n";
-        script += "    string baseName = string(pf.name);\n";
-        script += "    int priorCount = 0;\n";
-        script += "    for (int iJ = 1; iJ < iP; iJ++) {\n";
-        script += "        if (string(pfStorage.subnodes[iJ].name) == baseName) priorCount = priorCount + 1;\n";
-        script += "    }\n";
-        script += "    string displayName = baseName;\n";
-        script += "    if (priorCount > 0) displayName = baseName + \"~\" + (priorCount + 1);\n";
-        // Kind detection restored at .1000056: the getvarnum path was proven
-        // to work (delete_processflow uses the identical logic and returned
-        // the correct kind in the .1000055 smoke test without throwing). The
-        // earlier stripping was collateral damage from the array-append
-        // misdiagnosis. Same branches as delete_processflow.
-        script += "    string kind = \"general\";\n";
-        script += "    if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
-        script += "    else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
-        script += "    else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
-        script += "    Map row = Map();\n";
-        script += "    row[\"name\"] = displayName;\n";
-        script += "    row[\"kind\"] = kind;\n";
-        script += "    row[\"path\"] = string(nodetomodelpath(pf, 1));\n";
-        script += "    print(\"[ModelerAI] list_processflows: found PF '\" + displayName + \"' kind=\" + kind + \"\\n\");\n";
-        script += "    out.push(row);\n";
-        script += "}\n";
-        script += "print(\"[ModelerAI] list_processflows: returning result array\\n\");\n";
-        script += "return out;\n";
-
+        // Native walk of /Tools/ProcessFlow/* (the storage location for all PFs).
+        // ~N disambiguation for duplicate names; kind via getvarnum detection.
+        treenode pfStorage = node("Tools/ProcessFlow", model());
         nlohmann::json results = nlohmann::json::array();
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Array) {
-                Array a = static_cast<Array>(v);
-                for (int i = 1; i <= a.length; ++i) {
-                    Variant rowV = a[i];
-                    if (rowV.type != VariantType::Map) continue;
-                    Map m = static_cast<Map>(rowV);
-
-                    std::string name, kind, path;
-                    try { name = std::string(m["name"]); } catch (...) {}
-                    try { kind = std::string(m["kind"]); } catch (...) {}
-                    try { path = std::string(m["path"]); } catch (...) {}
-
-                    if (kind.empty()) kind = "unknown";
-
-                    nlohmann::json row;
-                    row["name"] = name;
-                    row["kind"] = kind;
-                    row["path"] = path;
-                    // activity_count omitted — use modelerai_list_activities
-                    // on a specific PF to get its activity list / count.
-                    results.push_back(std::move(row));
+        if (objectexists(pfStorage)) {
+            int n = content(pfStorage);
+            for (int iP = 1; iP <= n; ++iP) {
+                treenode pf = rank(pfStorage, iP);
+                if (!objectexists(pf)) continue;
+                std::string baseName = getname(pf);
+                int priorCount = 0;
+                for (int iJ = 1; iJ < iP; ++iJ) {
+                    treenode prior = rank(pfStorage, iJ);
+                    if (prior && std::string(getname(prior)) == baseName) priorCount++;
                 }
+                std::string displayName = (priorCount > 0)
+                    ? baseName + "~" + std::to_string(priorCount + 1)
+                    : baseName;
+                std::string kind = "general";
+                if (getvarnum(pf, "isSubFlow") == 1) kind = "sub_flow";
+                else if (getvarnum(pf, "isPersonFlow") == 1) kind = "person";
+                else {
+                    treenode attachedObj = getvarnode(pf, "attachedObject");
+                    if (objectexists(attachedObj) && attachedObj != pf) kind = "object";
+                }
+                nlohmann::json row;
+                row["name"] = displayName;
+                row["kind"] = kind;
+                const char* p = nodetomodelpath_cstr(pf, 1);
+                row["path"] = p ? std::string(p) : std::string("");
+                // activity_count omitted — use modelerai_list_activities on a
+                // specific PF to get its activity list / count.
+                results.push_back(std::move(row));
             }
-        } catch (const std::exception& e) {
-            return returnError("list_pf_failed", e.what());
         }
 
         nlohmann::json out;
@@ -8899,58 +8319,65 @@ modelerai_export Variant ModelerAi_deleteProcessFlow(FLEXSIMINTERFACE)
                 "modelerai_delete_processflow requires a name: pass a string or { \"name\": \"...\" }.");
         }
 
-        // FlexScript: scan /Tools/ProcessFlow/* (storage location), find the PF
-        // by name, infer its kind, destroy it (also cleans up any toolbox coupling
-        // if present, best-effort).
-        std::string script = emitPfResolveScript("delete_processflow", name);
-        // Infer kind before destroying.
-        script += "string kind = \"general\";\n";
-        script += "if (getvarnum(pf, \"isSubFlow\") == 1) kind = \"sub_flow\";\n";
-        script += "else if (getvarnum(pf, \"isPersonFlow\") == 1) kind = \"person\";\n";
-        script += "else { treenode attachedObj = getvarnode(pf, \"attachedObject\"); if (objectexists(attachedObj) && attachedObj != pf) kind = \"object\"; }\n";
-        // Best-effort: also remove any toolbox coupling entry pointing to this PF.
-        script += "treenode toolbox = node(\"Tools/Toolbox/ProcessFlow\", model());\n";
-        script += "if (objectexists(toolbox)) {\n";
-        script += "    for (int iF = 1; iF <= toolbox.subnodes.length; iF++) {\n";
-        script += "        treenode folder = toolbox.subnodes[iF];\n";
-        script += "        for (int iC = folder.subnodes.length; iC >= 1; iC--) {\n";
-        script += "            treenode coupling = folder.subnodes[iC];\n";
-        script += "            if (coupling.dataType != DATATYPE_COUPLING) continue;\n";
-        script += "            if (coupling.value == pf) { print(\"[ModelerAI] delete_processflow: removing toolbox coupling\\n\"); coupling.destroy(); }\n";
-        script += "        }\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "pf.destroy();\n";
-        script += "print(\"[ModelerAI] delete_processflow: destroyed — kind=\" + kind + \"\\n\");\n";
-        script += "return kind;\n";
-
-        Variant v;
-        try {
-            v = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("delete_pf_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("delete_pf_failed", "non-std exception.");
+        // Native: resolve the PF under /Tools/ProcessFlow (~N selects among
+        // duplicate names), infer kind, remove any toolbox coupling, destroy.
+        std::string base = name;
+        int idx = 1;
+        auto tilde = name.rfind('~');
+        if (tilde != std::string::npos) {
+            try { idx = std::stoi(name.substr(tilde + 1)); base = name.substr(0, tilde); } catch (...) {}
         }
-
-        std::string kindStr;
-        if (v.type == VariantType::String) kindStr = std::string(v);
-
-        if (kindStr.empty()) {
+        treenode pfStorage = node("Tools/ProcessFlow", model());
+        treenode pf = nullptr;
+        if (objectexists(pfStorage)) {
+            int seen = 0, n = content(pfStorage);
+            for (int i = 1; i <= n; ++i) {
+                treenode c = rank(pfStorage, i);
+                if (c && std::string(getname(c)) == base && ++seen == idx) { pf = c; break; }
+            }
+        }
+        if (!objectexists(pf)) {
             nlohmann::json err;
             err["ok"]            = false;
             err["error_code"]    = "not_found";
-            err["error_message"] = "No ProcessFlow named \"" + name + "\" found under "
-                                   "Tools/ProcessFlow.";
+            err["error_message"] = "No ProcessFlow named \"" + name + "\" found under Tools/ProcessFlow.";
             err["name"]          = name;
             return returnJson(err);
         }
 
+        // Infer kind before destroying.
+        std::string kind = "general";
+        if (getvarnum(pf, "isSubFlow") == 1) kind = "sub_flow";
+        else if (getvarnum(pf, "isPersonFlow") == 1) kind = "person";
+        else {
+            treenode attachedObj = getvarnode(pf, "attachedObject");
+            if (objectexists(attachedObj) && attachedObj != pf) kind = "object";
+        }
+
+        // Best-effort: remove any toolbox coupling entry pointing to this PF.
+        treenode toolbox = node("Tools/Toolbox/ProcessFlow", model());
+        if (objectexists(toolbox)) {
+            int nf = content(toolbox);
+            for (int iF = 1; iF <= nf; ++iF) {
+                treenode folder = rank(toolbox, iF);
+                if (!folder) continue;
+                for (int iC = content(folder); iC >= 1; --iC) {
+                    treenode coupling = rank(folder, iC);
+                    if (!coupling || coupling->dataType != DATATYPE_COUPLING) continue;
+                    Variant cv = coupling->value;
+                    if (cv.type == VariantType::TreeNode && static_cast<treenode>(cv) == pf) {
+                        destroyobject(coupling);
+                    }
+                }
+            }
+        }
+
+        destroyobject(pf);
+
         nlohmann::json out;
         out["ok"]      = true;
         out["name"]    = name;
-        out["kind"]    = kindStr;
+        out["kind"]    = kind;
         out["removed"] = true;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("delete_processflow", e.what()); }
@@ -9023,123 +8450,70 @@ modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
         if (actType.empty()) return returnError("missing_args", "type is required.");
         if (libraryPath.empty()) libraryPath = "processflow/activities";
 
-        // Build FlexScript that opens the view, creates the activity, and
-        // returns the new activity treenode. Error paths use print() + return
-        // null so the C++ side sees "not a treenode" → structured error,
-        // while the user sees the specific cause in System Console.
-        std::ostringstream fs;
+        // Native: resolve the PF + library template, then create the activity via
+        // the ProcessFlow::createObject class method — no view, no executestring.
+        // (createActivity, the view path, ultimately wraps this same method.)
 
-        // 1. Locate the ProcessFlow via /Tools/ProcessFlow/* (storage location).
-        //    NOTE: add_activity returns a treenode (not a string) on success,
-        //    so the resolve script's ERR: string return would be mis-parsed
-        //    by C++ here. Use an inline NULL-return on not-found for
-        //    add_activity specifically, but still leverage the ~N parsing
-        //    by constructing the walk inline using the same logic.
-        fs << "print(\"[ModelerAI] add_activity: enter — pf=" << fsEscape(pfName) << " type=" << fsEscape(actType) << "\\n\");\n";
+        // 1. Resolve the ProcessFlow storage node (~N selects among duplicates).
+        std::string pfBase = pfName;
+        int pfIdx = 1;
         {
-            auto disambig = parseDisambiguatedName(pfName);
-            fs << "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
-            fs << "if (!objectexists(pfStorage)) { print(\"[ModelerAI] add_activity: /Tools/ProcessFlow missing\\n\"); return NULL; }\n";
-            fs << "treenode pf = NULL;\n";
-            fs << "int pfMatchesSoFar = 0;\n";
-            fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-            fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(disambig.base) << "\") {\n";
-            fs << "        pfMatchesSoFar = pfMatchesSoFar + 1;\n";
-            fs << "        if (pfMatchesSoFar == " << disambig.index << ") { pf = pfStorage.subnodes[iP]; break; }\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(pf)) { print(\"[ModelerAI] add_activity: PF '" << fsEscape(pfName) << "' not found\\n\"); return NULL; }\n";
-            fs << "print(\"[ModelerAI] add_activity: found pf at \" + string(nodetomodelpath(pf, 1)) + \"\\n\");\n";
+            auto t = pfName.rfind('~');
+            if (t != std::string::npos) {
+                try { pfIdx = std::stoi(pfName.substr(t + 1)); pfBase = pfName.substr(0, t); } catch (...) {}
+            }
+        }
+        treenode pfStorage = node("Tools/ProcessFlow", model());
+        treenode pf = nullptr;
+        if (objectexists(pfStorage)) {
+            int seen = 0, n = content(pfStorage);
+            for (int i = 1; i <= n; ++i) {
+                treenode c = rank(pfStorage, i);
+                if (c && std::string(getname(c)) == pfBase && ++seen == pfIdx) { pf = c; break; }
+            }
+        }
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
         }
 
-        // 2. Locate the library template.
-        fs << "treenode libPath = library().find(\"" << fsEscape(libraryPath) << "\");\n";
-        fs << "if (!objectexists(libPath)) { print(\"[ModelerAI] add_activity: library_path '" << fsEscape(libraryPath) << "' not found. Try processflow/activities or people/Activities.\\n\"); return NULL; }\n";
-        fs << "treenode libObj = libPath.find(\"" << fsEscape(actType) << "\");\n";
-        fs << "if (!objectexists(libObj)) { print(\"[ModelerAI] add_activity: activity type '" << fsEscape(actType) << "' not found under library_path '" << fsEscape(libraryPath) << "'. Common types: InterArrivalSource, ScheduleSource, DateTimeSource, Delay, Decide, AssignLabels, Sink.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] add_activity: found libObj \" + string(libObj.name) + \"\\n\");\n";
-
-        // 3. Resolve `after` activity if specified (with ~N disambiguation).
-        if (!afterName.empty()) {
-            auto afterDis = parseDisambiguatedName(afterName);
-            fs << "treenode prevActivity = NULL;\n";
-            fs << "int prevMatchesSoFar = 0;\n";
-            fs << "for (int iPrev = 1; iPrev <= pf.subnodes.length; iPrev++) {\n";
-            fs << "    if (string(pf.subnodes[iPrev].name) == \"" << fsEscape(afterDis.base) << "\") {\n";
-            fs << "        prevMatchesSoFar = prevMatchesSoFar + 1;\n";
-            fs << "        if (prevMatchesSoFar == " << afterDis.index << ") { prevActivity = pf.subnodes[iPrev]; break; }\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(prevActivity)) { print(\"[ModelerAI] add_activity: 'after' activity '" << fsEscape(afterName) << "' not found\\n\"); return NULL; }\n";
-            fs << "print(\"[ModelerAI] add_activity: resolved 'after' activity '\" + string(prevActivity.name) + \"'\\n\");\n";
+        // 2. Resolve the library activity template: library()/<libraryPath>/<type>.
+        treenode libPath = library()->find(libraryPath.c_str());
+        if (!objectexists(libPath)) {
+            return returnError("library_path_not_found",
+                "library_path '" + libraryPath + "' not found. Try processflow/activities or people/Activities.");
+        }
+        treenode libObj = libPath->find(actType.c_str());
+        if (!objectexists(libObj)) {
+            return returnError("activity_type_not_found",
+                "activity type '" + actType + "' not found under library_path '" + libraryPath +
+                "'. Common types: InterArrivalSource, ScheduleSource, DateTimeSource, Delay, Decide, AssignLabels, Sink.");
         }
 
-        // 4. Open the ProcessFlowView — required for createActivity to work.
-        //    openprocessflowview is idempotent (safe to call even if already open).
-        fs << "treenode view = applicationcommand(\"openprocessflowview\", pf);\n";
-        fs << "if (!objectexists(view)) { print(\"[ModelerAI] add_activity: openprocessflowview returned null for PF '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] add_activity: view opened\\n\");\n";
-
-        // 5. Create the activity via the view's createActivity callback.
-        //    With `after` arg → auto-positions and stacks visually below the
-        //    predecessor (the 4th arg triggers that placement logic).
-        //    Without `after` → standalone placement at origin.
-        if (!afterName.empty()) {
-            fs << "treenode newActivity = function_s(view, \"createActivity\", getvarnode(view, \"ProcessFlowView\"), libObj, prevActivity);\n";
-        } else {
-            fs << "treenode newActivity = function_s(view, \"createActivity\", getvarnode(view, \"ProcessFlowView\"), libObj);\n";
+        // 3. Create natively via the ProcessFlow::createObject class method.
+        ProcessFlow::ProcessFlow* pfObj = pf->object<ProcessFlow::ProcessFlow>();
+        if (!pfObj) {
+            return returnError("add_activity_failed", "could not obtain the ProcessFlow object from the PF node.");
         }
-        fs << "if (!objectexists(newActivity)) { print(\"[ModelerAI] add_activity: createActivity returned null — view may not be open or library type is invalid.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] add_activity: created activity \" + string(newActivity.name) + \"\\n\");\n";
-
-        // 6. Optional position override.
-        //    In stacked mode the view auto-positions; only override if explicit.
-        if (hasPosition) {
-            fs << "setloc(newActivity, " << posX << ", " << posY << ", 0);\n";
-        }
-
-        // 7. Optional rename.
-        if (!actName.empty()) {
-            fs << "setname(newActivity, \"" << fsEscape(actName) << "\");\n";
-        }
-
-        // 8. Return the new activity treenode (same pattern as createProcessFlow).
-        //    add_activity returns a TreeNode because C++ reads name + path off
-        //    the result below. (Array<Map> returns DO marshal fine through
-        //    executestring — that was a long-standing misdiagnosis; the real
-        //    bug was the array-append throw, since fixed. See list_activities.)
-        fs << "return newActivity;\n";
-
-        Variant v;
+        treenode newActivity = nullptr;
         try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("add_activity_failed",
-                std::string("FlexScript execution threw: ") + e.what()
-                + ". Check System Console for [ModelerAI] diagnostic lines.");
+            newActivity = pfObj->createObject(libObj, nullptr, false);
         } catch (...) {
-            return returnError("add_activity_failed",
-                "non-std exception during add_activity. Check System Console.");
+            return returnError("add_activity_failed", "ProcessFlow::createObject threw.");
         }
-
-        if (v.type != VariantType::TreeNode) {
-            return returnError("add_activity_failed",
-                "FlexScript did not return a treenode. Possible causes: "
-                "processflow not found, library_path/type invalid, "
-                "`after` activity not in this flow. "
-                "Check System Console for [ModelerAI] diagnostic lines.");
-        }
-        treenode newActivity = static_cast<treenode>(v);
         if (!objectexists(newActivity)) {
             return returnError("add_activity_failed",
-                "FlexScript returned a null treenode. "
-                "Check System Console for [ModelerAI] diagnostic lines.");
+                "createObject returned no activity (the library type may be invalid for this flow).");
         }
+
+        // 4. Optional position + rename (native).
+        if (hasPosition) setloc(newActivity, posX, posY, 0);
+        if (!actName.empty()) setname(newActivity, actName.c_str());
 
         std::string newName = std::string(getname(newActivity));
         std::string newPath;
-        try { newPath = nodetomodelpath(newActivity, 1).c_str(); } catch (...) {}
-        std::string connectedTo = afterName;  // empty if not connected
+        const char* np = nodetomodelpath_cstr(newActivity, 1);
+        if (np) newPath = np;
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -9147,7 +8521,12 @@ modelerai_export Variant ModelerAi_addActivity(FLEXSIMINTERFACE)
         out["type"]        = actType;
         out["processflow"] = pfName;
         out["path"]        = newPath;
-        if (!afterName.empty()) out["connected_to"] = afterName;
+        // Native createObject does NOT auto-wire to a predecessor (that was a
+        // view-only feature). If `after` was given, say so explicitly.
+        if (!afterName.empty()) {
+            out["after_note"] = "Native add_activity does not auto-connect; "
+                                "use modelerai_connect_activities to wire " + afterName + " -> " + newName + ".";
+        }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("add_activity", e.what()); }
       catch (...)                     { return returnException("add_activity", "unknown"); }
@@ -9198,87 +8577,42 @@ modelerai_export Variant ModelerAi_connectActivities(FLEXSIMINTERFACE)
         if (fromName.empty()) return returnError("missing_args", "from is required.");
         if (toName.empty())   return returnError("missing_args", "to is required.");
 
-        // Build FlexScript: locate PF, open view, find activities, create connector.
-        std::ostringstream fs;
-
-        // 1. Locate the ProcessFlow + from/to activities (inline because
-        //    connect_activities returns a treenode and ERR: string return
-        //    from the helper would be mis-parsed by C++ — same as add_activity).
-        fs << "print(\"[ModelerAI] connect_activities: enter — pf=" << fsEscape(pfName) << " from=" << fsEscape(fromName) << " to=" << fsEscape(toName) << "\\n\");\n";
-        {
-            auto pfDis    = parseDisambiguatedName(pfName);
-            auto fromDis  = parseDisambiguatedName(fromName);
-            auto toDis    = parseDisambiguatedName(toName);
-            fs << "treenode pfStorage = node(\"Tools/ProcessFlow\", model());\n";
-            fs << "if (!objectexists(pfStorage)) { print(\"[ModelerAI] connect_activities: /Tools/ProcessFlow missing\\n\"); return NULL; }\n";
-            fs << "treenode pf = NULL;\n";
-            fs << "int pfMatchesSoFar = 0;\n";
-            fs << "for (int iP = 1; iP <= pfStorage.subnodes.length; iP++) {\n";
-            fs << "    if (string(pfStorage.subnodes[iP].name) == \"" << fsEscape(pfDis.base) << "\") {\n";
-            fs << "        pfMatchesSoFar = pfMatchesSoFar + 1;\n";
-            fs << "        if (pfMatchesSoFar == " << pfDis.index << ") { pf = pfStorage.subnodes[iP]; break; }\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(pf)) { print(\"[ModelerAI] connect_activities: PF '" << fsEscape(pfName) << "' not found\\n\"); return NULL; }\n";
-
-            // from
-            fs << "treenode fromAct = NULL;\n";
-            fs << "int fromMatchesSoFar = 0;\n";
-            fs << "for (int iFrom = 1; iFrom <= pf.subnodes.length; iFrom++) {\n";
-            fs << "    if (string(pf.subnodes[iFrom].name) == \"" << fsEscape(fromDis.base) << "\") {\n";
-            fs << "        fromMatchesSoFar = fromMatchesSoFar + 1;\n";
-            fs << "        if (fromMatchesSoFar == " << fromDis.index << ") { fromAct = pf.subnodes[iFrom]; break; }\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(fromAct)) { print(\"[ModelerAI] connect_activities: from activity '" << fsEscape(fromName) << "' not found\\n\"); return NULL; }\n";
-
-            // to
-            fs << "treenode toAct = NULL;\n";
-            fs << "int toMatchesSoFar = 0;\n";
-            fs << "for (int iTo = 1; iTo <= pf.subnodes.length; iTo++) {\n";
-            fs << "    if (string(pf.subnodes[iTo].name) == \"" << fsEscape(toDis.base) << "\") {\n";
-            fs << "        toMatchesSoFar = toMatchesSoFar + 1;\n";
-            fs << "        if (toMatchesSoFar == " << toDis.index << ") { toAct = pf.subnodes[iTo]; break; }\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(toAct)) { print(\"[ModelerAI] connect_activities: to activity '" << fsEscape(toName) << "' not found\\n\"); return NULL; }\n";
+        // Native: resolve PF + from/to activities (~N), then wire a connector via
+        // the ProcessFlow::createConnector class method — no view, no executestring.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
+        }
+        treenode fromAct = resolveActivityNode(pf, fromName);
+        if (!objectexists(fromAct)) {
+            return returnError("from_not_found",
+                "from activity '" + fromName + "' not found in ProcessFlow '" + pfName + "'.");
+        }
+        treenode toAct = resolveActivityNode(pf, toName);
+        if (!objectexists(toAct)) {
+            return returnError("to_not_found",
+                "to activity '" + toName + "' not found in ProcessFlow '" + pfName + "'.");
         }
 
-        // 3. Open the view (idempotent) — required for createConnector.
-        fs << "treenode view = applicationcommand(\"openprocessflowview\", pf);\n";
-        fs << "if (!objectexists(view)) { print(\"[ModelerAI] connect_activities: openprocessflowview returned null for PF '" << fsEscape(pfName) << "'.\\n\"); return NULL; }\n";
-        fs << "print(\"[ModelerAI] connect_activities: view opened\\n\");\n";
+        ProcessFlow::ProcessFlow* pfObj = pf->object<ProcessFlow::ProcessFlow>();
+        ProcessFlow::ProcessFlowObject* fromObj = fromAct->object<ProcessFlow::ProcessFlowObject>();
+        ProcessFlow::ProcessFlowObject* toObj   = toAct->object<ProcessFlow::ProcessFlowObject>();
+        if (!pfObj || !fromObj || !toObj) {
+            return returnError("connect_activities_failed",
+                "could not obtain ProcessFlow/activity C++ objects from their nodes.");
+        }
 
-        // 4. Draw the connector arrow.
-        fs << "function_s(pf, \"createConnector\", activedocumentnode(), fromAct, toAct);\n";
-        fs << "print(\"[ModelerAI] connect_activities: connector drawn\\n\");\n";
-
-        // 5. Return the pf treenode as a success signal (TreeNode marshals cleanly).
-        fs << "return pf;\n";
-
-        Variant v;
         try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("connect_activities_failed",
-                std::string("FlexScript execution threw: ") + e.what()
-                + ". Check System Console for [ModelerAI] diagnostic lines.");
+            ProcessFlow::Connector* c = pfObj->createConnector();
+            if (!c) {
+                return returnError("connect_activities_failed", "createConnector returned null.");
+            }
+            c->setFromBlock(fromObj);
+            c->setToBlock(toObj);
+            c->onCreate();
         } catch (...) {
-            return returnError("connect_activities_failed",
-                "non-std exception during connect_activities. Check System Console.");
-        }
-
-        if (v.type != VariantType::TreeNode) {
-            return returnError("connect_activities_failed",
-                "FlexScript did not return a treenode. Possible causes: "
-                "processflow not found, 'from' or 'to' activity not in this flow. "
-                "Check System Console for [ModelerAI] diagnostic lines.");
-        }
-        treenode pfNode = static_cast<treenode>(v);
-        if (!objectexists(pfNode)) {
-            return returnError("connect_activities_failed",
-                "FlexScript returned a null treenode. "
-                "Check System Console for [ModelerAI] diagnostic lines.");
+            return returnError("connect_activities_failed", "ProcessFlow::createConnector wiring threw.");
         }
 
         nlohmann::json out;
@@ -9327,35 +8661,18 @@ modelerai_export Variant ModelerAi_deleteActivity(FLEXSIMINTERFACE)
         if (pfName.empty())  return returnError("missing_args", "processflow is required.");
         if (actName.empty()) return returnError("missing_args", "activity is required.");
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("delete_activity", pfName);
-        fs << emitActivityResolveScript("delete_activity", actName, "activity", pfName, "iAct");
-        fs << "print(\"[ModelerAI] delete_activity: destroying activity '\" + string(activity.name) + \"'\\n\");\n";
-        fs << "activity.destroy();\n";
-        fs << "print(\"[ModelerAI] delete_activity: done\\n\");\n";
-        fs << "return \"ok\";\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("delete_activity_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("delete_activity_failed", "non-std exception during delete_activity.");
+        // Native: resolve PF + activity (~N), destroy. No executestring.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
         }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                std::string rest = s.substr(4);
-                auto sep = rest.find(':');
-                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "delete_activity_failed";
-                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
-                return returnError(code.c_str(), msg);
-            }
-            // "ok" string = success
+        treenode activity = resolveActivityNode(pf, actName);
+        if (!objectexists(activity)) {
+            return returnError("activity_not_found",
+                "Activity '" + actName + "' not found in ProcessFlow '" + pfName + "'.");
         }
+        destroyobject(activity);
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -9638,87 +8955,56 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
         if (actName.empty()) return returnError("missing_args", "activity is required.");
         if (varName.empty()) return returnError("missing_args", "variable is required.");
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("set_activity_variable", pfName);
-        fs << emitActivityResolveScript("set_activity_variable", actName, "activity", pfName, "iAct");
-        fs << "print(\"[ModelerAI] set_activity_variable: found activity '\" + string(activity.name) + \"'\\n\");\n";
+        // Native (.1000084 — was executestring). Resolve PF + activity, then apply
+        // the typed value via fsvisible var/node primitives.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "No ProcessFlow named \"" + pfName + "\" found.");
+        }
+        treenode activity = resolveActivityNode(pf, actName);
+        if (!objectexists(activity)) {
+            return returnError("activity_not_found",
+                "Activity \"" + actName + "\" not found in ProcessFlow \"" + pfName + "\".");
+        }
 
-        // Apply the value.
         if (valueKind == "number") {
-            std::ostringstream numStr;
-            numStr << numValue;
-            fs << "setvarnum(activity, \"" << fsEscape(varName) << "\", " << numStr.str() << ");\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set number " << numStr.str() << " on '\" + string(activity.name) + \"'\\n\");\n";
-        } else if (valueKind == "string") {
-            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = \""
-               << fsEscape(strValue) << "\";\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set string value on '\" + string(activity.name) + \"'\\n\");\n";
-        } else if (valueKind == "ref") {
-            // Resolve the sibling activity via the shared helper so `~N`
-            // disambiguation works (a plain first-match would silently bind
-            // to the wrong activity when two share a base name). The helper
-            // emits `return "ERR:...";` on miss — fine, this tool returns
-            // strings. Reuses `activity`-scope `pf`; result var `refActivity`.
-            fs << emitActivityResolveScript("set_activity_variable", refName, "refActivity", pfName, "iRef");
-            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refActivity;\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set ref to '\" + string(refActivity.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
-        } else if (valueKind == "ref_pf") {
-            // Locate the referenced ProcessFlow via /Tools/ProcessFlow/* storage.
-            fs << "treenode refPf = NULL;\n";
-            fs << "for (int jP = 1; jP <= pfStorage.subnodes.length; jP++) {\n";
-            fs << "    if (string(pfStorage.subnodes[jP].name) == \"" << fsEscape(refPfName) << "\") {\n";
-            fs << "        refPf = pfStorage.subnodes[jP];\n";
-            fs << "        break;\n";
-            fs << "    }\n";
-            fs << "}\n";
-            fs << "if (!objectexists(refPf)) { print(\"[ModelerAI] set_activity_variable: ref_pf '" << fsEscape(refPfName) << "' not found.\\n\"); return \"ERR:ref_pf_not_found:ProcessFlow \\\"" << fsEscape(refPfName) << "\\\" not found under Tools/ProcessFlow.\";\n }\n";
-            fs << "getvarnode(activity, \"" << fsEscape(varName) << "\").value = refPf;\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set ref_pf to '\" + string(refPf.name) + \"' on '\" + string(activity.name) + \"'\\n\");\n";
-        } else if (valueKind == "model_object") {
-            // Pointer-to-model-object mode: make the variable node a COUPLING
-            // pointing at Model.find(name). Right shape for `destination`,
-            // `objectRef`, `assignTo` etc. when targeting a specific
-            // existing object.
-            fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
-            fs << "treenode targetObj = Model.find(\"" << fsEscape(modelObjName) << "\");\n";
-            fs << "if (!objectexists(targetObj)) { print(\"[ModelerAI] set_activity_variable: Model.find('" << fsEscape(modelObjName) << "') returned NULL\\n\"); return \"ERR:model_object_not_found:Model object \\\"" << fsEscape(modelObjName) << "\\\" not found.\"; }\n";
-            fs << "nodeadddata(varNode, DATATYPE_COUPLING);\n";
-            fs << "nodepoint(varNode, targetObj);\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set model_object pointer to '" << fsEscape(modelObjName) << "'\\n\");\n";
-        } else if (valueKind == "flexscript") {
-            // Force FlexScript-mode: store the body as a string and mark the
-            // node as a flexscript node so the engine compiles + evaluates
-            // on read. Without switch_flexscript+buildnodeflexscript, the
-            // engine would treat the body as a literal string (the bug
-            // that produced labels carrying `"return time();"` verbatim).
-            fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
-            fs << "varNode.value = \"" << fsEscape(flexBody) << "\";\n";
-            fs << "switch_flexscript(varNode, 1);\n";
-            fs << "buildnodeflexscript(varNode);\n";
-            fs << "print(\"[ModelerAI] set_activity_variable: set flexscript body on '\" + string(activity.name) + \"'\\n\");\n";
-        }
-
-        fs << "print(\"[ModelerAI] set_activity_variable: done\\n\");\n";
-        fs << "return \"ok\";\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_var_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("set_var_failed", "non-std exception during set_activity_variable.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                std::string rest = s.substr(4);
-                auto sep = rest.find(':');
-                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "set_var_failed";
-                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
-                return returnError(code.c_str(), msg);
+            setvarnum(activity, varName.c_str(), numValue);
+        } else {
+            // All other kinds write through the variable node.
+            treenode varNode = getvarnode(activity, varName.c_str());
+            if (!objectexists(varNode)) {
+                return returnError("variable_not_found",
+                    "Variable \"" + varName + "\" not found on activity \"" + actName + "\".");
+            }
+            if (valueKind == "string") {
+                varNode->value = Variant(strValue.c_str());
+            } else if (valueKind == "ref") {
+                treenode refActivity = resolveActivityNode(pf, refName);
+                if (!objectexists(refActivity)) {
+                    return returnError("activity_not_found",
+                        "Referenced activity \"" + refName + "\" not found in ProcessFlow \"" + pfName + "\".");
+                }
+                varNode->value = Variant(refActivity);
+            } else if (valueKind == "ref_pf") {
+                treenode refPf = resolvePfNode(refPfName);
+                if (!objectexists(refPf)) {
+                    return returnError("ref_pf_not_found",
+                        "ProcessFlow \"" + refPfName + "\" not found under Tools/ProcessFlow.");
+                }
+                varNode->value = Variant(refPf);
+            } else if (valueKind == "model_object") {
+                treenode targetObj = model()->find(modelObjName.c_str());
+                if (!objectexists(targetObj)) {
+                    return returnError("model_object_not_found",
+                        "Model object \"" + modelObjName + "\" not found.");
+                }
+                nodeadddata(varNode, DATATYPE_COUPLING);
+                nodepoint(varNode, targetObj);
+            } else if (valueKind == "flexscript") {
+                varNode->value = Variant(flexBody.c_str());
+                switch_flexscript(varNode, 1);
+                buildnodeflexscript(varNode);
             }
         }
 
@@ -9752,61 +9038,29 @@ modelerai_export Variant ModelerAi_listActivities(FLEXSIMINTERFACE)
                 "pass a string or { \"processflow\": \"...\" }.");
         }
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("list_activities", pfName);
-        fs << "Array out = Array();\n";
-        // Each direct subnode of a PF is either an activity or a container
-        // node like 'variables'/'connectors' on the PF itself. Real activities
-        // resolve to a class treenode under .../library/processflow/activities
-        // (or people/Activities). Bookkeeping subnodes have no classobject().
-        // The class node's name is the class name (e.g. "InterArrivalSource").
-        fs << "for (int iA = 1; iA <= pf.subnodes.length; iA++) {\n";
-        fs << "    treenode a = pf.subnodes[iA];\n";
-        fs << "    if (!objectexists(a)) continue;\n";
-        fs << "    treenode clsNode = classobject(a);\n";
-        fs << "    if (!objectexists(clsNode)) continue;\n";
-        fs << "    string cls = string(clsNode.name);\n";
-        fs << "    if (cls == \"\") continue;\n";
-        fs << "    Map row = Map();\n";
-        fs << "    row[\"name\"]  = string(a.name);\n";
-        fs << "    row[\"class\"] = cls;\n";
-        fs << "    row[\"path\"]  = string(nodetomodelpath(a, 1));\n";
-        fs << "    out.push(row);\n";
-        fs << "}\n";
-        fs << "print(\"[ModelerAI] list_activities: returning result array\\n\");\n";
-        fs << "return out;\n";
-
+        // Native: resolve the PF (~N), walk its direct subnodes. Real activities
+        // have a classobject (bookkeeping subnodes like variables/connectors
+        // don't); the class node's name is the activity class.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
+        }
         nlohmann::json activities = nlohmann::json::array();
-        try {
-            Variant v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-            // emitPfResolveScript returns "ERR:..." on PF-not-found; surface that.
-            if (v.type == VariantType::String) {
-                std::string s = std::string(v);
-                if (s.rfind("ERR:", 0) == 0) {
-                    auto err = parseErrString(s, "list_activities_failed");
-                    return returnError(err["code"].get<std::string>().c_str(),
-                                       err["msg"].get<std::string>());
-                }
-            }
-            if (v.type == VariantType::Array) {
-                Array a = static_cast<Array>(v);
-                for (int i = 1; i <= a.length; ++i) {
-                    Variant rowV = a[i];
-                    if (rowV.type != VariantType::Map) continue;
-                    Map m = static_cast<Map>(rowV);
-                    std::string name, cls, path;
-                    try { name = std::string(m["name"]); }  catch (...) {}
-                    try { cls  = std::string(m["class"]); } catch (...) {}
-                    try { path = std::string(m["path"]); }  catch (...) {}
-                    nlohmann::json row;
-                    row["name"]  = name;
-                    row["class"] = cls;
-                    row["path"]  = path;
-                    activities.push_back(std::move(row));
-                }
-            }
-        } catch (const std::exception& e) {
-            return returnError("list_activities_failed", e.what());
+        int n = content(pf);
+        for (int iA = 1; iA <= n; ++iA) {
+            treenode a = rank(pf, iA);
+            if (!objectexists(a)) continue;
+            treenode clsNode = classobject(a);
+            if (!objectexists(clsNode)) continue;
+            std::string cls(getname(clsNode));
+            if (cls.empty()) continue;
+            nlohmann::json row;
+            row["name"]  = std::string(getname(a));
+            row["class"] = cls;
+            const char* p = nodetomodelpath_cstr(a, 1);
+            row["path"]  = p ? std::string(p) : std::string("");
+            activities.push_back(std::move(row));
         }
 
         nlohmann::json out;
@@ -9851,75 +9105,33 @@ modelerai_export Variant ModelerAi_getActivityInfo(FLEXSIMINTERFACE)
         if (pfName.empty())  return returnError("missing_args", "processflow is required.");
         if (actName.empty()) return returnError("missing_args", "activity is required.");
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("get_activity_info", pfName);
-        fs << emitActivityResolveScript("get_activity_info", actName, "activity", pfName, "iAct");
-        fs << "print(\"[ModelerAI] get_activity_info: found activity at \" + string(nodetomodelpath(activity, 1)) + \"\\n\");\n";
-        // Returns just name/class/path. The earlier inline >variables
-        // enumeration was dropped at .1000046 (it failed back through
-        // executestring — almost certainly the same array-append throw, since
-        // fixed, but never re-attempted). For valid variable names per class,
-        // the agent reads KNOWLEDGE/topics/modelerai/processflow-activity-
-        // variables.md. If per-instance enumeration is wanted later, re-add a
-        // >variables walk using out.push() (the append idiom that was the bug).
-        fs << "Array out = Array();\n";
-        fs << "Map row = Map();\n";
-        fs << "row[\"name\"] = string(activity.name);\n";
-        fs << "treenode clsNode = classobject(activity);\n";
-        fs << "string clsName = \"\";\n";
-        fs << "if (objectexists(clsNode)) clsName = string(clsNode.name);\n";
-        fs << "row[\"class\"] = clsName;\n";
-        fs << "row[\"path\"] = string(nodetomodelpath(activity, 1));\n";
-        fs << "out.push(row);\n";
-        fs << "print(\"[ModelerAI] get_activity_info: done\\n\");\n";
-        fs << "return out;\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("get_activity_info_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("get_activity_info_failed", "non-std exception during get_activity_info.");
+        // Native: resolve PF + activity (~N), read name/class/path. (The earlier
+        // getactivity() linkage probe is removed now that the native PF pipeline
+        // is established.) For per-class variable names see
+        // KNOWLEDGE/topics/modelerai/processflow-activity-variables.md.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "ProcessFlow '" + pfName + "' not found under Tools/ProcessFlow.");
         }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                std::string rest = s.substr(4);
-                auto sep = rest.find(':');
-                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "get_activity_info_failed";
-                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
-                return returnError(code.c_str(), msg);
-            }
+        treenode activity = resolveActivityNode(pf, actName);
+        if (!objectexists(activity)) {
+            return returnError("activity_not_found",
+                "Activity '" + actName + "' not found in ProcessFlow '" + pfName + "'.");
         }
-        if (v.type != VariantType::Array) {
-            return returnError("get_activity_info_failed",
-                "FlexScript did not return an Array. Check System Console for [ModelerAI] diagnostics.");
-        }
-        Array a = static_cast<Array>(v);
-        if (a.length < 1) {
-            return returnError("get_activity_info_failed", "Empty result array.");
-        }
-        Variant rowV = a[1];
-        if (rowV.type != VariantType::Map) {
-            return returnError("get_activity_info_failed", "Row is not a Map.");
-        }
-        Map m = static_cast<Map>(rowV);
-        std::string actNameOut, cls, path;
-        try { actNameOut = std::string(m["name"]);  } catch (...) {}
-        try { cls        = std::string(m["class"]); } catch (...) {}
-        try { path       = std::string(m["path"]);  } catch (...) {}
+        std::string cls;
+        treenode clsNode = classobject(activity);
+        if (objectexists(clsNode)) cls = std::string(getname(clsNode));
+        std::string path;
+        const char* ap = nodetomodelpath_cstr(activity, 1);
+        if (ap) path = ap;
 
         nlohmann::json out;
         out["ok"]          = true;
         out["processflow"] = pfName;
-        out["activity"]    = actNameOut;
+        out["activity"]    = std::string(getname(activity));
         out["class"]       = cls;
         out["path"]        = path;
-        // No `variables` field — see processflow-activity-variables.md for the
-        // per-class variable list.
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_activity_info", e.what()); }
       catch (...)                     { return returnException("get_activity_info", "unknown"); }
@@ -9963,104 +9175,60 @@ modelerai_export Variant ModelerAi_getActivityVariable(FLEXSIMINTERFACE)
         if (actName.empty()) return returnError("missing_args", "activity is required.");
         if (varName.empty()) return returnError("missing_args", "variable is required.");
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("get_activity_variable", pfName);
-        fs << emitActivityResolveScript("get_activity_variable", actName, "activity", pfName, "iAct");
-        fs << "treenode varNode = getvarnode(activity, \"" << fsEscape(varName) << "\");\n";
-        fs << "if (!objectexists(varNode)) { print(\"[ModelerAI] get_activity_variable: variable '" << fsEscape(varName) << "' not found on '\" + string(activity.name) + \"'\\n\"); return \"ERR:variable_not_found:Variable \\\"" << fsEscape(varName) << "\\\" not found on activity \\\"" << fsEscape(actName) << "\\\".\"; }\n";
+        // Native (.1000084 — was executestring). Resolve PF + activity + var node,
+        // classify by datatype (1=number, 2=string, 3=node/coupling). For a
+        // coupling, resolve the target and detect sibling-activity (ref) vs
+        // sibling-ProcessFlow (ref_pf) vs some other node (path).
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found",
+                "No ProcessFlow named \"" + pfName + "\" found.");
+        }
+        treenode activity = resolveActivityNode(pf, actName);
+        if (!objectexists(activity)) {
+            return returnError("activity_not_found",
+                "Activity \"" + actName + "\" not found in ProcessFlow \"" + pfName + "\".");
+        }
+        treenode varNode = getvarnode(activity, varName.c_str());
+        if (!objectexists(varNode)) {
+            return returnError("variable_not_found",
+                "Variable \"" + varName + "\" not found on activity \"" + actName + "\".");
+        }
+        treenode pfStorage = node("Tools/ProcessFlow", model());
 
-        // Inspect the variable node's datatype to determine its kind.
-        // FlexSim datatype constants: 1=NUMBER, 2=STRING, 3=NODE (coupling).
-        // For coupling, resolve where it points and detect whether the
-        // target is a sibling activity (ref) or a sibling ProcessFlow (ref_pf).
-        fs << "Array out = Array();\n";
-        fs << "Map row = Map();\n";
-        fs << "int dt = getdatatype(varNode);\n";
-        fs << "print(\"[ModelerAI] get_activity_variable: inspecting datatype\\n\");\n";
-        fs << "if (dt == 1) {\n";
-        fs << "    row[\"kind\"]      = \"number\";\n";
-        fs << "    row[\"value_num\"] = getvarnum(activity, \"" << fsEscape(varName) << "\");\n";
-        fs << "    row[\"value_str\"] = \"\";\n";
-        fs << "} else if (dt == 2) {\n";
-        fs << "    row[\"kind\"]      = \"string\";\n";
-        fs << "    row[\"value_num\"] = 0;\n";
-        fs << "    row[\"value_str\"] = string(varNode.value);\n";
-        fs << "} else if (dt == 3) {\n";
-        fs << "    treenode target = varNode.value;\n";
-        fs << "    if (!objectexists(target)) {\n";
-        fs << "        row[\"kind\"]      = \"unknown\";\n";
-        fs << "        row[\"value_num\"] = 0;\n";
-        fs << "        row[\"value_str\"] = \"\";\n";
-        fs << "    } else {\n";
-        // Is the target a sibling activity in this PF?
-        fs << "        treenode parent = up(target);\n";
-        fs << "        if (objectexists(parent) && parent == pf) {\n";
-        fs << "            row[\"kind\"]      = \"ref\";\n";
-        fs << "            row[\"value_num\"] = 0;\n";
-        fs << "            row[\"value_str\"] = string(target.name);\n";
-        fs << "        } else if (objectexists(parent) && parent == pfStorage) {\n";
-        // Target is another ProcessFlow (parent == /Tools/ProcessFlow).
-        fs << "            row[\"kind\"]      = \"ref_pf\";\n";
-        fs << "            row[\"value_num\"] = 0;\n";
-        fs << "            row[\"value_str\"] = string(target.name);\n";
-        fs << "        } else {\n";
-        // Some other treenode — return its path so the agent has something
-        // to work with.
-        fs << "            row[\"kind\"]      = \"node\";\n";
-        fs << "            row[\"value_num\"] = 0;\n";
-        fs << "            row[\"value_str\"] = string(nodetomodelpath(target, 1));\n";
-        fs << "        }\n";
-        fs << "    }\n";
-        fs << "} else {\n";
-        fs << "    row[\"kind\"]      = \"unknown\";\n";
-        fs << "    row[\"value_num\"] = 0;\n";
-        fs << "    row[\"value_str\"] = string(varNode.value);\n";
-        fs << "}\n";
-        fs << "out.push(row);\n";
-        fs << "print(\"[ModelerAI] get_activity_variable: done\\n\");\n";
-        fs << "return out;\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("get_activity_variable_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("get_activity_variable_failed", "non-std exception during get_activity_variable.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                std::string rest = s.substr(4);
-                auto sep = rest.find(':');
-                std::string code = (sep != std::string::npos) ? rest.substr(0, sep) : "get_activity_variable_failed";
-                std::string msg  = (sep != std::string::npos) ? rest.substr(sep + 1) : rest;
-                return returnError(code.c_str(), msg);
-            }
-        }
-        if (v.type != VariantType::Array) {
-            return returnError("get_activity_variable_failed",
-                "FlexScript did not return an Array. Check System Console for [ModelerAI] diagnostics.");
-        }
-        Array a = static_cast<Array>(v);
-        if (a.length < 1) {
-            return returnError("get_activity_variable_failed", "Empty result array.");
-        }
-        Variant rowV = a[1];
-        if (rowV.type != VariantType::Map) {
-            return returnError("get_activity_variable_failed", "Row is not a Map.");
-        }
-        Map m = static_cast<Map>(rowV);
         std::string kind, valStr;
         double valNum = 0.0;
-        try { kind   = std::string(m["kind"]); }      catch (...) {}
-        try { valStr = std::string(m["value_str"]); } catch (...) {}
-        try {
-            Variant nv = m["value_num"];
-            if (nv.type == VariantType::Number) valNum = static_cast<double>(nv);
-        } catch (...) {}
+        int dt = getdatatype(varNode);
+        if (dt == 1) {
+            kind   = "number";
+            valNum = getvarnum(activity, varName.c_str());
+        } else if (dt == 2) {
+            kind   = "string";
+            valStr = std::string(varNode->value);
+        } else if (dt == 3) {
+            Variant tv = varNode->value;
+            treenode target = (tv.type == VariantType::TreeNode) ? static_cast<treenode>(tv) : nullptr;
+            if (!objectexists(target)) {
+                kind = "unknown";
+            } else {
+                treenode parent = target->up;
+                if (objectexists(parent) && parent == pf) {
+                    kind   = "ref";
+                    valStr = std::string(getname(target));
+                } else if (objectexists(parent) && parent == pfStorage) {
+                    kind   = "ref_pf";
+                    valStr = std::string(getname(target));
+                } else {
+                    kind = "node";
+                    const char* p = nodetomodelpath_cstr(target, 1);
+                    valStr = p ? std::string(p) : std::string("");
+                }
+            }
+        } else {
+            kind = "unknown";
+            Variant cv = varNode->value;
+            if (cv.type == VariantType::String) valStr = std::string(cv);
+        }
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -10165,6 +9333,38 @@ nlohmann::json parseErrString(const std::string& s, const char* defaultCode)
     return err;
 }
 
+// Native equivalent of emitActivityTableResolveScript (.1000084+ migration):
+// resolve pf → activity → the variable's table/var node, with no executestring.
+// Returns the var node, or nullptr with errCode/errMsg filled. A leading '>' in
+// varName means a hidden subnode (activity.find); otherwise a bound variable
+// (getvarnode).
+TreeNode* resolveActivityVarNode(const std::string& pfName, const std::string& actName,
+                                 const std::string& varName,
+                                 std::string& errCode, std::string& errMsg)
+{
+    treenode pf = resolvePfNode(pfName);
+    if (!objectexists(pf)) {
+        errCode = "processflow_not_found";
+        errMsg  = "No ProcessFlow named \"" + pfName + "\" found.";
+        return nullptr;
+    }
+    treenode activity = resolveActivityNode(pf, actName);
+    if (!objectexists(activity)) {
+        errCode = "activity_not_found";
+        errMsg  = "Activity \"" + actName + "\" not found in ProcessFlow \"" + pfName + "\".";
+        return nullptr;
+    }
+    treenode varNode = nullptr;
+    if (!varName.empty() && varName[0] == '>') varNode = activity->find(varName.c_str());
+    else                                       varNode = getvarnode(activity, varName.c_str());
+    if (!objectexists(varNode)) {
+        errCode = "variable_not_found";
+        errMsg  = "Variable \"" + varName + "\" not found on activity \"" + actName + "\".";
+        return nullptr;
+    }
+    return varNode;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -10214,44 +9414,32 @@ modelerai_export Variant ModelerAi_setActivityTableCell(FLEXSIMINTERFACE)
         if (varName.empty()) return returnError("missing_args", "variable is required.");
         if (row < 1 || col < 1) return returnError("bad_index", "row and col are 1-indexed (>= 1).");
 
-        std::ostringstream fs;
-        fs << emitActivityTableResolveScript("set_activity_table_cell", pfName, actName, varName);
+        // Native (.1000084 — was executestring). Resolve the table node, cast to
+        // Table, auto-grow, then write the cell via cell()->value (the proven
+        // VariantLValue path) / switch_flexscript / nodepoint.
+        std::string errCode, errMsg;
+        TreeNode* tblNode = resolveActivityVarNode(pfName, actName, varName, errCode, errMsg);
+        if (!tblNode) return returnError(errCode.c_str(), errMsg);
 
-        // Cast to Table.
-        fs << "Table tbl = tblNode;\n";
-
-        // Auto-grow: if the cell coordinate exceeds the current table size,
-        // resize first. Otherwise the cell write would silently land out of
-        // bounds. We grow the table to max(currentSize, requested) so we never
-        // shrink existing data.
-        fs << "int curRows = tbl.numRows;\n";
-        fs << "int curCols = tbl.numCols;\n";
-        fs << "int needRows = " << row << ";\n";
-        fs << "int needCols = " << col << ";\n";
-        fs << "int newRows = curRows;\n";
-        fs << "int newCols = curCols;\n";
-        fs << "if (needRows > newRows) newRows = needRows;\n";
-        fs << "if (needCols > newCols) newCols = needCols;\n";
-        fs << "if (newRows != curRows || newCols != curCols) {\n";
-        fs << "    tbl.setSize(newRows, newCols);\n";
-        fs << "    print(\"[ModelerAI] set_activity_table_cell: auto-grew table to fit cell\\n\");\n";
-        fs << "}\n";
+        Table tbl(tblNode);
+        // Auto-grow to fit the requested cell (never shrink existing data).
+        int curRows = tbl.numRows, curCols = tbl.numCols;
+        int newRows = row > curRows ? row : curRows;
+        int newCols = col > curCols ? col : curCols;
+        if (newRows != curRows || newCols != curCols) tbl.setSize(newRows, newCols, 0, 0);
 
         std::string valueKind;
         if (valueJson.is_number()) {
             valueKind = "number";
-            std::ostringstream n; n << valueJson.get<double>();
-            fs << "tbl[" << row << "][" << col << "] = " << n.str() << ";\n";
+            tbl.cell(row, col)->value = Variant(valueJson.get<double>());
         } else if (valueJson.is_string()) {
             valueKind = "string";
-            fs << "tbl[" << row << "][" << col << "] = \"" << fsEscape(valueJson.get<std::string>()) << "\";\n";
+            tbl.cell(row, col)->value = Variant(valueJson.get<std::string>().c_str());
         } else if (valueJson.is_object() && valueJson.contains("flexscript")
                    && valueJson["flexscript"].is_string()) {
-            // FlexScript-mode cell: store the body as a string node AND mark
-            // it as FlexScript so the engine compiles + evaluates on read.
-            // Auto-prepend the right codeHeader so `current`/`token`/etc.
-            // are in scope; optional `header` field picks the variant
-            // (defaults to "standard" — see activityCodeHeader).
+            // FlexScript-mode cell: store the body + mark the node FlexScript so
+            // the engine compiles/evaluates on read. Auto-prepend the codeHeader
+            // so current/token/etc. are in scope (header field picks the variant).
             valueKind = "flexscript";
             std::string body = valueJson["flexscript"].get<std::string>();
             std::string headerMode = "standard";
@@ -10259,52 +9447,30 @@ modelerai_export Variant ModelerAi_setActivityTableCell(FLEXSIMINTERFACE)
                 headerMode = valueJson["header"].get<std::string>();
             }
             body = maybePrependCodeHeader(body, headerMode);
-            fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
-            fs << "cellNode.value = \"" << fsEscape(body) << "\";\n";
-            fs << "switch_flexscript(cellNode, 1);\n";
-            fs << "buildnodeflexscript(cellNode);\n";
+            TreeNode* cellNode = tbl.cell(row, col);
+            cellNode->value = Variant(body.c_str());
+            switch_flexscript(cellNode, 1);
+            buildnodeflexscript(cellNode);
         } else if (valueJson.is_object() && valueJson.contains("model_object")
                    && valueJson["model_object"].is_string()) {
-            // Pointer-to-model-object mode: make the cell a coupling node
-            // pointing at the resolved Model.find(name). This is what the
-            // modeler wants when referencing a SPECIFIC existing object
-            // (Queue1, Source3, etc.) — pointer storage, not a string
-            // literal, not a FlexScript body.
+            // Pointer-to-model-object: make the cell a coupling node pointing at
+            // Model.find(name) — pointer storage, not a string/FlexScript body.
             valueKind = "model_object";
             std::string objName = valueJson["model_object"].get<std::string>();
-            fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
-            fs << "treenode targetObj = Model.find(\"" << fsEscape(objName) << "\");\n";
-            fs << "if (!objectexists(targetObj)) { print(\"[ModelerAI] set_activity_table_cell: Model.find('"
-               << fsEscape(objName) << "') returned NULL\\n\"); return \"ERR:model_object_not_found:Model object \\\""
-               << fsEscape(objName) << "\\\" not found.\"; }\n";
-            fs << "nodeadddata(cellNode, DATATYPE_COUPLING);\n";
-            fs << "nodepoint(cellNode, targetObj);\n";
+            TreeNode* targetObj = model()->find(objName.c_str());
+            if (!objectexists(targetObj)) {
+                return returnError("model_object_not_found",
+                    "Model object \"" + objName + "\" not found.");
+            }
+            TreeNode* cellNode = tbl.cell(row, col);
+            nodeadddata(cellNode, DATATYPE_COUPLING);
+            nodepoint(cellNode, targetObj);
         } else {
             return returnError("unsupported_value_type",
                 "value must be: a JSON number, a JSON string (stored as a "
                 "string node — engine evaluates literal-vs-expression based on "
                 "content), {flexscript:\"<body>\"} (force FlexScript-mode), or "
                 "{model_object:\"Queue1\"} (pointer to a model object).");
-        }
-        fs << "print(\"[ModelerAI] set_activity_table_cell: done\\n\");\n";
-        fs << "return \"ok\";\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_table_cell_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("set_table_cell_failed", "non-std exception during set_activity_table_cell.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "set_table_cell_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
         }
 
         nlohmann::json out;
@@ -10354,70 +9520,32 @@ modelerai_export Variant ModelerAi_getActivityTableCell(FLEXSIMINTERFACE)
         if (varName.empty()) return returnError("missing_args", "variable is required.");
         if (row < 1 || col < 1) return returnError("bad_index", "row and col are 1-indexed (>= 1).");
 
-        std::ostringstream fs;
-        fs << emitActivityTableResolveScript("get_activity_table_cell", pfName, actName, varName);
-        fs << "Table tbl = tblNode;\n";
-        // Inspect the cell node's datatype.
-        fs << "treenode cellNode = tbl.cell(" << row << ", " << col << ");\n";
-        fs << "Array out = Array();\n";
-        fs << "Map row = Map();\n";
-        fs << "if (objectexists(cellNode)) {\n";
-        fs << "    int dt = getdatatype(cellNode);\n";
-        fs << "    if (dt == 1) {\n";
-        fs << "        row[\"kind\"] = \"number\";\n";
-        fs << "        row[\"value_num\"] = tbl[" << row << "][" << col << "];\n";
-        fs << "        row[\"value_str\"] = \"\";\n";
-        fs << "    } else if (dt == 2) {\n";
-        fs << "        row[\"kind\"] = \"string\";\n";
-        fs << "        row[\"value_num\"] = 0;\n";
-        fs << "        row[\"value_str\"] = string(cellNode.value);\n";
-        fs << "    } else {\n";
-        fs << "        row[\"kind\"] = \"unknown\";\n";
-        fs << "        row[\"value_num\"] = 0;\n";
-        fs << "        row[\"value_str\"] = string(cellNode.value);\n";
-        fs << "    }\n";
-        fs << "} else {\n";
-        fs << "    row[\"kind\"] = \"empty\";\n";
-        fs << "    row[\"value_num\"] = 0;\n";
-        fs << "    row[\"value_str\"] = \"\";\n";
-        fs << "}\n";
-        fs << "out.push(row);\n";
-        fs << "return out;\n";
+        // Native (.1000084 — was executestring). Resolve the table node, read the
+        // cell node, classify by datatype (1=number, 2=string).
+        std::string errCode, errMsg;
+        TreeNode* tblNode = resolveActivityVarNode(pfName, actName, varName, errCode, errMsg);
+        if (!tblNode) return returnError(errCode.c_str(), errMsg);
 
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("get_table_cell_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("get_table_cell_failed", "non-std exception during get_activity_table_cell.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "get_table_cell_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
-        }
-        if (v.type != VariantType::Array) {
-            return returnError("get_table_cell_failed",
-                "FlexScript did not return an Array. Check System Console diagnostics.");
-        }
-        Array a = static_cast<Array>(v);
-        if (a.length < 1) return returnError("get_table_cell_failed", "Empty result array.");
-        Variant rowV = a[1];
-        if (rowV.type != VariantType::Map) return returnError("get_table_cell_failed", "Row is not a Map.");
-        Map m = static_cast<Map>(rowV);
+        Table tbl(tblNode);
+        TreeNode* cellNode = tbl.cell(row, col);
         std::string kind, valStr;
         double valNum = 0.0;
-        try { kind   = std::string(m["kind"]); }      catch (...) {}
-        try { valStr = std::string(m["value_str"]); } catch (...) {}
-        try {
-            Variant nv = m["value_num"];
-            if (nv.type == VariantType::Number) valNum = static_cast<double>(nv);
-        } catch (...) {}
+        if (objectexists(cellNode)) {
+            int dt = getdatatype(cellNode);
+            if (dt == 1) {
+                kind   = "number";
+                valNum = static_cast<double>(cellNode->value);
+            } else if (dt == 2) {
+                kind   = "string";
+                valStr = std::string(cellNode->value);
+            } else {
+                kind = "unknown";
+                Variant cv = cellNode->value;
+                if (cv.type == VariantType::String) valStr = std::string(cv);
+            }
+        } else {
+            kind = "empty";
+        }
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -10465,75 +9593,17 @@ modelerai_export Variant ModelerAi_getActivityTableSize(FLEXSIMINTERFACE)
         if (actName.empty()) return returnError("missing_args", "activity is required.");
         if (varName.empty()) return returnError("missing_args", "variable is required.");
 
-        std::ostringstream fs;
-        fs << emitActivityTableResolveScript("get_activity_table_size", pfName, actName, varName);
-        fs << "Table tbl = tblNode;\n";
-        // One-row Array<Map>. rows/cols are stored as strings via empty-string
-        // concat (`"" + n`) — `string(rawInt)` is unreliable for bare ints in
-        // this FlexScript build (it parses `string` as a command call), whereas
-        // `string(treenodeProperty)` works because the input is already typed.
-        // The `"" + n` idiom sidesteps it entirely.
-        fs << "Array out = Array();\n";
-        fs << "Map row = Map();\n";
-        fs << "row[\"rows\"] = \"\" + tbl.numRows;\n";
-        fs << "row[\"cols\"] = \"\" + tbl.numCols;\n";
-        fs << "string headerCsv = \"\";\n";
-        fs << "for (int iC = 1; iC <= tbl.numCols; iC++) {\n";
-        fs << "    if (headerCsv != \"\") headerCsv = headerCsv + \"|\";\n";  // pipe avoids ambiguity with comma in headers
-        fs << "    headerCsv = headerCsv + tbl.getColHeader(iC);\n";
-        fs << "}\n";
-        fs << "row[\"headers\"] = headerCsv;\n";
-        fs << "out.push(row);\n";
-        fs << "return out;\n";
+        // Native (.1000084 — was executestring). Read dims + column headers off
+        // the Table directly.
+        std::string errCode, errMsg;
+        TreeNode* tblNode = resolveActivityVarNode(pfName, actName, varName, errCode, errMsg);
+        if (!tblNode) return returnError(errCode.c_str(), errMsg);
 
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("get_table_size_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("get_table_size_failed", "non-std exception.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "get_table_size_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
-        }
-        if (v.type != VariantType::Array) {
-            return returnError("get_table_size_failed",
-                "FlexScript did not return an Array. Check System Console diagnostics.");
-        }
-        Array a = static_cast<Array>(v);
-        if (a.length < 1) return returnError("get_table_size_failed", "Empty result array.");
-        Variant rowV = a[1];
-        if (rowV.type != VariantType::Map) return returnError("get_table_size_failed", "Row is not a Map.");
-        Map m = static_cast<Map>(rowV);
-        std::string rowsStr, colsStr, headerCsv;
-        try { rowsStr   = std::string(m["rows"]); }    catch (...) {}
-        try { colsStr   = std::string(m["cols"]); }    catch (...) {}
-        try { headerCsv = std::string(m["headers"]); } catch (...) {}
-
-        int rows = 0, cols = 0;
-        try { rows = std::stoi(rowsStr); } catch (...) {}
-        try { cols = std::stoi(colsStr); } catch (...) {}
-
+        Table tbl(tblNode);
+        int rows = tbl.numRows;
+        int cols = tbl.numCols;
         nlohmann::json headers = nlohmann::json::array();
-        if (!headerCsv.empty()) {
-            size_t start = 0;
-            while (start <= headerCsv.size()) {
-                size_t sep = headerCsv.find('|', start);
-                std::string tok = (sep == std::string::npos)
-                    ? headerCsv.substr(start)
-                    : headerCsv.substr(start, sep - start);
-                headers.push_back(tok);
-                if (sep == std::string::npos) break;
-                start = sep + 1;
-            }
-        }
+        for (int iC = 1; iC <= cols; ++iC) headers.push_back(tbl.getColHeader(iC));
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -10581,30 +9651,13 @@ modelerai_export Variant ModelerAi_resizeActivityTable(FLEXSIMINTERFACE)
         if (varName.empty()) return returnError("missing_args", "variable is required.");
         if (rows < 0 || cols < 0) return returnError("bad_size", "rows and cols must be >= 0.");
 
-        std::ostringstream fs;
-        fs << emitActivityTableResolveScript("resize_activity_table", pfName, actName, varName);
-        fs << "Table tbl = tblNode;\n";
-        fs << "tbl.setSize(" << rows << ", " << cols << ");\n";
-        fs << "print(\"[ModelerAI] resize_activity_table: done\\n\");\n";
-        fs << "return \"ok\";\n";
+        // Native (.1000084 — was executestring). setSize(rows,cols,datatype,overwrite).
+        std::string errCode, errMsg;
+        TreeNode* tblNode = resolveActivityVarNode(pfName, actName, varName, errCode, errMsg);
+        if (!tblNode) return returnError(errCode.c_str(), errMsg);
 
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("resize_table_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("resize_table_failed", "non-std exception.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "resize_table_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
-        }
+        Table tbl(tblNode);
+        tbl.setSize(rows, cols, 0, 0);
 
         nlohmann::json out;
         out["ok"]          = true;
@@ -10653,30 +9706,13 @@ modelerai_export Variant ModelerAi_setActivityTableColumnHeader(FLEXSIMINTERFACE
         if (col < 1)         return returnError("bad_index", "col is 1-indexed (>= 1).");
         if (header.empty())  return returnError("missing_args", "header is required.");
 
-        std::ostringstream fs;
-        fs << emitActivityTableResolveScript("set_activity_table_column_header", pfName, actName, varName);
-        fs << "Table tbl = tblNode;\n";
-        fs << "tbl.setColHeader(" << col << ", \"" << fsEscape(header) << "\");\n";
-        fs << "print(\"[ModelerAI] set_activity_table_column_header: done\\n\");\n";
-        fs << "return \"ok\";\n";
+        // Native (.1000084 — was executestring). setColHeader(col, name).
+        std::string errCode, errMsg;
+        TreeNode* tblNode = resolveActivityVarNode(pfName, actName, varName, errCode, errMsg);
+        if (!tblNode) return returnError(errCode.c_str(), errMsg);
 
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_column_header_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("set_column_header_failed", "non-std exception.");
-        }
-
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "set_column_header_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
-        }
+        Table tbl(tblNode);
+        tbl.setColHeader(col, header.c_str());
 
         nlohmann::json out;
         out["ok"]          = true;

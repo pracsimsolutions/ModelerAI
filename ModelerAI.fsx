@@ -4386,7 +4386,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000057&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000084&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -8687,6 +8687,7 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_statistics_collector</name><data>dll:"module:ModelerAI" func:"ModelerAi_createStatisticsCollector"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_tracked_variable</name><data>dll:"module:ModelerAI" func:"ModelerAi_createTrackedVariable"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_processflow</name><data>dll:"module:ModelerAI" func:"ModelerAi_createProcessFlow"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_open_processflow_view</name><data>dll:"module:ModelerAI" func:"ModelerAi_openProcessFlowView"</data></node>
       <node f="1000042" dt="2"><name>modelerai_list_processflows</name><data>dll:"module:ModelerAI" func:"ModelerAi_listProcessFlows"</data></node>
       <node f="1000042" dt="2"><name>modelerai_delete_processflow</name><data>dll:"module:ModelerAI" func:"ModelerAi_deleteProcessFlow"</data></node>
       <node f="1000042" dt="2"><name>modelerai_add_activity</name><data>dll:"module:ModelerAI" func:"ModelerAi_addActivity"</data></node>

@@ -19,7 +19,7 @@
 //
 // Args (all optional except target — defaults shown):
 //   target                  : path string | treenode | null (use selection)
-//   output                  : "file" | "inline"             (default "file")
+//   output                  : "file" | "inline"             (default "inline")
 //   max_depth               : int >= 0, 0 = unlimited       (default 0)
 //   max_nodes               : int >= 0, 0 = unlimited       (default 0)
 //   include_subnodes        : bool                          (default true)
@@ -211,7 +211,10 @@ std::string resolveOutputMode(const Variant& targetArg, const Variant& outputArg
         if (args->contains("output") && (*args)["output"].is_string())
             return (*args)["output"].get<std::string>();
     }
-    return "file";
+    // Default inline (.1000058): the agent wants the JSON returned, and "file"
+    // fails on an unsaved model ("could not resolve model directory"). Pass
+    // output:"file" explicitly to write to disk instead.
+    return "inline";
 }
 
 // Pull walker flags from the structured args JSON if present. Leaves

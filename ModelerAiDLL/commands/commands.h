@@ -1,3 +1,4 @@
+/**Custom Code*/
 // Copyright (c) 2026 Practical Simulation Solutions.
 // Licensed under the MIT License — see LICENSE.txt at the repo root.
 //
@@ -99,6 +100,7 @@ modelerai_export Variant ModelerAi_setRunSpeed         (FLEXSIMINTERFACE);
 // ProcessFlow lifecycle — create/list/delete the ProcessFlow tools that live
 // under Tools/Toolbox/ProcessFlow in the model tree.
 modelerai_export Variant ModelerAi_createProcessFlow       (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_openProcessFlowView     (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_listProcessFlows        (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_deleteProcessFlow       (FLEXSIMINTERFACE);
 
