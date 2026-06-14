@@ -48,9 +48,8 @@ set-key.*
 set-env.*
 load-env.*
 
-# Build artifacts — produced by Visual Studio, never committed.
-# Clone, build, ship is the distribution model.
-ModelerAI.dll
+# Build artifacts — produced by Visual Studio.
+# (ModelerAI.dll is intentionally committed so users can run without building.)
 ModelerAI.t
 ModelerAI.exp
 ModelerAI.lib
