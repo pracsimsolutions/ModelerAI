@@ -189,20 +189,33 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
       transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
     }
 
-    /* ----- Custom scrollbars (Chromium/WebKit pseudo-elements; CEF
-       is Chromium-based so these apply everywhere). Replaces the
-       OS-native bar that clashes with the theme. Thin, rounded, fades
-       in on hover, theme-aware via the --scroll-* variables we define
-       in :root / dark-mode block. ----- */
-    :root {
-      --scroll-track:       transparent;
-      --scroll-thumb:       rgba(0, 0, 0, 0.22);
-      --scroll-thumb-hover: rgba(0, 0, 0, 0.40);
+    /* ----- Scrollbars. FlexSim's CEF renders the STANDARD scrollbar
+       (scrollbar-width / scrollbar-color) and IGNORES ::-webkit-scrollbar
+       (verified in CEF DevTools 2026-06-15 — webkit pseudo-elements don't
+       paint even with the standard props reset). So the standard properties
+       are the only lever: we can theme the COLOR but not round the shape.
+       The --scroll-* vars MUST be keyed to the theme CLASSES (this app is
+       dark-by-default via html/html.dark, light via html.light/html.system),
+       NOT @media(prefers-color-scheme) — the app forces its theme by class,
+       so a media query keys off the wrong thing and leaves a black thumb on
+       the dark UI. ----- */
+    html, html.dark {
+      /* dark UI → light thumb */
+      --scroll-track:       rgba(255, 255, 255, 0.07);
+      --scroll-thumb:       rgba(255, 255, 255, 0.42);
+      --scroll-thumb-hover: rgba(255, 255, 255, 0.60);
     }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --scroll-thumb:       rgba(255, 255, 255, 0.16);
-        --scroll-thumb-hover: rgba(255, 255, 255, 0.32);
+    html.light {
+      /* light UI → dark thumb */
+      --scroll-track:       rgba(0, 0, 0, 0.06);
+      --scroll-thumb:       rgba(0, 0, 0, 0.42);
+      --scroll-thumb-hover: rgba(0, 0, 0, 0.60);
+    }
+    @media (prefers-color-scheme: light) {
+      html.system {
+        --scroll-track:       rgba(0, 0, 0, 0.06);
+        --scroll-thumb:       rgba(0, 0, 0, 0.42);
+        --scroll-thumb-hover: rgba(0, 0, 0, 0.60);
       }
     }
     /* Apply to every scrollable element. */
@@ -751,6 +764,11 @@ else return applicationcommand("undockwindow", c, 0, dropx(), dropy());</data></
          fit. The custom *::-webkit-scrollbar styling above paints it
          to match the theme. */
       flex: 1; overflow-y: scroll; padding: 16px;
+      /* min-height:0 is REQUIRED: as a flex:1 child of the column #pane-chat,
+         the default min-height:auto refuses to shrink below content size, so
+         the transcript grows to fit every bubble and never overflows/scrolls.
+         Zeroing it lets the element cap at the available height and scroll. */
+      min-height: 0;
       display: flex; flex-direction: column; gap: 10px;
     }
     .bubble {
@@ -4386,7 +4404,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000087&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000090&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
