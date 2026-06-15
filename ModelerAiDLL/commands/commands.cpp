@@ -5326,7 +5326,18 @@ modelerai_export Variant ModelerAi_getPerformanceMeasure(FLEXSIMINTERFACE)
             return returnError("missing_name",
                 "modelerai_get_performance_measure(name) requires a name.");
         }
-        std::string script = "return Model.performanceMeasures[\"" + fsEscape(name) + "\"];";
+        // Evaluate the PM: Model.performanceMeasures["X"] is a StatusVariable that
+        // resolves to the PM's "Value" node; its "valueNode" child holds the
+        // FlexScript body, which .evaluate() runs to produce the number. (.1000092
+        // — `.value` raised "StatusVariable does not support property value"; the
+        // accessor alone returned the node, not the value. Verified in-console:
+        // vn.evaluate() == the live count.)
+        std::string script =
+            "treenode pmNode = Model.performanceMeasures[\"" + fsEscape(name) + "\"];\n"
+            "if (!objectexists(pmNode)) return nullvar;\n"
+            "treenode vn = pmNode.find(\"valueNode\");\n"
+            "if (objectexists(vn)) return vn.evaluate();\n"
+            "return pmNode.evaluate();";
         nlohmann::json value;
         try {
             Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
@@ -5384,7 +5395,13 @@ modelerai_export Variant ModelerAi_getPerformanceMeasures(FLEXSIMINTERFACE)
         nlohmann::json values = nlohmann::json::object();
         nlohmann::json errors = nlohmann::json::object();
         for (const auto& n : names) {
-            std::string script = "return Model.performanceMeasures[\"" + fsEscape(n) + "\"];";
+            // Evaluate via the PM's valueNode (see get_performance_measure, .1000092).
+            std::string script =
+                "treenode pmNode = Model.performanceMeasures[\"" + fsEscape(n) + "\"];\n"
+                "if (!objectexists(pmNode)) return nullvar;\n"
+                "treenode vn = pmNode.find(\"valueNode\");\n"
+                "if (objectexists(vn)) return vn.evaluate();\n"
+                "return pmNode.evaluate();";
             try {
                 Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
                 values[n] = pmValueToJson(v);
