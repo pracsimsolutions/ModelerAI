@@ -188,6 +188,16 @@ std::string resolveNameArg(const Variant& v, const char* objField)
                 }
             } catch (...) {}
         }
+        // Unwrap a JSON-quoted bare string (.1000085 — the agent naturally passes
+        // args:"\"Queue1\"" for the bare-string form, which arrived here with the
+        // literal quotes still attached and failed to resolve).
+        if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+            try {
+                auto j = nlohmann::json::parse(s);
+                if (j.is_string()) return j.get<std::string>();
+            } catch (...) {}
+            return s.substr(1, s.size() - 2);
+        }
         return s;
     }
     return "";
@@ -292,8 +302,12 @@ bool parseParamType(const std::string& s, ParamType& out)
     std::string lower;
     lower.reserve(s.size());
     for (char c : s) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    if      (lower == "continuous")  { out = ParamType::Continuous;  return true; }
-    else if (lower == "integer")     { out = ParamType::Integer;     return true; }
+    // Common aliases the agent reaches for (.1000085): "number"/"float"/"double"
+    // → continuous, "int" → integer.
+    if      (lower == "continuous" || lower == "number" || lower == "float" || lower == "double")
+                                     { out = ParamType::Continuous;  return true; }
+    else if (lower == "integer" || lower == "int")
+                                     { out = ParamType::Integer;     return true; }
     else if (lower == "discrete")    { out = ParamType::Discrete;    return true; }
     else if (lower == "binary")      { out = ParamType::Binary;      return true; }
     else if (lower == "option")      { out = ParamType::Option;      return true; }
@@ -3476,14 +3490,17 @@ modelerai_export Variant ModelerAi_addParameter(FLEXSIMINTERFACE)
 
         try {
             auto j = nlohmann::json::parse(argsJson);
-            if (!j.contains("table_name") || !j["table_name"].is_string()
-                || !j.contains("name")    || !j["name"].is_string()
-                || !j.contains("type")    || !j["type"].is_string())
+            // name + type required; table_name defaults to "Parameters" (the
+            // table every model ships with) when omitted (.1000085 — was a hard
+            // requirement that cost the agent retries).
+            if (!j.contains("name") || !j["name"].is_string()
+                || !j.contains("type") || !j["type"].is_string())
             {
                 return returnError("missing_field",
-                    "add_parameter requires table_name, name, type.");
+                    "add_parameter requires name and type (table_name optional, defaults to \"Parameters\").");
             }
-            tableName    = j["table_name"].get<std::string>();
+            tableName    = j.value("table_name", std::string("Parameters"));
+            if (tableName.empty()) tableName = "Parameters";
             name         = j["name"].get<std::string>();
             typeStr      = j["type"].get<std::string>();
             description  = j.value("description", "");
@@ -4967,13 +4984,18 @@ modelerai_export Variant ModelerAi_createPerformanceMeasure(FLEXSIMINTERFACE)
         bool replace = false;
         try {
             auto j = nlohmann::json::parse(argsJson);
-            if (!j.contains("name") || !j["name"].is_string()
-                || !j.contains("expression") || !j["expression"].is_string()) {
+            // Accept `body` as an alias for `expression` (.1000085 — the agent
+            // naturally reaches for "body", matching set_label/cell flexscript).
+            bool hasExpr = (j.contains("expression") && j["expression"].is_string())
+                        || (j.contains("body")       && j["body"].is_string());
+            if (!j.contains("name") || !j["name"].is_string() || !hasExpr) {
                 return returnError("missing_field",
-                    "create_performance_measure requires `name` and `expression`.");
+                    "create_performance_measure requires `name` and `expression` (alias: `body`).");
             }
             name          = j["name"].get<std::string>();
-            expression    = j["expression"].get<std::string>();
+            expression    = (j.contains("expression") && j["expression"].is_string())
+                          ? j["expression"].get<std::string>()
+                          : j["body"].get<std::string>();
             tableName     = j.value("table_name", "");
             referencePath = j.value("reference",   "");
             units         = j.value("units",       "");
@@ -8969,7 +8991,18 @@ modelerai_export Variant ModelerAi_setActivityVariable(FLEXSIMINTERFACE)
         }
 
         if (valueKind == "number") {
-            setvarnum(activity, varName.c_str(), numValue);
+            // Write the number AND force literal-number mode. Dual-mode nodes
+            // (e.g. Delay.delayTimeNode) ship as FlexScript nodes holding a
+            // default expression; setvarnum alone leaves the FlexScript flag on,
+            // so the engine keeps evaluating the expression and the literal never
+            // takes effect (.1000085 fix). Set the value then clear the flag.
+            treenode varNode = getvarnode(activity, varName.c_str());
+            if (objectexists(varNode)) {
+                varNode->value = Variant(numValue);
+                switch_flexscript(varNode, 0);   // 0 = force literal/off
+            } else {
+                setvarnum(activity, varName.c_str(), numValue);  // fallback
+            }
         } else {
             // All other kinds write through the variable node.
             treenode varNode = getvarnode(activity, varName.c_str());

@@ -4386,7 +4386,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000084&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000086&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;

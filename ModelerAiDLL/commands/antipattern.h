@@ -1,3 +1,4 @@
+/**Custom Code*/
 // Copyright (c) 2026 Practical Simulation Solutions.
 // Licensed under the MIT License — see LICENSE.txt at the repo root.
 //
@@ -93,14 +94,14 @@ inline const AntiPattern* getAntiPatterns(int& outCount)
             "`destroyobject(obj)` is legacy. Use `obj.destroy()` or `treenode.destroy()` "
             "(the curated `modelerai_delete_object` is preferred for top-level deletes)."
         },
-        {
-            "getoutput/getinput",
-            R"(\b(getoutput|getinput)\s*\()",
-            "`getoutput(obj)` and `getinput(obj)` are legacy free functions. Use the modern "
-            "accessor: `obj.stats.output.value` (items released) or `obj.stats.input.value` "
-            "(items received). IMPORTANT: Sinks RECEIVE items — for Sink throughput use "
-            "`obj.stats.input.value`, NOT `output.value`."
-        },
+        // NOTE (.1000086): the getoutput/getinput antipattern was REMOVED. Those
+        // are valid fsvisible functions that work on a TREENODE (e.g. the result
+        // of Model.find()), whereas the "modern" `obj.stats.input.value` accessor
+        // requires an Object — on a Model.find() treenode it raises a compile
+        // error ("ObjectPorts does not support property value"). The old rule
+        // rejected getinput/getoutput and steered the agent straight into that
+        // error when authoring PM/expression bodies. getinput(Model.find("X"))
+        // is the correct, cast-free form; leave it allowed.
         {
             "while-time-step loop",
             // Match `while (... time() ...)` whose body (within the same statement-ish window)
