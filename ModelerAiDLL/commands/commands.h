@@ -35,6 +35,7 @@ modelerai_export Variant ModelerAi_setLabel                (FLEXSIMINTERFACE);
 
 // Groups — Tools.create("Group") + Group("name").addMember/removeMember.
 modelerai_export Variant ModelerAi_createGroup             (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_createUserCommand       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_groupAddMember          (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_groupRemoveMember       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_listGroups              (FLEXSIMINTERFACE);

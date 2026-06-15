@@ -5986,6 +5986,114 @@ modelerai_export Variant ModelerAi_createGroup(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("create_group", "unknown"); }
 }
 
+// ============================================================================
+// modelerai_create_user_command({ name, code, description?, parameters?,
+//                                 example?, return_type?, short_description? })
+//
+// Creates (or replaces) a persistent FlexSim User Command under
+// Tools/UserCommands/<name>, then registers it live so it's callable from
+// FlexScript immediately (and re-registers on model reload via the node
+// structure). Mirrors the tree layout FlexSim's own Tools|User Commands
+// builds: a <name> container whose children are
+//   code             (FlexScript body — flagged as a FlexScript node)
+//   description       (string)
+//   parameters        (signature/param doc string, e.g. "(num x, str label)")
+//   example           (string, e.g. "myCommand(1, \"hi\")")
+//   returntype        (string: "num" | "string" | "variant")
+//   shortdescription  (string)
+// Registration uses addcommand(codeNode, name, desc, params, example, "",
+// RETURN_TYPE_*) + refreshcommandlist().
+//
+// Idempotent on name: an existing command of the same name is destroyed and
+// rebuilt (same as FlexSim's drop handler).
+// ============================================================================
+modelerai_export Variant ModelerAi_createUserCommand(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_create_user_command expects { name, code, description?, "
+                "parameters?, example?, return_type?, short_description? } JSON.");
+        }
+        std::string name, code, description, parameters, example, shortDescription;
+        std::string returnType = "num";
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            name             = j.value("name",              std::string(""));
+            code             = j.value("code",              std::string(""));
+            description      = j.value("description",       std::string(""));
+            parameters       = j.value("parameters",        std::string(""));
+            example          = j.value("example",           std::string(""));
+            shortDescription = j.value("short_description",  std::string(""));
+            returnType       = j.value("return_type",       std::string("num"));
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (name.empty()) return returnError("missing_name", "name is required.");
+        if (code.empty()) return returnError("missing_code", "code (the FlexScript body) is required.");
+
+        // Map the return-type string to FlexSim's RETURN_TYPE_* int + the node
+        // label FlexSim stores ("num"/"string"/"variant").
+        int returnTypeInt = RETURN_TYPE_NUMBER;
+        std::string returnTypeLabel = "num";
+        {
+            std::string rt;
+            for (char c : returnType) rt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if      (rt == "" || rt == "num" || rt == "number" || rt == "double") { returnTypeInt = RETURN_TYPE_NUMBER;  returnTypeLabel = "num"; }
+            else if (rt == "string" || rt == "str" || rt == "text")               { returnTypeInt = RETURN_TYPE_STRING;  returnTypeLabel = "string"; }
+            else if (rt == "variant")                                             { returnTypeInt = RETURN_TYPE_VARIANT; returnTypeLabel = "variant"; }
+            else {
+                return returnError("bad_return_type",
+                    "return_type must be one of: num, string, variant. Got: '" + returnType + "'.");
+            }
+        }
+
+        // Assert Tools/UserCommands and the command container (replace existing).
+        treenode tools = model()->find("Tools");
+        if (!objectexists(tools)) return returnError("tools_not_found", "model Tools node not found.");
+        treenode folder = assertsubnode(tools, "UserCommands", 0);
+        if (!objectexists(folder)) return returnError("usercommands_failed", "could not assert Tools/UserCommands.");
+
+        bool replaced = false;
+        if (treenode existing = folder->find(name.c_str())) {
+            if (objectexists(existing)) { destroyobject(existing); replaced = true; }
+        }
+        treenode cmd = assertsubnode(folder, name.c_str(), 0);
+        if (!objectexists(cmd)) return returnError("create_failed", "could not create the command node.");
+
+        // Build the child nodes (string-typed). The code node is flagged as a
+        // FlexScript node and compiled.
+        treenode codeNode = assertsubnode(cmd, "code", DATATYPE_STRING);
+        codeNode->value = Variant(code.c_str());
+        switch_flexscript(codeNode, 1);
+        buildnodeflexscript(codeNode);
+
+        assertsubnode(cmd, "description",      DATATYPE_STRING)->value = Variant(description.c_str());
+        assertsubnode(cmd, "parameters",       DATATYPE_STRING)->value = Variant(parameters.c_str());
+        assertsubnode(cmd, "example",          DATATYPE_STRING)->value = Variant(example.c_str());
+        assertsubnode(cmd, "returntype",       DATATYPE_STRING)->value = Variant(returnTypeLabel.c_str());
+        assertsubnode(cmd, "shortdescription", DATATYPE_STRING)->value = Variant(shortDescription.c_str());
+
+        // Register live so it's callable now (and validates the body compiles).
+        addcommand(codeNode, name.c_str(), description.c_str(), parameters.c_str(),
+                   example.c_str(), "", returnTypeInt);
+        refreshcommandlist();
+
+        nlohmann::json out;
+        out["ok"]          = true;
+        out["name"]        = name;
+        out["replaced"]    = replaced;
+        out["return_type"] = returnTypeLabel;
+        if (const char* p = nodetomodelpath_cstr(cmd, 1)) out["path"] = std::string(p);
+        out["note"]        = "User command registered and callable from FlexScript now. "
+                             "It persists under Tools/UserCommands and re-registers on model reload.";
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("create_user_command", e.what()); }
+      catch (...)                     { return returnException("create_user_command", "unknown"); }
+}
+
 // Shared body for add/remove: walks a members list and applies an op to
 // each. Members can be passed as a single string OR an array of strings.
 namespace {
