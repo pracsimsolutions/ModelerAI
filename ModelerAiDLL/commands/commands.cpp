@@ -1865,33 +1865,31 @@ modelerai_export Variant ModelerAi_extractClassSchema(FLEXSIMINTERFACE)
         if (allFlag) {
             // save_to_file is implicitly true for the all path — bulk
             // rebuild has no other purpose.
-            std::string walkScript;
-            walkScript += "treenode lib = maintree().find(\"project/library\");\n";
-            walkScript += "if (!lib) return -1;\n";
-            walkScript += "int classCount = 0;\n";
-            walkScript += "forobjecttreeunder(lib) {\n";
-            walkScript += "    if (content(a) == 0) {\n";
-            walkScript += "        string nm = a.name;\n";
-            walkScript += "        applicationcommand(\"modelerai_extract_class_schema\", "
-                          "\"{\\\"class_name\\\":\\\"\"+nm+\"\\\",\\\"save_to_file\\\":true}\");\n";
-            walkScript += "        classCount = classCount + 1;\n";
-            walkScript += "    }\n";
-            walkScript += "}\n";
-            walkScript += "return classCount;\n";
-
+            // Native (.1000100 — was a maintree().find + forobjecttreeunder
+            // executestring walk). node("MAIN:/project/library") resolves the
+            // library root; nextforobjecttreeunder iterates every node under it;
+            // leaf nodes (content==0) are the concrete classes — extract each via
+            // applicationcommand (the same recursive call the FlexScript made).
+            treenode lib = node("MAIN:/project/library", nullptr);
+            if (!objectexists(lib)) {
+                return returnError("library_not_found",
+                    "Could not resolve MAIN:/project/library. Is a model loaded?");
+            }
             int classCount = 0;
             try {
-                Variant v = executestring(walkScript.c_str(), nullptr, nullptr, Variant());
-                if (v.type == VariantType::Number) classCount = (int)double(v);
+                for (treenode n = nextforobjecttreeunder(lib, lib);
+                     objectexists(n);
+                     n = nextforobjecttreeunder(n, lib)) {
+                    if (content(n) != 0) continue;            // only leaf classes
+                    std::string nm = getname(n);
+                    std::string callArg = "{\"class_name\":\"" + nm + "\",\"save_to_file\":true}";
+                    applicationcommand("modelerai_extract_class_schema", Variant(callArg.c_str()));
+                    ++classCount;
+                }
             } catch (const std::exception& e) {
-                return returnError("all_walk_failed", std::string("forobjecttreeunder threw: ") + e.what());
+                return returnError("all_walk_failed", std::string("class walk threw: ") + e.what());
             } catch (...) {
-                return returnError("all_walk_failed", "forobjecttreeunder threw a non-std exception.");
-            }
-            if (classCount < 0) {
-                return returnError("library_not_found",
-                    "Could not resolve maintree().find(\"project/library\"). "
-                    "Is a model loaded?");
+                return returnError("all_walk_failed", "class walk threw a non-std exception.");
             }
             // Drop the schema cache so subsequent lookups read the fresh
             // files we just wrote rather than the stale in-memory entries.
@@ -1914,19 +1912,18 @@ modelerai_export Variant ModelerAi_extractClassSchema(FLEXSIMINTERFACE)
             return returnError("missing_class_name", "class_name is required (or pass all: true).");
         }
 
-        // Resolve the class node under /project/library. AGV::Path → AGV/Path.
-        std::string treePath = classNameToTreePath(className);
+        // Resolve the class node under /project/library. AGV::Path → AGV/?Path.
+        // Native (.1000100 — was maintree().find via executestring). node() can't
+        // do the `?` recursive search, so resolve the library root with node() then
+        // TreeNode::find the class subpath (find DOES support `?`).
+        std::string treePath = classNameToTreePath(className);   // "project/library/?Class"
+        std::string relPath = treePath;
+        const std::string libPrefix = "project/library/";
+        if (relPath.rfind(libPrefix, 0) == 0) relPath = relPath.substr(libPrefix.size());
         TreeNode* classNode = nullptr;
         try {
-            // maintree() returns TreeNodeListHead* which doesn't expose find()
-            // directly the way treenode does; use executestring as the
-            // simplest portable path-resolution.
-            std::string resolveScript;
-            resolveScript += "return maintree().find(\"" + fsEscape(treePath) + "\");\n";
-            Variant v = executestring(resolveScript.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::TreeNode) {
-                classNode = static_cast<TreeNode*>(v);
-            }
+            treenode lib = node("MAIN:/project/library", nullptr);
+            if (objectexists(lib)) classNode = lib->find(relPath.c_str());
         } catch (...) {}
         if (!objectexists(classNode)) {
             return returnError("class_not_found",
@@ -2444,37 +2441,67 @@ NavWalkResult fixedResourceNavigatorMemberships(const std::string& frName)
 {
     NavWalkResult result;
 
-    std::string script;
-    script += "Object fr = Model.find(\"" + fsEscape(frName) + "\");\n";
-    script += "Array anchors;\n";
-    script += "treenode storedNode = stored(fr);\n";
-    script += "if (objectexists(storedNode)) {\n";
-    script += "    forobjecttreeunder(storedNode) {\n";
-    script += "        treenode target = a.value;\n";
-    script += "        if (!objectexists(target)) continue;\n";
-    script += "        treenode owner = ownerobject(target);\n";
-    script += "        if (!objectexists(owner)) continue;\n";
-    script += "        if (isclasstype(owner, \"Navigator\") ||\n";
-    script += "            isclasstype(owner, \"AGV::ControlPoint\") ||\n";
-    script += "            isclasstype(owner, \"GIS::Point\")) {\n";
-    script += "            anchors.push(owner);\n";
-    script += "        } else if (objectexists(owner.up) && isclasstype(owner.up, \"Navigator\")) {\n";
-    script += "            anchors.push(owner.up);\n";
-    script += "        }\n";
-    script += "    }\n";
-    script += "}\n";
-    script += "treenode nnsNode = getvarnode(fr, \"networknodes\");\n";
-    script += "if (objectexists(nnsNode)) {\n";
-    script += "    forobjecttreeunder(nnsNode) {\n";
-    script += "        treenode target = a.value;\n";
-    script += "        if (objectexists(target)) anchors.push(ownerobject(target));\n";
-    script += "    }\n";
-    script += "}\n";
-    script += "return anchors;\n";
+    // Native (.1000100 — was an executestring walker). Walk stored(fr) and the
+    // bound networknodes space with nextforobjecttreeunder; each entry's value is
+    // a coupling whose ownerobject() is the navigator anchor (a NetworkNode lives
+    // one level under its Navigator, so fall back to owner->up for that case).
+    treenode fr = model()->find(frName.c_str());
+    if (!objectexists(fr)) {
+        result.error_detail = "fixed resource '" + frName + "' not found";
+        return result;
+    }
 
-    Variant v;
+    std::vector<TreeNode*> anchors;
     try {
-        v = executestring(script.c_str(), nullptr, nullptr, Variant());
+        // FULLY guarded walk: ANY step (stored(), the value read, ownerobject(),
+        // even the iterator advance) can throw a non-std FlexSim exception on some
+        // node in the >stored / networknodes space (e.g. item-flow port couplings
+        // live in >stored too). The FlexScript a.value walk tolerated those; here we
+        // wrap every step so one bad node is skipped, never aborting the whole walk.
+        // The nav-anchor couplings read fine, so real memberships are still found.
+        auto couplingTarget = [](treenode n) -> treenode {
+            try {
+                Variant tv = n->value;
+                if (tv.type == VariantType::TreeNode) return static_cast<treenode>(tv);
+            } catch (...) {}
+            return nullptr;
+        };
+        auto advance = [](treenode cur, treenode top) -> treenode {
+            try { return nextforobjecttreeunder(cur, top); } catch (...) { return nullptr; }
+        };
+
+        treenode storedNode = 0;
+        try { storedNode = stored(fr); } catch (...) {}
+        if (objectexists(storedNode)) {
+            for (treenode n = advance(storedNode, storedNode); objectexists(n); n = advance(n, storedNode)) {
+                try {
+                    treenode target = couplingTarget(n);
+                    if (!objectexists(target)) continue;
+                    treenode owner = ownerobject(target);
+                    if (!objectexists(owner)) continue;
+                    if (isclasstype(owner, "Navigator")
+                     || isclasstype(owner, "AGV::ControlPoint")
+                     || isclasstype(owner, "GIS::Point")) {
+                        anchors.push_back(owner);
+                    } else if (objectexists(owner->up) && isclasstype(owner->up, "Navigator")) {
+                        anchors.push_back(owner->up);
+                    }
+                } catch (...) { /* skip this node */ }
+            }
+        }
+
+        treenode nnsNode = 0;
+        try { nnsNode = getvarnode(fr, "networknodes"); } catch (...) {}
+        if (objectexists(nnsNode)) {
+            for (treenode n = advance(nnsNode, nnsNode); objectexists(n); n = advance(n, nnsNode)) {
+                try {
+                    treenode target = couplingTarget(n);
+                    if (!objectexists(target)) continue;
+                    treenode owner = ownerobject(target);
+                    if (objectexists(owner)) anchors.push_back(owner);
+                } catch (...) { /* skip this node */ }
+            }
+        }
     } catch (const std::exception& e) {
         result.error_detail = std::string("walker threw: ") + e.what();
         return result;
@@ -2483,23 +2510,10 @@ NavWalkResult fixedResourceNavigatorMemberships(const std::string& frName)
         return result;
     }
 
-    if (v.type != VariantType::Array) {
-        result.error_detail = "walker did not return an Array (FR may use a "
-                              "non-standard >stored/>variables shape — "
-                              "duplicate-system check below should not be trusted)";
-        return result;
-    }
-
-    // From here on the walker SUCCEEDED — empty array is a legitimate
-    // "not in any navigator system" answer. Mark ok before populating
-    // memberships.
+    // Walk succeeded — empty is a legitimate "not in any navigator system".
     result.ok = true;
 
-    Array arr = static_cast<Array>(v);
-    for (int i = 1; i <= arr.length; ++i) {
-        Variant elem = arr[i];
-        if (elem.type != VariantType::TreeNode) continue;
-        TreeNode* anchor = static_cast<TreeNode*>(elem);
+    for (TreeNode* anchor : anchors) {
         if (!objectexists(anchor)) continue;
 
         NavMembership m;
@@ -2875,20 +2889,45 @@ modelerai_export Variant ModelerAi_connectFixedResourceToNavigator(FLEXSIMINTERF
             }
         }
 
-        Variant base = doAConnect("connect_fixed_resource_to_navigator", fr, frName, anchor, anchorName);
-        // If error, base already carries the error JSON. If ok, add system field.
-        if (base.type == VariantType::String) {
-            try {
-                auto j = nlohmann::json::parse(std::string(base));
-                if (j.is_object() && j.value("ok", false)) {
-                    j["system"]              = system;
-                    j["memberships_verified"]= true;
-                    j["prior_anchor_check"]  = "not_implemented";
-                    return returnJson(j);
-                }
-            } catch (...) {}
+        // Connect via the A-drag gesture (same as the UI), then verify by
+        // RE-WALKING the FR's navigator memberships. A FR→navigator link is stored
+        // as a coupling, NOT an item-flow port wire, so doAConnect's port-array
+        // check reports a false "connect_unverified" here (the connection actually
+        // succeeds). doAConnect stays unchanged for the genuine A-port tools
+        // (FR↔FR flow, dispatcher↔TE); this tool verifies via the coupling instead.
+        try {
+            contextdragconnection(fr, anchor, 'A');
+        } catch (const std::exception& e) {
+            return returnError("connect_failed",
+                std::string("connect_fixed_resource_to_navigator: contextdragconnection threw: ") + e.what());
+        } catch (...) {
+            return returnError("connect_failed",
+                "connect_fixed_resource_to_navigator: contextdragconnection threw a non-std exception.");
         }
-        return base;
+
+        NavWalkResult after = fixedResourceNavigatorMemberships(frName);
+        bool verified = false;
+        std::string anchorClass;
+        if (after.ok) {
+            for (const auto& m : after.memberships) {
+                if (m.system == system) { verified = true; anchorClass = m.anchor_class; break; }
+            }
+        }
+        if (!verified) {
+            return returnError("connect_unverified",
+                "contextdragconnection from '" + frName + "' to '" + anchorName +
+                "' completed but the FR did not appear in navigator system '" + system +
+                "' on re-inspection. The class pair may not support this connection.");
+        }
+
+        nlohmann::json out;
+        out["ok"]                   = true;
+        out["fr"]                   = frName;
+        out["anchor"]               = anchorName;
+        out["system"]               = system;
+        if (!anchorClass.empty()) out["anchor_class"] = anchorClass;
+        out["memberships_verified"] = true;
+        return returnJson(out);
     } catch (const std::exception& e) { return returnException("connect_fixed_resource_to_navigator", e.what()); }
       catch (...)                     { return returnException("connect_fixed_resource_to_navigator", "unknown"); }
 }
@@ -4181,72 +4220,59 @@ nlohmann::json runStepLoopShared(const char* commandName,
         return out;
     }
 
-    std::string condExpr = condition.empty() ? std::string("0") : condition;
-
-    std::string script;
-    script += "resetmodel(1);\n";
-    script += "applicationcommand(\"switchRunning\", 0);\n";
-    script += "Map out = Map();\n";
-    script += "double safetyTime = "; script += std::to_string(safetySec); script += ";\n";
-    script += "int steps = 0;\n";
-    script += "int reason = 0;\n";
-    script += "while (eventqty() > 0 && time() <= safetyTime) {\n";
-    script += "    step();\n";
-    script += "    steps++;\n";
-    if (!condition.empty()) {
-        script += "    if (("; script += condExpr; script += ")) { reason = 1; break; }\n";
-    }
-    script += "}\n";
-    script += "if (time() > safetyTime && reason == 0) reason = 2;\n";
-    script += "out[\"reason\"]          = reason;\n";
-    script += "out[\"final_sim_time\"]  = time();\n";
-    script += "out[\"steps_taken\"]     = steps;\n";
-    if (!condition.empty()) {
-        script += "out[\"condition_value\"] = (("; script += condExpr; script += ") ? 1 : 0);\n";
-    }
-    script += "return out;\n";
-
+    // Native (.1000100 — was executestring). The condition is arbitrary
+    // FlexScript: compile it ONCE into a scratch node ("return (<cond>);"), then
+    // evaluate() it natively each step. evaluate() runs the already-compiled node
+    // — no per-call string compile. The C++ step loop mirrors the run_to_end path.
     nlohmann::json out;
+    treenode condNode = 0;
     try {
-        Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-        if (v.type != VariantType::Map) {
-            out["ok"]            = false;
-            out["error_code"]    = "loop_returned_wrong_type";
-            out["error_message"] = "Step loop returned non-Map; the condition "
-                                   "expression may have a compile error. "
-                                   "Condition: " + condition;
-            return out;
-        }
-        Map m = static_cast<Map>(v);
-        int reason       = static_cast<int>(double(m["reason"]));
-        double finalTime = static_cast<double>(double(m["final_sim_time"]));
-        long long steps  = static_cast<long long>(double(m["steps_taken"]));
+        resetmodel(1);
+        applicationcommand("switchRunning", Variant(0.0));
 
-        std::string reasonStr;
-        switch (reason) {
-            case 1:  reasonStr = "condition_met";  break;
-            case 2:  reasonStr = "safety_capped";  break;
-            default: reasonStr = "events_drained"; break;
-        }
+        // Build + compile the condition node after reset so it survives the run.
+        condNode = assertsubnode(model(), "__modelerai_runUntilCond", DATATYPE_STRING);
+        std::string body = "return (" + condition + ");";
+        condNode->value = Variant(body.c_str());
+        switch_flexscript(condNode, 1);
+        buildnodeflexscript(condNode);
 
-        out["ok"]                  = true;
-        out["reason"]              = reasonStr;
-        out["final_sim_time"]      = finalTime;
-        out["steps_taken"]         = steps;
-        out["safety_sim_seconds"]  = safetySec;
-        if (!condition.empty()) {
-            int condVal = static_cast<int>(double(m["condition_value"]));
-            out["condition_value"] = (condVal != 0);
+        auto truthy = [](const Variant& cv) {
+            return (cv.type == VariantType::Number) ? (double(cv) != 0.0)
+                 : (cv.type != VariantType::Null);
+        };
+
+        long long steps = 0;
+        int reason = 0;   // 0=events_drained 1=condition_met 2=safety_capped
+        while (eventqty() > 0 && time() <= safetySec) {
+            step();
+            ++steps;
+            if (truthy(condNode->evaluate())) { reason = 1; break; }
         }
+        if (reason == 0 && time() > safetySec) reason = 2;
+
+        bool condVal = truthy(condNode->evaluate());
+
+        std::string reasonStr = (reason == 1) ? "condition_met"
+                              : (reason == 2) ? "safety_capped"
+                                              : "events_drained";
+        out["ok"]                 = true;
+        out["reason"]             = reasonStr;
+        out["final_sim_time"]     = time();
+        out["steps_taken"]        = steps;
+        out["safety_sim_seconds"] = safetySec;
+        out["condition_value"]    = condVal;
     } catch (const std::exception& e) {
         out["ok"]            = false;
         out["error_code"]    = std::string(commandName) + "_failed";
         out["error_message"] = std::string("step-loop threw: ") + e.what()
-                             + (condition.empty() ? std::string()
-                                : std::string(" — most likely a condition "
-                                              "expression error. Expression: ")
-                                  + condition);
+                             + " — most likely a condition expression error. Expression: " + condition;
+    } catch (...) {
+        out["ok"]            = false;
+        out["error_code"]    = std::string(commandName) + "_failed";
+        out["error_message"] = "step-loop threw a non-std exception. Expression: " + condition;
     }
+    if (objectexists(condNode)) { try { destroyobject(condNode); } catch (...) {} }
     return out;
 }
 
@@ -4408,12 +4434,14 @@ modelerai_export Variant ModelerAi_stopModel(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_stepModel(FLEXSIMINTERFACE)
 {
     try {
+        // Native (.1000100 — was executestring). step()/repaintall()/time() all
+        // link. (clearundohistory has no native decl in the SDK headers; dropped —
+        // a single step accrues negligible undo history.)
         double t = 0.0;
         try {
-            Variant v = executestring(
-                "clearundohistory(NULL); step(); repaintall(); return time();",
-                nullptr, nullptr, Variant());
-            if (v.type == VariantType::Number) t = double(v);
+            step();
+            repaintall();
+            t = time();
         } catch (const std::exception& e) {
             return returnError("step_failed", e.what());
         }
@@ -6204,68 +6232,54 @@ modelerai_export Variant ModelerAi_listGroupMembers(FLEXSIMINTERFACE)
             return returnError("missing_group", "Pass { group: \"Name\" } or a bare group name.");
         }
 
-        // We always walk direct children at least once to count nested
-        // groups; if recursive is on we ALSO emit the toFlatArray result
-        // as the canonical members list.
-        std::string script;
-        script += "treenode g = Tools.get(\"Group\", \"" + fsEscape(groupName) + "\");\n";
-        script += "if (!g) return -1;\n";
-        script += "Group gref = Group(\"" + fsEscape(groupName) + "\");\n";
-        script += "Map out = Map();\n";
-        script += "Array members = Array();\n";
-        script += "double nestedCount = 0;\n";
-        script += "double directCount = gref.length;\n";
-        // First pass — scan direct children to count nested groups. A
-        // direct child is "nested" when its parent under Tools is the
-        // Groups folder (i.e. its class is Group).
-        script += "for (int i = 1; i <= gref.length; i++) {\n";
-        script += "    treenode child = gref[i];\n";
-        script += "    if (!objectexists(child)) continue;\n";
-        script += "    treenode cls = classobject(child);\n";
-        script += "    if (cls && string(getname(cls)) == \"Group\") nestedCount = nestedCount + 1;\n";
-        script += "}\n";
-        if (recursive) {
-            script += "Array flat = gref.toFlatArray();\n";
-            script += "for (int i = 1; i <= flat.length; i++) {\n";
-            script += "    treenode m = flat[i];\n";
-            script += "    if (objectexists(m)) members.push(string(getname(m)));\n";
-            script += "}\n";
-        } else {
-            script += "for (int i = 1; i <= gref.length; i++) {\n";
-            script += "    treenode m = gref[i];\n";
-            script += "    if (objectexists(m)) members.push(string(getname(m)));\n";
-            script += "}\n";
-        }
-        script += "out[\"members\"]      = members;\n";
-        script += "out[\"nested\"]       = nestedCount;\n";
-        script += "out[\"direct_count\"] = directCount;\n";
-        script += "return out;\n";
-
-        Variant result;
-        try {
-            result = executestring(script.c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) { return returnError("list_members_failed", e.what()); }
-          catch (...) { return returnError("list_members_failed", "non-std exception."); }
-        if (result.type == VariantType::Number && static_cast<double>(result) < 0) {
+        // Native (.1000100 — was executestring). Group::toFlatArray()/length() are
+        // engine_export; Group::operator[] is NOT exported, so direct members (for
+        // nested-group counting + the non-recursive listing) come from the bound
+        // `members` coupling list. Each entry is one side of a two-way coupling;
+        // ownerobject() of the dereferenced value resolves to the member object
+        // whether the value is the member's holder or its far-side coupling node.
+        TreeNode* gNode = resolveGroupNode(groupName);
+        if (!gNode) {
             return returnError("group_not_found", "Group '" + groupName + "' does not exist.");
         }
-        if (result.type != VariantType::Map) {
-            return returnError("list_members_failed", "script returned wrong type.");
-        }
-        Map m = static_cast<Map>(result);
+        Group* gref = gNode->object<Group>();
+        int directCount = gref ? gref->length() : 0;
+
         nlohmann::json members = nlohmann::json::array();
-        Variant memsV = m["members"];
-        if (memsV.type == VariantType::Array) {
-            Array a = static_cast<Array>(memsV);
-            for (int i = 1; i <= a.length; ++i) members.push_back(std::string(a[i]));
+        int nestedCount = 0;
+
+        TreeNode* memNode = getvarnode(gNode, "members");
+        if (memNode) {
+            int nd = content(memNode);
+            for (int i = 1; i <= nd; ++i) {
+                TreeNode* c = rank(memNode, i);
+                if (!c) continue;
+                Variant fv = c->value;                       // coupling -> partner
+                if (fv.type != VariantType::TreeNode) continue;
+                TreeNode* mem = ownerobject(static_cast<TreeNode*>(fv));
+                if (!objectexists(mem)) continue;
+                TreeNode* cls = classobject(mem);
+                if (cls && std::string(getname(cls)) == "Group") ++nestedCount;
+                if (!recursive) members.push_back(std::string(getname(mem)));
+            }
         }
-        int nestedCount = (int)static_cast<double>(m["nested"]);
+
+        if (recursive && gref) {
+            Array flat = gref->toFlatArray();
+            for (int i = 1; i <= flat.length; ++i) {
+                Variant mv = flat[i];
+                if (mv.type != VariantType::TreeNode) continue;
+                TreeNode* mem = static_cast<TreeNode*>(mv);
+                if (objectexists(mem)) members.push_back(std::string(getname(mem)));
+            }
+        }
+
         nlohmann::json out;
         out["ok"]                 = true;
         out["group"]              = groupName;
         out["recursive"]          = recursive;
         out["member_count"]       = (int)members.size();
-        out["direct_count"]       = (int)static_cast<double>(m["direct_count"]);
+        out["direct_count"]       = directCount;
         out["has_nested_groups"]  = (nestedCount > 0);
         out["nested_group_count"] = nestedCount;
         out["members"]            = std::move(members);
@@ -9838,56 +9852,47 @@ modelerai_export Variant ModelerAi_setCreateObjectTargetLabel(FLEXSIMINTERFACE)
         if (actName.empty())   return returnError("missing_args", "activity is required.");
         if (labelName.empty()) return returnError("missing_args", "label_name is required.");
 
-        std::ostringstream fs;
-        fs << emitPfResolveScript("set_create_object_target_label", pfName);
-        fs << emitActivityResolveScript("set_create_object_target_label", actName, "activity", pfName, "iAct");
-
-        // Resolve the library-template assignTo (the SDT-style token-label
-        // structure we need to copy onto the instance).
-        fs << "treenode libAssignTo = maintree().find(\"project/library/processflow/activities/CreateObject>variables/assignTo\");\n";
-        fs << "if (!objectexists(libAssignTo)) { print(\"[ModelerAI] set_create_object_target_label: library template assignTo not found\\n\"); return \"ERR:library_template_missing:CreateObject library template assignTo node not found.\"; }\n";
-
-        // Resolve the instance's assignTo variable node.
-        fs << "treenode instAssignTo = getvarnode(activity, \"assignTo\");\n";
-        fs << "if (!objectexists(instAssignTo)) { print(\"[ModelerAI] set_create_object_target_label: instance assignTo not found\\n\"); return \"ERR:variable_not_found:assignTo variable not found on activity (is this a CreateObject?).\"; }\n";
-
-        // Copy the library template OVER the instance node:
-        // source.copy(destination, COPY_FLAG_REPLACE) replaces the destination
-        // node with a copy of the source. The returned treenode is the new
-        // node (the old instAssignTo handle may be stale after replace), so
-        // capture it and re-resolve from there.
-        fs << "treenode newAssignTo = libAssignTo.copy(instAssignTo, COPY_FLAG_REPLACE);\n";
-        fs << "if (!objectexists(newAssignTo)) newAssignTo = getvarnode(activity, \"assignTo\");\n";
-        fs << "print(\"[ModelerAI] set_create_object_target_label: copy/replace done\\n\");\n";
-
-        // Set the stringValue subnode (second subnode of assignTo) to the
-        // label name.
-        fs << "if (newAssignTo.subnodes.length < 2) { print(\"[ModelerAI] set_create_object_target_label: assignTo has < 2 subnodes after copy\\n\"); return \"ERR:malformed_template:assignTo template lacks the stringValue subnode (post-copy structure unexpected).\"; }\n";
-        fs << "treenode stringValueNode = newAssignTo.subnodes[2];\n";
-        fs << "stringValueNode.value = \"" << fsEscape(labelName) << "\";\n";
-
-        // Set assignType (overwrite=0, append=1).
-        fs << "setvarnum(activity, \"assignType\", " << (append ? "1" : "0") << ");\n";
-        fs << "print(\"[ModelerAI] set_create_object_target_label: done\\n\");\n";
-        fs << "return \"ok\";\n";
-
-        Variant v;
-        try {
-            v = executestring(fs.str().c_str(), nullptr, nullptr, Variant());
-        } catch (const std::exception& e) {
-            return returnError("set_target_label_failed",
-                std::string("FlexScript execution threw: ") + e.what());
-        } catch (...) {
-            return returnError("set_target_label_failed", "non-std exception.");
+        // Native (.1000100 — was an executestring builder). Resolve PF + activity
+        // with the shared native helpers; library template via node("MAIN:/..."),
+        // instance var via getvarnode; copy the template over the instance
+        // (TreeNode::copy + COPY_FLAG_REPLACE); set stringValue subnode + assignType.
+        treenode pf = resolvePfNode(pfName);
+        if (!objectexists(pf)) {
+            return returnError("processflow_not_found", "ProcessFlow '" + pfName + "' not found.");
+        }
+        treenode activity = resolveActivityNode(pf, actName);
+        if (!objectexists(activity)) {
+            return returnError("activity_not_found",
+                "Activity '" + actName + "' not found in ProcessFlow '" + pfName + "'.");
         }
 
-        if (v.type == VariantType::String) {
-            std::string s = std::string(v);
-            if (s.rfind("ERR:", 0) == 0) {
-                auto err = parseErrString(s, "set_target_label_failed");
-                return returnError(err["code"].get<std::string>().c_str(), err["msg"].get<std::string>());
-            }
+        treenode libAssignTo = node(
+            "MAIN:/project/library/processflow/activities/CreateObject>variables/assignTo", nullptr);
+        if (!objectexists(libAssignTo)) {
+            return returnError("library_template_missing",
+                "CreateObject library template assignTo node not found.");
         }
+        treenode instAssignTo = getvarnode(activity, "assignTo");
+        if (!objectexists(instAssignTo)) {
+            return returnError("variable_not_found",
+                "assignTo variable not found on activity (is this a CreateObject?).");
+        }
+
+        // copy(destination, COPY_FLAG_REPLACE) replaces the instance node with a
+        // copy of the template; the returned node is the new one (old handle may
+        // be stale), so re-resolve if it comes back null.
+        treenode newAssignTo = libAssignTo->copy(instAssignTo, COPY_FLAG_REPLACE);  // macro = 0x1
+        if (!objectexists(newAssignTo)) newAssignTo = getvarnode(activity, "assignTo");
+        if (!objectexists(newAssignTo) || content(newAssignTo) < 2) {
+            return returnError("malformed_template",
+                "assignTo template lacks the stringValue subnode (post-copy structure unexpected).");
+        }
+        treenode stringValueNode = rank(newAssignTo, 2);   // second subnode = stringValue
+        if (!objectexists(stringValueNode)) {
+            return returnError("malformed_template", "assignTo stringValue subnode missing.");
+        }
+        stringValueNode->value = Variant(labelName.c_str());
+        setvarnum(activity, "assignType", append ? 1.0 : 0.0);   // 0=overwrite 1=append
 
         nlohmann::json out;
         out["ok"]          = true;
