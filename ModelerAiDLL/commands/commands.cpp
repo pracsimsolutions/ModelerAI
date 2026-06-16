@@ -236,7 +236,12 @@ treenode resolveActivityNode(treenode pf, const std::string& actName)
     int seen = 0, n = content(pf);
     for (int i = 1; i <= n; ++i) {
         treenode c = rank(pf, i);
-        if (c && std::string(getname(c)) == base && ++seen == idx) return c;
+        // Require a classobject so we only match real activities — a PF's direct
+        // children also include bookkeeping containers (variables, connectors,
+        // stats, tools) that can share a name; matching one of those would let
+        // delete_activity/set_activity_variable mutate a structural node.
+        if (c && std::string(getname(c)) == base
+            && objectexists(classobject(c)) && ++seen == idx) return c;
     }
     return nullptr;
 }
@@ -2513,24 +2518,32 @@ NavWalkResult fixedResourceNavigatorMemberships(const std::string& frName)
     // Walk succeeded — empty is a legitimate "not in any navigator system".
     result.ok = true;
 
+    // Classify each collected anchor. CRITICAL: only keep recognized navigator
+    // anchor classes. The walked coupling space (especially >stored) holds many
+    // non-navigator couplings (flow ports, display blocks, library templates);
+    // those classify as "Unknown" and are pure noise — they can never match a
+    // requested system and previously flooded inspect_connections with hundreds
+    // of bogus entries. Drop them, and dedupe by anchor name (the same anchor can
+    // be reached through several couplings).
+    std::set<std::string> seenAnchors;
     for (TreeNode* anchor : anchors) {
         if (!objectexists(anchor)) continue;
 
+        std::string sys;
+        if      (isclasstype(anchor, "AGV::ControlPoint"))     sys = "AGV";
+        else if (isclasstype(anchor, "NetworkNode"))           sys = "Network";
+        else if (isclasstype(anchor, "GIS::Point"))            sys = "GIS";
+        else if (isclasstype(anchor, "AStar::AStarNavigator")) sys = "AStar";
+        else if (isclasstype(anchor, "Navigator"))             sys = "Other";
+        else continue;   // not a navigator anchor — skip the noise
+
         NavMembership m;
+        m.system = sys;
         try { m.anchor_name = getname(anchor); } catch (...) {}
+        if (!m.anchor_name.empty() && !seenAnchors.insert(m.anchor_name).second) continue;  // dedupe
         TreeNode* cls = nullptr;
         try { cls = classobject(anchor); } catch (...) {}
-        if (cls) {
-            try { m.anchor_class = getname(cls); } catch (...) {}
-        }
-
-        if      (isclasstype(anchor, "AGV::ControlPoint"))    m.system = "AGV";
-        else if (isclasstype(anchor, "NetworkNode"))          m.system = "Network";
-        else if (isclasstype(anchor, "GIS::Point"))           m.system = "GIS";
-        else if (isclasstype(anchor, "AStar::AStarNavigator"))m.system = "AStar";
-        else if (isclasstype(anchor, "Navigator"))            m.system = "Other";
-        else                                                  m.system = "Unknown";
-
+        if (cls) { try { m.anchor_class = getname(cls); } catch (...) {} }
         result.memberships.push_back(std::move(m));
     }
     return result;
@@ -3314,6 +3327,26 @@ modelerai_export Variant ModelerAi_disconnect(FLEXSIMINTERFACE)
                 e["anchor"]       = m.anchor_name;
                 e["anchor_class"] = m.anchor_class;
                 removed.push_back(std::move(e));
+            }
+            // Re-verify removal: a 'Q' drag can complete without throwing yet
+            // leave the membership in place (wrong gesture for some anchor types).
+            // Re-walk and demote any anchor that's still present to a failure so
+            // we never report a dangling membership as removed.
+            NavWalkResult afterWalk = fixedResourceNavigatorMemberships(fromName);
+            if (afterWalk.ok) {
+                std::set<std::string> stillAnchors;
+                for (const auto& m : afterWalk.memberships) stillAnchors.insert(m.anchor_name);
+                nlohmann::json reallyRemoved = nlohmann::json::array();
+                for (auto& e : removed) {
+                    std::string a = e.value("anchor", std::string("?"));
+                    std::string s = e.value("system", std::string("?"));
+                    if (stillAnchors.count(a)) {
+                        failures.push_back(a + " (still in system '" + s + "' after Q-disconnect)");
+                    } else {
+                        reallyRemoved.push_back(e);
+                    }
+                }
+                removed = std::move(reallyRemoved);
             }
             nlohmann::json out;
             out["ok"]          = failures.empty();
@@ -6728,6 +6761,7 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
         }
 
         std::string outKind;
+        int droppedNodeRefCells = 0;   // bundle node/pointer row values we can't write
         try {
             if (kindEnum == Kind::Variant) {
                 Variant cv; std::string err;
@@ -6803,7 +6837,11 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
                                                         : std::string(""));
                                 setbundlevalue(cellNode, e, fieldIdx, sv.c_str());
                             } else if (fieldTypes[c] == "node" || fieldTypes[c] == "pointer") {
-                                // node-ref cells not expressible via setbundlevalue overloads
+                                // node-ref cells aren't expressible via the
+                                // setbundlevalue overloads (no treenode overload),
+                                // so a supplied value can't be written — count it
+                                // and warn rather than silently claiming success.
+                                if (!cell.is_null()) ++droppedNodeRefCells;
                             } else {
                                 double dv = cell.is_boolean() ? (cell.get<bool>() ? 1.0 : 0.0)
                                     : (cell.is_number() ? cell.get<double>() : 0.0);
@@ -6857,6 +6895,12 @@ modelerai_export Variant ModelerAi_setGlobalTableCell(FLEXSIMINTERFACE)
         out["row"]        = row;
         out["col"]        = col;
         out["value_kind"] = outKind;
+        if (droppedNodeRefCells > 0) {
+            out["warning"] = std::to_string(droppedNodeRefCells) +
+                " node/pointer bundle cell value(s) were NOT written — node-ref "
+                "bundle fields can't be populated through this tool (the field "
+                "structure was created, but supply pointer values another way).";
+        }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("set_global_table_cell", e.what()); }
       catch (...)                     { return returnException("set_global_table_cell", "unknown"); }
