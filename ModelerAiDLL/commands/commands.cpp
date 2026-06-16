@@ -4237,21 +4237,28 @@ nlohmann::json runStepLoopShared(const char* commandName,
         switch_flexscript(condNode, 1);
         buildnodeflexscript(condNode);
 
+        // A condition is "met" only when it yields a finite, non-zero NUMBER.
+        // A non-Number result (e.g. a condition that returns a treenode/string) or
+        // NaN must NOT count as true — otherwise the run stops on step 1 with a
+        // bogus condition_met. (d != d) is the header-free NaN test.
         auto truthy = [](const Variant& cv) {
-            return (cv.type == VariantType::Number) ? (double(cv) != 0.0)
-                 : (cv.type != VariantType::Null);
+            if (cv.type != VariantType::Number) return false;
+            double d = (double)cv;
+            return !(d != d) && d != 0.0;
         };
 
         long long steps = 0;
         int reason = 0;   // 0=events_drained 1=condition_met 2=safety_capped
+        bool condVal = false;   // last in-loop evaluation — reported as condition_value
         while (eventqty() > 0 && time() <= safetySec) {
             step();
             ++steps;
-            if (truthy(condNode->evaluate())) { reason = 1; break; }
+            condVal = truthy(condNode->evaluate());
+            if (condVal) { reason = 1; break; }
         }
         if (reason == 0 && time() > safetySec) reason = 2;
-
-        bool condVal = truthy(condNode->evaluate());
+        // NOTE: no post-loop re-evaluate — that would double-fire any side effects
+        // in the condition and could turn a clean run into a reported failure.
 
         std::string reasonStr = (reason == 1) ? "condition_met"
                               : (reason == 2) ? "safety_capped"
@@ -6254,13 +6261,19 @@ modelerai_export Variant ModelerAi_listGroupMembers(FLEXSIMINTERFACE)
             for (int i = 1; i <= nd; ++i) {
                 TreeNode* c = rank(memNode, i);
                 if (!c) continue;
-                Variant fv = c->value;                       // coupling -> partner
-                if (fv.type != VariantType::TreeNode) continue;
-                TreeNode* mem = ownerobject(static_cast<TreeNode*>(fv));
-                if (!objectexists(mem)) continue;
-                TreeNode* cls = classobject(mem);
-                if (cls && std::string(getname(cls)) == "Group") ++nestedCount;
-                if (!recursive) members.push_back(std::string(getname(mem)));
+                // Guard per entry: reading c->value / ownerobject() can throw a
+                // non-std FlexSim exception on some coupling node types — skip the
+                // offending entry instead of aborting the whole listing. Detect a
+                // nested group via isclasstype (reliable) rather than the class
+                // node's name string.
+                try {
+                    Variant fv = c->value;                   // coupling -> partner
+                    if (fv.type != VariantType::TreeNode) continue;
+                    TreeNode* mem = ownerobject(static_cast<TreeNode*>(fv));
+                    if (!objectexists(mem)) continue;
+                    if (isclasstype(mem, "Group")) ++nestedCount;
+                    if (!recursive) members.push_back(std::string(getname(mem)));
+                } catch (...) { /* skip this coupling entry */ }
             }
         }
 
