@@ -2154,11 +2154,17 @@ modelerai_export Variant ModelerAi_deleteObject(FLEXSIMINTERFACE)
         // Walk the WHOLE model tree (not just top-level subnodes) — AGV
         // ControlPoints commonly live inside Planes or other containers
         // and the shallow walk would have missed them.
-        if (isclasstype(obj, "AGV::AGVNetwork")) {
-            // Native (.1000093 — was a forobjecttreeunder executestring walk).
+        // The auto-created AGV network's class short-name is "AGVNavigator"
+        // (classobject().name returns the SHORT name, no module prefix); the
+        // qualified "AGV::AGVNetwork" string does NOT match via isclasstype.
+        // Keep the isclasstype call as a fallback in case the type registers.
+        if (className == "AGVNavigator" || isclasstype(obj, "AGV::AGVNetwork")) {
+            // Native (.1000094 — was a forobjecttreeunder executestring walk).
             // nextforobjecttreeunder iterates the object tree directly; collect
-            // any object whose class name starts with "AGV::" (excluding the
-            // network being deleted), capped at 10, deduped by name.
+            // any AGV-typed object (excluding the network being deleted), capped
+            // at 10, deduped by name. Detect AGV objects via isclasstype against
+            // the qualified AGV leaf types — classobject().name returns SHORT
+            // names with no "AGV::" prefix, so a name-prefix test never matches.
             std::vector<std::string> dependents;
             std::set<std::string> seen;
             treenode top = model();
@@ -2166,10 +2172,13 @@ modelerai_export Variant ModelerAi_deleteObject(FLEXSIMINTERFACE)
                  objectexists(n) && dependents.size() < 10;
                  n = nextforobjecttreeunder(n, top)) {
                 if (n == obj) continue;
+                bool isAgv = isclasstype(n, "AGV::StraightPath")
+                          || isclasstype(n, "AGV::CurvedPath")
+                          || isclasstype(n, "AGV::ControlPoint")
+                          || isclasstype(n, "AGV::ControlArea");
+                if (!isAgv) continue;
                 treenode cls = classobject(n);
-                if (!objectexists(cls)) continue;
-                std::string clsName = std::string(getname(cls));
-                if (clsName.rfind("AGV::", 0) != 0) continue;   // not an AGV class
+                std::string clsName = objectexists(cls) ? std::string(getname(cls)) : "AGV";
                 std::string nm = std::string(getname(n));
                 if (!seen.insert(nm).second) continue;
                 dependents.push_back(nm + " (" + clsName + ")");
@@ -5288,11 +5297,48 @@ nlohmann::json pmValueToJson(const Variant& v)
     }
 }
 
+// Native PM lookup: walk every PerformanceMeasureTable's bound performanceMeasures
+// var space and return the PM row node whose Name matches (or nullptr). Mirrors the
+// delete_performance_measure walk — getvarnode reaches the bound >variables space
+// that t.find("variables") can't traverse (the .1000058 traversal bug).
+static TreeNode* findPmNodeByName(const std::string& name)
+{
+    TreeNode* allTables = model()->find("Tools/PerformanceMeasureTables");
+    if (!allTables) return nullptr;
+    int nt = content(allTables);
+    for (int iT = 1; iT <= nt; ++iT) {
+        TreeNode* t = rank(allTables, iT);
+        if (!t) continue;
+        TreeNode* pms = getvarnode(t, "performanceMeasures");
+        if (!pms) continue;
+        int np = content(pms);
+        for (int iP = 1; iP <= np; ++iP) {
+            TreeNode* pm = rank(pms, iP);
+            if (!pm) continue;
+            TreeNode* nm = pm->find("Name");
+            if (nm && std::string(nm->value) == name) return pm;
+        }
+    }
+    return nullptr;
+}
+
+// Evaluate a PM row node natively. Its Value/valueNode child holds the FlexScript
+// body; TreeNode::evaluate() runs the already-compiled node (engine_export instance
+// method — no executestring). Falls back to evaluating the Value node directly.
+static Variant evaluatePmNode(TreeNode* pm)
+{
+    if (!pm) return Variant();
+    TreeNode* valNode = pm->find("Value");
+    if (!valNode) return Variant();
+    TreeNode* vn = valNode->find("valueNode");
+    if (vn) return vn->evaluate();
+    return valNode->evaluate();
+}
+
 // ============================================================================
 // modelerai_get_performance_measure(name)
-//   Evaluates a single PM via Model.performanceMeasures[<name>] and returns
-//   the value. Marshalled through pmValueToJson — supports number, string,
-//   treenode (as path), array, map.
+//   Evaluates a single PM and returns the value. Marshalled through
+//   pmValueToJson — supports number, string, treenode (as path), array, map.
 // ============================================================================
 modelerai_export Variant ModelerAi_getPerformanceMeasure(FLEXSIMINTERFACE)
 {
@@ -5304,24 +5350,24 @@ modelerai_export Variant ModelerAi_getPerformanceMeasure(FLEXSIMINTERFACE)
             return returnError("missing_name",
                 "modelerai_get_performance_measure(name) requires a name.");
         }
-        // Evaluate the PM: Model.performanceMeasures["X"] is a StatusVariable that
-        // resolves to the PM's "Value" node; its "valueNode" child holds the
-        // FlexScript body, which .evaluate() runs to produce the number. (.1000092
-        // — `.value` raised "StatusVariable does not support property value"; the
-        // accessor alone returned the node, not the value. Verified in-console:
-        // vn.evaluate() == the live count.)
-        std::string script =
-            "treenode pmNode = Model.performanceMeasures[\"" + fsEscape(name) + "\"];\n"
-            "if (!objectexists(pmNode)) return nullvar;\n"
-            "treenode vn = pmNode.find(\"valueNode\");\n"
-            "if (objectexists(vn)) return vn.evaluate();\n"
-            "return pmNode.evaluate();";
+        // Native (.1000094 — was executestring). Locate the PM row by name across
+        // every table, then run its valueNode via TreeNode::evaluate(). The PM body
+        // stays FlexScript (user code in the tree) but we invoke it with a native
+        // engine call instead of compiling a generated string. (.1000092 — `.value`
+        // raised "StatusVariable does not support property value"; the node has to
+        // be evaluated, which evaluatePmNode does.)
+        TreeNode* pm = findPmNodeByName(name);
+        if (!pm) {
+            return returnError("pm_not_found",
+                "No performance measure named '" + name + "' in any table.");
+        }
         nlohmann::json value;
         try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            value = pmValueToJson(v);
+            value = pmValueToJson(evaluatePmNode(pm));
         } catch (const std::exception& e) {
             return returnError("eval_failed", std::string("Evaluating PM `") + name + "` threw: " + e.what());
+        } catch (const char* msg) {
+            return returnError("eval_failed", std::string("Evaluating PM `") + name + "` threw: " + (msg ? msg : "FlexScript error"));
         }
 
         nlohmann::json out;
@@ -5342,57 +5388,48 @@ modelerai_export Variant ModelerAi_getPerformanceMeasure(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_getPerformanceMeasures(FLEXSIMINTERFACE)
 {
     try {
-        // First enumerate names. We evaluate one-at-a-time in C++ so a single
-        // bad PM script doesn't kill the whole snapshot.
-        // Enumerate via the engine accessor (same fix as list_performance_
-        // measures — the tree-walk didn't traverse the bound >variables space).
-        std::string listScript;
-        listScript += "Array tableNames = Model.performanceMeasures.tableNames;\n";
-        listScript += "Array out = Array();\n";
-        listScript += "for (int t = 1; t <= tableNames.length; t++) {\n";
-        listScript += "    Array names = Model.performanceMeasures.names(string(tableNames[t]));\n";
-        listScript += "    for (int i = 1; i <= names.length; i++)\n";
-        listScript += "        if (string(names[i]) != \"\") out.push(string(names[i]));\n";
-        listScript += "}\n";
-        listScript += "return out;\n";
-
-        std::vector<std::string> names;
-        try {
-            Variant v = executestring(listScript.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Array) {
-                Array a = static_cast<Array>(v);
-                for (int i = 1; i <= a.length; ++i) {
-                    Variant nv = a[i];
-                    if (nv.type == VariantType::String) names.push_back(std::string(nv));
-                }
-            }
-        } catch (const std::exception& e) {
-            return returnError("list_failed", e.what());
-        }
-
+        // Native (.1000094 — was two executestring calls: one to enumerate names,
+        // one per PM to evaluate). Single tree-walk over every table's bound
+        // performanceMeasures space; evaluate each row's valueNode via
+        // TreeNode::evaluate(). One bad PM body is caught per-row so it doesn't
+        // kill the whole snapshot. Same walk as findPmNodeByName /
+        // delete_performance_measure (getvarnode reaches the >variables space).
         nlohmann::json values = nlohmann::json::object();
         nlohmann::json errors = nlohmann::json::object();
-        for (const auto& n : names) {
-            // Evaluate via the PM's valueNode (see get_performance_measure, .1000092).
-            std::string script =
-                "treenode pmNode = Model.performanceMeasures[\"" + fsEscape(n) + "\"];\n"
-                "if (!objectexists(pmNode)) return nullvar;\n"
-                "treenode vn = pmNode.find(\"valueNode\");\n"
-                "if (objectexists(vn)) return vn.evaluate();\n"
-                "return pmNode.evaluate();";
-            try {
-                Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-                values[n] = pmValueToJson(v);
-            } catch (const std::exception& e) {
-                errors[n] = e.what();
-            } catch (...) {
-                errors[n] = "unknown exception";
+        int count = 0;
+        TreeNode* allTables = model()->find("Tools/PerformanceMeasureTables");
+        if (allTables) {
+            int nt = content(allTables);
+            for (int iT = 1; iT <= nt; ++iT) {
+                TreeNode* t = rank(allTables, iT);
+                if (!t) continue;
+                TreeNode* pms = getvarnode(t, "performanceMeasures");
+                if (!pms) continue;
+                int np = content(pms);
+                for (int iP = 1; iP <= np; ++iP) {
+                    TreeNode* pm = rank(pms, iP);
+                    if (!pm) continue;
+                    TreeNode* nm = pm->find("Name");
+                    if (!nm) continue;
+                    std::string pmName = std::string(nm->value);
+                    if (pmName.empty()) continue;
+                    ++count;
+                    try {
+                        values[pmName] = pmValueToJson(evaluatePmNode(pm));
+                    } catch (const std::exception& e) {
+                        errors[pmName] = e.what();
+                    } catch (const char* msg) {
+                        errors[pmName] = msg ? msg : "FlexScript error";
+                    } catch (...) {
+                        errors[pmName] = "unknown exception";
+                    }
+                }
             }
         }
 
         nlohmann::json out;
         out["ok"]                   = true;
-        out["count"]                = static_cast<int>(names.size());
+        out["count"]                = count;
         out["performance_measures"] = std::move(values);
         if (!errors.empty()) out["errors"] = std::move(errors);
         return returnJson(out);
