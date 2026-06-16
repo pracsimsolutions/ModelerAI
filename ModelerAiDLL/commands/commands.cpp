@@ -2155,38 +2155,25 @@ modelerai_export Variant ModelerAi_deleteObject(FLEXSIMINTERFACE)
         // ControlPoints commonly live inside Planes or other containers
         // and the shallow walk would have missed them.
         if (isclasstype(obj, "AGV::AGVNetwork")) {
+            // Native (.1000093 — was a forobjecttreeunder executestring walk).
+            // nextforobjecttreeunder iterates the object tree directly; collect
+            // any object whose class name starts with "AGV::" (excluding the
+            // network being deleted), capped at 10, deduped by name.
             std::vector<std::string> dependents;
-            try {
-                std::string script;
-                script += "Array out;\n";
-                script += "Object skipMe = Model.find(\"" + fsEscape(objectName) + "\");\n";
-                script += "forobjecttreeunder(model()) {\n";
-                script += "    treenode candidate = ownerobject(a.value);\n";
-                script += "    if (!objectexists(candidate)) continue;\n";
-                script += "    if (candidate == skipMe) continue;\n";
-                script += "    treenode cls = classobject(candidate);\n";
-                script += "    if (!objectexists(cls)) continue;\n";
-                script += "    string nm = getname(cls);\n";
-                script += "    if (nm.substr(0, 5) == \"AGV::\")\n";
-                script += "        out.push(candidate);\n";
-                script += "}\n";
-                script += "return out;\n";
-                Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-                if (v.type == VariantType::Array) {
-                    Array arr = static_cast<Array>(v);
-                    std::set<std::string> seen;  // dedupe (forobjecttreeunder can revisit)
-                    for (int i = 1; i <= arr.length && dependents.size() < 10; ++i) {
-                        if (arr[i].type != VariantType::TreeNode) continue;
-                        TreeNode* dep = static_cast<TreeNode*>(arr[i]);
-                        if (!objectexists(dep)) continue;
-                        std::string nm = getname(dep);
-                        if (!seen.insert(nm).second) continue;
-                        TreeNode* depCls = classobject(dep);
-                        std::string depClassName = depCls ? std::string(getname(depCls)) : std::string();
-                        dependents.push_back(nm + " (" + depClassName + ")");
-                    }
-                }
-            } catch (...) {}
+            std::set<std::string> seen;
+            treenode top = model();
+            for (treenode n = nextforobjecttreeunder(top, top);
+                 objectexists(n) && dependents.size() < 10;
+                 n = nextforobjecttreeunder(n, top)) {
+                if (n == obj) continue;
+                treenode cls = classobject(n);
+                if (!objectexists(cls)) continue;
+                std::string clsName = std::string(getname(cls));
+                if (clsName.rfind("AGV::", 0) != 0) continue;   // not an AGV class
+                std::string nm = std::string(getname(n));
+                if (!seen.insert(nm).second) continue;
+                dependents.push_back(nm + " (" + clsName + ")");
+            }
             if (!dependents.empty()) {
                 std::string msg = "Cannot delete '" + objectName + "' (AGV::AGVNetwork): "
                                   "AGV objects still depend on it (recursive scan). Delete "
@@ -3411,32 +3398,23 @@ modelerai_export Variant ModelerAi_inspectConnections(FLEXSIMINTERFACE)
             }
         }
 
-        // Groups — walk the >Groups attribute subtree, collect Group owners.
-        // Pattern from user: forobjecttreeunder + isclasstype check.
+        // Groups — which groups is this object a member of? Native (.1000093 —
+        // was a forobjecttreeunder walk of the >Groups attribute). Iterate every
+        // Group under Tools/Groups and test direct membership via the engine_export
+        // Group::isMember — the canonical inverse of the >Groups coupling, same
+        // result without traversing the coupling subtree.
         nlohmann::json groupsArr = nlohmann::json::array();
-        try {
-            std::string script;
-            script += "Object o = Model.find(\"" + fsEscape(name) + "\");\n";
-            script += "Array out = [];\n";
-            script += "treenode g = o.find(\">Groups\");\n";
-            script += "if (objectexists(g)) {\n";
-            script += "    forobjecttreeunder(g) {\n";
-            script += "        treenode pg = ownerobject(a.value);\n";
-            script += "        if (isclasstype(pg, \"Group\"))\n";
-            script += "            out.push(pg.name);\n";
-            script += "    }\n";
-            script += "}\n";
-            script += "return out;\n";
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type == VariantType::Array) {
-                Array a = static_cast<Array>(v);
-                for (int i = 1; i <= a.length; ++i) {
-                    if (a[i].type == VariantType::String) {
-                        groupsArr.push_back(std::string(a[i]));
-                    }
+        if (TreeNode* gRoot = model()->find("Tools/Groups")) {
+            int gn = content(gRoot);
+            for (int i = 1; i <= gn; ++i) {
+                TreeNode* gNode = rank(gRoot, i);
+                if (!gNode) continue;
+                Group* g = gNode->object<Group>();
+                if (g && g->isMember(obj, 0)) {
+                    groupsArr.push_back(std::string(getname(gNode)));
                 }
             }
-        } catch (...) {}
+        }
 
         nlohmann::json out;
         out["ok"]            = true;
