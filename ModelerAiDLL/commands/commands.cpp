@@ -3442,6 +3442,11 @@ modelerai_export Variant ModelerAi_inspectConnections(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("inspect_connections", "unknown"); }
 }
 
+// Parameter tree-walk helpers (defined alongside the PM helpers below;
+// forward-declared so add_parameter / set_parameter can share them).
+static TreeNode* findParamNodeByName(const std::string& name);
+static TreeNode* owningParamTable(TreeNode* p);
+
 // ============================================================================
 // modelerai_add_parameter(json_string)
 //   json shape:
@@ -3582,194 +3587,39 @@ modelerai_export Variant ModelerAi_addParameter(FLEXSIMINTERFACE)
                 "passthrough type requires reference_path.");
         }
 
-        // Build the registration FlexScript.
-        std::string script;
-        script.reserve(1024 + sequenceValues.size() * 16 + optionNames.size() * 32);
+        // Native (.1000099 — was a ~200-line executestring builder). Validate the
+        // FlexScript hook bodies FIRST so a bad body can't leave a half-built row,
+        // then build the row with SDK calls (Tools::create, function_s("addParameter"),
+        // assertsubnode, pointTo, switch_flexscript/buildnodeflexscript). The hook +
+        // expression bodies stay FlexScript (authored user code in the tree); only
+        // the generated-string eval (executestring) is removed.
 
-        // Table lookup: (1) exact match on the supplied name, (2) fall back to
-        // the first existing ParameterTable (FlexSim ships every new model with
-        // one — the AI shouldn't have to know its exact name), (3) create a
-        // new table only if the container is empty.
-        script += "treenode tbl = 0;\n";
-        if (!tableName.empty()) {
-            script += "tbl = Tools.get(\"ParameterTable\", \""; script += fsEscape(tableName); script += "\");\n";
-        }
-        script += "if (!tbl) {\n";
-        script += "    treenode container = Model.find(\"Tools/ParameterTables\");\n";
-        script += "    if (container && container.subnodes.length > 0) {\n";
-        script += "        tbl = container.subnodes[1];\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "if (!tbl) {\n";
-        script += "    tbl = Tools.create(\"ParameterTable\", \"\");\n";
-        script += "    tbl.name = \""; script += fsEscape(tableName.empty() ? std::string("Parameters") : tableName); script += "\";\n";
-        script += "}\n";
-        script += "if (!tbl) { print(\"add_parameter: could not find or create a ParameterTable\"); return 0; }\n";
-
-        // Cross-table uniqueness (Model.parameters["Name"] is GLOBAL).
-        // Use treenode.find (subtree path search) — NodeListArray (subnodes)
-        // has assert but NOT find; node.find finds a descendant by relative path.
-        script += "treenode allTables = Model.find(\"Tools/ParameterTables\");\n";
-        script += "treenode crossTable = 0;\n";
-        script += "if (allTables) {\n";
-        script += "    for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
-        script += "        treenode t = allTables.subnodes[iT];\n";
-        script += "        if (t == tbl) continue;\n";
-        script += "        treenode psOther = t.find(\"variables\");\n";
-        script += "        if (!psOther) continue;\n";
-        script += "        psOther = psOther.find(\"parameters\");\n";
-        script += "        if (!psOther) continue;\n";
-        script += "        for (int iPo = 1; iPo <= psOther.subnodes.length; iPo++) {\n";
-        script += "            treenode po = psOther.subnodes[iPo];\n";
-        script += "            treenode nmo = po.find(\"Name\");\n";
-        script += "            if (nmo && nmo.value == \""; script += fsEscape(name); script += "\") {\n";
-        script += "                crossTable = t; break;\n";
-        script += "            }\n";
-        script += "        }\n";
-        script += "        if (crossTable) break;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "if (crossTable) { print(\"add_parameter: name '"; script += fsEscape(name);
-        script += "' already exists in another table: \" + crossTable.name + \".\"); return 0; }\n";
-
-        // Same-table duplicate.
-        script += "treenode pset = tbl.subnodes.assert(\"variables\").subnodes.assert(\"parameters\");\n";
-        script += "treenode existing = 0;\n";
-        script += "for (int iX = 1; iX <= pset.subnodes.length; iX++) {\n";
-        script += "    treenode p = pset.subnodes[iX];\n";
-        script += "    treenode nm = p.find(\"Name\");\n";
-        script += "    if (nm && nm.value == \""; script += fsEscape(name); script += "\") { existing = p; break; }\n";
-        script += "}\n";
-        if (replace) {
-            script += "if (existing) existing.destroy();\n";
-        } else {
-            script += "if (existing) { print(\"add_parameter: duplicate name in same table (use replace=true): "; script += fsEscape(name); script += "\"); return 0; }\n";
-        }
-
-        // Create row + configure.
-        script += "treenode np = function_s(tbl, \"addParameter\");\n";
-        script += "np.subnodes.assert(\"Name\").value = \""; script += fsEscape(name); script += "\";\n";
-        script += "treenode v = np.subnodes.assert(\"Value\");\n";
-        script += "v.subnodes.assert(\"type\").value = "; script += std::to_string(static_cast<int>(type)); script += ";\n";
-
-        auto setNum = [&](const char* sub, double n) {
-            script += "v.subnodes.assert(\""; script += sub; script += "\").value = ";
-            script += std::to_string(n); script += ";\n";
-        };
-
-        if (type == ParamType::Continuous || type == ParamType::Integer || type == ParamType::Discrete) {
-            // ALWAYS emit bounds for numeric types. FlexSim's default
-            // upperBound on a fresh row is 10, and onConstrain clamps any
-            // value above that, producing "Unable to set X to Y; using 10
-            // instead" warnings. Permissive defaults (-1e9 / 1e9) when the
-            // caller doesn't specify, so the value assignment below succeeds.
-            setNum("lowerBound", hasLower ? lowerBound : -1e9);
-            setNum("upperBound", hasUpper ? upperBound :  1e9);
-        }
-        if (type == ParamType::Discrete && hasStep) setNum("stepSize", stepSize);
-
-        if (type == ParamType::Option) {
-            script += "treenode opts = v.subnodes.assert(\"options\");\n";
-            // Bounded purge — see comment in trigger tools. FlexScript has
-            // no try/catch; an uncapped while-destroy can freeze the engine.
-            script += "for (int __pO = 0; __pO < 4096 && opts.subnodes.length; __pO++) opts.subnodes[1].destroy();\n";
-            for (size_t i = 0; i < optionNames.size(); ++i) {
-                script += "opts.subnodes.assert(\""; script += fsEscape(optionNames[i]); script += "\").value = ";
-                script += std::to_string(static_cast<int>(i) + 1); script += ";\n";
-            }
-        }
-
-        if (type == ParamType::Sequence) {
-            setNum("sequenceLength", static_cast<double>(sequenceLength));
-            if (!sequenceValues.empty()) {
-                script += "Array seq = [";
-                for (size_t i = 0; i < sequenceValues.size(); ++i) {
-                    if (i) script += ",";
-                    script += std::to_string(static_cast<int>(sequenceValues[i]));
-                }
-                script += "];\n";
-                script += "v.value = seq;\n";
-            }
-        }
-
-        if (type == ParamType::Expression) {
-            script += "treenode exprNode = v.subnodes.assert(\"expression\");\n";
-            script += "exprNode.value = \""; script += fsEscape(expressionCode); script += "\";\n";
-            script += "enablecode(exprNode);\n";
-            script += "buildnodeflexscript(exprNode);\n";
-            script += "v.value = \""; script += fsEscape(expressionCode); script += "\";\n";
-        }
-
-        if (type == ParamType::Passthrough || type == ParamType::Custom) {
-            if (!referencePath.empty()) {
-                script += "treenode refn = Model.find(\""; script += fsEscape(referencePath); script += "\");\n";
-                script += "if (!refn) { print(\"add_parameter: reference_path not found: "; script += fsEscape(referencePath); script += "\"); return 0; }\n";
-                script += "v.subnodes.assert(\"reference\").value = refn;\n";
-            }
-        }
-
-        if (hasValue) {
-            if (type == ParamType::Sequence || type == ParamType::Passthrough || type == ParamType::Expression) {
-                // ignored — handled above
-            } else if (valueJson.is_number()) {
-                script += "v.value = "; script += std::to_string(valueJson.get<double>()); script += ";\n";
-            } else if (valueJson.is_string()) {
-                script += "v.value = \""; script += fsEscape(valueJson.get<std::string>()); script += "\";\n";
-            }
-        }
-
-        if (!description.empty()) {
-            script += "np.subnodes.assert(\"Description\").value = \""; script += fsEscape(description); script += "\";\n";
-        }
-        if (!displayUnits.empty()) {
-            script += "np.subnodes.assert(\"Display Units\").value = \""; script += fsEscape(displayUnits); script += "\";\n";
-        }
-
-        // on_set / on_constrain — script hooks. Same pattern as Expression:
-        // write source, enablecode, buildnodeflexscript. Bodies come from
-        // the picklist library (flexsim-parameter-onset). The 4-param
-        // signature is mandatory:
-        //   treenode reference = param(1);
-        //   Variant  newValue  = param(2);
-        //   Variant  oldValue  = param(3);
-        //   int      isReset   = param(4);
+        // on_set: auto-prepend the mandatory 4-param signature when the body uses
+        // reference/newValue/oldValue/isReset without declaring them, then scan.
+        std::string finalOnSet;
         if (!onSetBody.empty()) {
-            // Auto-prepend the 4-param signature if the body uses
-            // `reference`/`newValue`/`oldValue`/`isReset` without
-            // declaring them. Same QoL as PM expression bodies; the
-            // picklist library template bodies declare the params, so
-            // bodies copied verbatim work as-is. Bodies that just paste
-            // the action without the preamble get the preamble inserted.
-            bool usesRef     = onSetBody.find("reference")     != std::string::npos;
-            bool declRef     = onSetBody.find("treenode reference") != std::string::npos;
-            bool usesNew     = onSetBody.find("newValue")      != std::string::npos;
-            bool declNew     = onSetBody.find("Variant newValue") != std::string::npos
-                            || onSetBody.find("Variant  newValue") != std::string::npos;
-            bool usesOld     = onSetBody.find("oldValue")      != std::string::npos;
-            bool declOld     = onSetBody.find("Variant oldValue") != std::string::npos
-                            || onSetBody.find("Variant  oldValue") != std::string::npos;
-            bool usesReset   = onSetBody.find("isReset")       != std::string::npos;
-            bool declReset   = onSetBody.find("int isReset")   != std::string::npos
-                            || onSetBody.find("int  isReset")  != std::string::npos;
+            bool usesRef   = onSetBody.find("reference") != std::string::npos;
+            bool declRef   = onSetBody.find("treenode reference") != std::string::npos;
+            bool usesNew   = onSetBody.find("newValue") != std::string::npos;
+            bool declNew   = onSetBody.find("Variant newValue") != std::string::npos
+                          || onSetBody.find("Variant  newValue") != std::string::npos;
+            bool usesOld   = onSetBody.find("oldValue") != std::string::npos;
+            bool declOld   = onSetBody.find("Variant oldValue") != std::string::npos
+                          || onSetBody.find("Variant  oldValue") != std::string::npos;
+            bool usesReset = onSetBody.find("isReset") != std::string::npos;
+            bool declReset = onSetBody.find("int isReset") != std::string::npos
+                          || onSetBody.find("int  isReset") != std::string::npos;
             std::string preamble;
             if (usesRef   && !declRef)   preamble += "treenode reference = param(1);\n";
             if (usesNew   && !declNew)   preamble += "Variant newValue = param(2);\n";
             if (usesOld   && !declOld)   preamble += "Variant oldValue = param(3);\n";
             if (usesReset && !declReset) preamble += "int isReset = param(4);\n";
-            std::string finalOnSet = preamble + onSetBody;
-
-            // Run the antipattern scanner on the body — same protection
-            // as run_script. Deprecated forms in onSet bodies become
-            // production bugs the modeler can't easily inspect.
+            finalOnSet = preamble + onSetBody;
             std::string anName, anRem;
             if (ModelerAi::scanAntiPatterns(finalOnSet, anName, anRem)) {
                 return returnError("deprecated_api_in_on_set",
                     "on_set body uses a deprecated/hallucinated API: " + anRem);
             }
-            script += "treenode onSetHook = np.subnodes.assert(\"onSet\");\n";
-            script += "onSetHook.value = \""; script += fsEscape(finalOnSet); script += "\";\n";
-            script += "enablecode(onSetHook);\n";
-            script += "buildnodeflexscript(onSetHook);\n";
         }
         if (!onConstrainBody.empty()) {
             std::string anName, anRem;
@@ -3777,54 +3627,152 @@ modelerai_export Variant ModelerAi_addParameter(FLEXSIMINTERFACE)
                 return returnError("deprecated_api_in_on_constrain",
                     "on_constrain body uses a deprecated/hallucinated API: " + anRem);
             }
-            script += "treenode onConstrainHook = np.subnodes.assert(\"onConstrain\");\n";
-            script += "onConstrainHook.value = \""; script += fsEscape(onConstrainBody); script += "\";\n";
-            script += "enablecode(onConstrainHook);\n";
-            script += "buildnodeflexscript(onConstrainHook);\n";
         }
 
-        script += "return np;\n";
+        // Table lookup: exact name match, else first existing ParameterTable
+        // (every model ships with one), else create a new one.
+        treenode tbl = 0;
+        TreeNode* container = model()->find("Tools/ParameterTables");
+        if (!tableName.empty() && container) {
+            int nc = content(container);
+            for (int i = 1; i <= nc; ++i) {
+                TreeNode* t = rank(container, i);
+                if (t && std::string(getname(t)) == tableName) { tbl = t; break; }
+            }
+        }
+        if (!tbl && container && content(container) > 0) tbl = rank(container, 1);
+        if (!tbl) {
+            tbl = Tools::create("ParameterTable");
+            if (!objectexists(tbl)) {
+                return returnError("registration_failed", "Tools::create(\"ParameterTable\") returned null.");
+            }
+            setname(tbl, tableName.empty() ? "Parameters" : tableName.c_str());
+        }
 
-        // Execute (already on the main thread).
+        // Uniqueness: parameter names are global (Model.parameters[name] takes no
+        // table arg). Same-table hit is replace-or-reject; other-table is rejected.
+        if (TreeNode* dup = findParamNodeByName(name)) {
+            TreeNode* dupTbl = owningParamTable(dup);
+            if (dupTbl == tbl) {
+                if (replace) destroyobject(dup);
+                else return returnError("duplicate_name",
+                    "A parameter named '" + name + "' already exists in this table (use replace=true).");
+            } else {
+                return returnError("duplicate_name_other_table",
+                    "A parameter named '" + name + "' already exists in table '"
+                    + (dupTbl ? std::string(getname(dupTbl)) : std::string("?"))
+                    + "'. Parameter names must be globally unique.");
+            }
+        }
+
+        // Allocate the row via the table's addParameter node-function.
+        treenode np = 0;
+        {
+            Variant npv = function_s(tbl, "addParameter");
+            if (npv.type == VariantType::TreeNode) np = static_cast<treenode>(npv);
+        }
+        if (!objectexists(np)) {
+            return returnError("registration_failed", "addParameter did not return a valid row node.");
+        }
+
+        // Name + Value.type.
+        assertsubnode(np, "Name", DATATYPE_STRING)->value = Variant(name.c_str());
+        treenode vNode = assertsubnode(np, "Value", 0);
+        assertsubnode(vNode, "type", 0)->value = Variant((double)(int)type);
+
+        auto setNum = [&](const char* sub, double n) {
+            assertsubnode(vNode, sub, 0)->value = Variant(n);
+        };
+
+        if (type == ParamType::Continuous || type == ParamType::Integer || type == ParamType::Discrete) {
+            // ALWAYS emit bounds for numeric types. FlexSim's default upperBound on
+            // a fresh row is 10, and onConstrain clamps anything above it. Permissive
+            // defaults (-1e9 / 1e9) when the caller doesn't specify.
+            setNum("lowerBound", hasLower ? lowerBound : -1e9);
+            setNum("upperBound", hasUpper ? upperBound :  1e9);
+        }
+        if (type == ParamType::Discrete && hasStep) setNum("stepSize", stepSize);
+
+        if (type == ParamType::Option) {
+            treenode opts = assertsubnode(vNode, "options", 0);
+            // Bounded purge of any default options (cap guards against a runaway).
+            for (int guard = 0; guard < 4096 && content(opts) > 0; ++guard) {
+                treenode first = rank(opts, 1);
+                if (!first) break;
+                destroyobject(first);
+            }
+            for (size_t i = 0; i < optionNames.size(); ++i) {
+                assertsubnode(opts, optionNames[i].c_str(), 0)->value = Variant((double)(int)(i + 1));
+            }
+        }
+
+        if (type == ParamType::Sequence) {
+            setNum("sequenceLength", static_cast<double>(sequenceLength));
+            if (!sequenceValues.empty()) {
+                Array seq((int)sequenceValues.size());          // 1-based
+                for (size_t i = 0; i < sequenceValues.size(); ++i)
+                    seq[(int)i + 1] = Variant((double)(int)sequenceValues[i]);
+                vNode->value = Variant(seq);
+            }
+        }
+
+        if (type == ParamType::Expression) {
+            treenode exprNode = assertsubnode(vNode, "expression", DATATYPE_STRING);
+            exprNode->value = Variant(expressionCode.c_str());
+            switch_flexscript(exprNode, 1);
+            buildnodeflexscript(exprNode);
+            vNode->value = Variant(expressionCode.c_str());
+        }
+
+        if (type == ParamType::Passthrough || type == ParamType::Custom) {
+            if (!referencePath.empty()) {
+                treenode refn = model()->find(referencePath.c_str());
+                if (!objectexists(refn)) {
+                    return returnError("reference_not_found",
+                        "reference_path not found: " + referencePath);
+                }
+                assertsubnode(vNode, "reference", 0)->pointTo(refn);
+            }
+        }
+
+        if (hasValue) {
+            if (type == ParamType::Sequence || type == ParamType::Passthrough || type == ParamType::Expression) {
+                // handled above
+            } else if (valueJson.is_number()) {
+                vNode->value = Variant(valueJson.get<double>());
+            } else if (valueJson.is_string()) {
+                vNode->value = Variant(valueJson.get<std::string>().c_str());
+            }
+        }
+
+        if (!description.empty()) {
+            assertsubnode(np, "Description", DATATYPE_STRING)->value = Variant(description.c_str());
+        }
+        if (!displayUnits.empty()) {
+            assertsubnode(np, "Display Units", DATATYPE_STRING)->value = Variant(displayUnits.c_str());
+        }
+
+        // on_set / on_constrain hooks — bodies validated above; write + compile
+        // in-tree (switch_flexscript force-ON + buildnodeflexscript).
+        if (!finalOnSet.empty()) {
+            treenode onSetHook = assertsubnode(np, "onSet", DATATYPE_STRING);
+            onSetHook->value = Variant(finalOnSet.c_str());
+            switch_flexscript(onSetHook, 1);
+            buildnodeflexscript(onSetHook);
+        }
+        if (!onConstrainBody.empty()) {
+            treenode onConstrainHook = assertsubnode(np, "onConstrain", DATATYPE_STRING);
+            onConstrainHook->value = Variant(onConstrainBody.c_str());
+            switch_flexscript(onConstrainHook, 1);
+            buildnodeflexscript(onConstrainHook);
+        }
+
         std::string newPath;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type != VariantType::TreeNode) {
-                ModelerAi::bridge::consolePrint(
-                    "[ModelerAI] add_parameter FlexScript returned non-treenode. Script was:\n----\n"
-                    + script + "----\n");
-                return returnError("registration_failed",
-                    "Registration FlexScript did not return a treenode. Script was:\n" + script);
-            }
-            treenode created = static_cast<treenode>(v);
-            if (!created) {
-                ModelerAi::bridge::consolePrint(
-                    "[ModelerAI] add_parameter FlexScript returned null node. Script was:\n----\n"
-                    + script + "----\n");
-                return returnError("registration_failed",
-                    "Registration FlexScript returned a null node. Script was:\n" + script);
-            }
-            try { newPath = std::string(nodetomodelpath(created, 1).c_str()); } catch (...) {}
-        } catch (const std::exception& e) {
-            ModelerAi::bridge::consolePrint(
-                "[ModelerAI] add_parameter threw. Script was:\n----\n" + script + "----\n");
-            return returnError("registration_failed",
-                std::string(e.what()) + "\n--- script ---\n" + script);
-        } catch (const char* msg) {
-            ModelerAi::bridge::consolePrint(
-                "[ModelerAI] add_parameter threw. Script was:\n----\n" + script + "----\n");
-            return returnError("registration_failed",
-                std::string(msg ? msg : "FlexScript error (unknown)") + "\n--- script ---\n" + script);
-        } catch (...) {
-            ModelerAi::bridge::consolePrint(
-                "[ModelerAI] add_parameter threw unknown. Script was:\n----\n" + script + "----\n");
-            return returnError("registration_failed",
-                std::string("FlexScript threw a non-standard exception.\n--- script ---\n") + script);
-        }
+        if (const char* p = nodetomodelpath_cstr(np, 1)) newPath = std::string(p);
 
         nlohmann::json out;
         out["ok"]       = true;
-        out["table"]    = tableName;
+        out["table"]    = std::string(getname(tbl));
         out["name"]     = name;
         out["type"]     = typeStr;
         out["path"]     = newPath;
@@ -3832,32 +3780,32 @@ modelerai_export Variant ModelerAi_addParameter(FLEXSIMINTERFACE)
         if (!onSetBody.empty())       out["on_set_applied"]       = true;
         if (!onConstrainBody.empty()) out["on_constrain_applied"] = true;
 
-        // For numeric-valued types, read the value back and surface any
-        // clamping that FlexSim's onConstrain performed. Without this the
-        // tool reports "ok: true" even though the stored value differs from
-        // what the AI requested (common with Discrete + step_size, or values
-        // outside the bounds). The AI sees `clamped: true` + the actual
-        // value and can retry with compatible args.
+        // For numeric-valued types, read the value back and surface any clamping
+        // FlexSim's onConstrain performed. Native read: Model::getParameters()
+        // .findNode(name)->value (parameters store values; no eval like PMs).
         if (hasValue && valueJson.is_number()
             && (type == ParamType::Continuous || type == ParamType::Integer
              || type == ParamType::Discrete   || type == ParamType::Binary))
         {
-            std::string readback = "return Model.parameters[\"" + name + "\"].value;";
             try {
-                Variant av = executestring(readback.c_str(), nullptr, nullptr, Variant());
-                if (av.type == VariantType::Number) {
-                    double actual = static_cast<double>(av);
-                    double requested = valueJson.get<double>();
-                    out["actual_value"] = actual;
-                    if (std::abs(actual - requested) > 1e-6) {
-                        out["clamped"] = true;
-                        out["requested_value"] = requested;
-                        out["clamp_reason"] = "FlexSim's onConstrain adjusted the value. "
-                                              "Likely cause: value doesn't fit step_size (Discrete) "
-                                              "or is outside [lower_bound, upper_bound]. Retry with "
-                                              "a value that satisfies: value == lower_bound + n*step_size "
-                                              "for Discrete, or value in [lower_bound, upper_bound] "
-                                              "for Continuous/Integer.";
+                Parameters params = Model::getParameters();
+                treenode pNode = params.findNode(name.c_str());
+                if (objectexists(pNode)) {
+                    Variant av = pNode->value;
+                    if (av.type == VariantType::Number) {
+                        double actual = static_cast<double>(av);
+                        double requested = valueJson.get<double>();
+                        out["actual_value"] = actual;
+                        if (std::abs(actual - requested) > 1e-6) {
+                            out["clamped"] = true;
+                            out["requested_value"] = requested;
+                            out["clamp_reason"] = "FlexSim's onConstrain adjusted the value. "
+                                                  "Likely cause: value doesn't fit step_size (Discrete) "
+                                                  "or is outside [lower_bound, upper_bound]. Retry with "
+                                                  "a value that satisfies: value == lower_bound + n*step_size "
+                                                  "for Discrete, or value in [lower_bound, upper_bound] "
+                                                  "for Continuous/Integer.";
+                        }
                     }
                 }
             } catch (...) {
@@ -3941,40 +3889,21 @@ modelerai_export Variant ModelerAi_setParameter(FLEXSIMINTERFACE)
                 "set_parameter needs at least one of: value, description, display_units, lower_bound, upper_bound, step_size, sequence_length, values.");
         }
 
-        // Parameter names are GLOBAL — search every ParameterTable for the
-        // name rather than requiring the caller to know which table holds it.
-        // table_name (if supplied) is informational; we still return where
-        // we found it so the caller can verify.
-        std::string script;
-        script.reserve(1024 + sequenceValues.size() * 16);
-        script += "treenode allTables = Model.find(\"Tools/ParameterTables\");\n";
-        script += "if (!allTables) { print(\"set_parameter: Tools/ParameterTables container missing\"); return 0; }\n";
-        script += "treenode found = 0;\n";
-        script += "treenode owningTable = 0;\n";
-        script += "for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
-        script += "    treenode t = allTables.subnodes[iT];\n";
-        // The `parameters` container lives in the table's bound >variables
-        // attribute space — reach it with getvarnode, NOT t.find(\"variables\")
-        // (which does not traverse into the > attribute space, the bug that
-        // made set_parameter fail to find any parameter — .1000058 fix).
-        script += "    treenode ps = getvarnode(t, \"parameters\");\n";
-        script += "    if (!ps) continue;\n";
-        script += "    for (int iX = 1; iX <= ps.subnodes.length; iX++) {\n";
-        script += "        treenode p = ps.subnodes[iX];\n";
-        script += "        treenode nm = p.find(\"Name\");\n";
-        script += "        if (nm && nm.value == \""; script += fsEscape(name); script += "\") { found = p; owningTable = t; break; }\n";
-        script += "    }\n";
-        script += "    if (found) break;\n";
-        script += "}\n";
-        script += "if (!found) { print(\"set_parameter: parameter not found in any ParameterTable: "; script += fsEscape(name); script += "\"); return 0; }\n";
-        script += "treenode v = found.subnodes.assert(\"Value\");\n";
+        // Native (.1000099 — was an executestring builder). Parameter names are
+        // GLOBAL: find the row across all ParameterTables via the shared walk
+        // (table_name is informational). Update bounds/structural fields FIRST,
+        // then value — setting value before bounds lets onConstrain clamp against
+        // the OLD upperBound and the new value is silently lost.
+        treenode found = findParamNodeByName(name);
+        if (!objectexists(found)) {
+            return returnError("not_found",
+                "set_parameter: parameter not found in any ParameterTable: " + name);
+        }
+        treenode owningTable = owningParamTable(found);
+        treenode v = assertsubnode(found, "Value", 0);
 
-        // Bounds + structural fields FIRST, then value. If we set value before
-        // bounds, FlexSim's onConstrain clamps against the OLD upperBound and
-        // the new value is silently lost ("Unable to set X to Y; using <old>
-        // instead").
         auto setNum = [&](const char* sub, double n) {
-            script += "v.subnodes.assert(\""; script += sub; script += "\").value = "; script += std::to_string(n); script += ";\n";
+            assertsubnode(v, sub, 0)->value = Variant(n);
         };
         if (hasLower)  setNum("lowerBound", lowerBound);
         if (hasUpper)  setNum("upperBound", upperBound);
@@ -3983,120 +3912,60 @@ modelerai_export Variant ModelerAi_setParameter(FLEXSIMINTERFACE)
 
         if (hasValue) {
             if (valueJson.is_number()) {
-                script += "v.value = "; script += std::to_string(valueJson.get<double>()); script += ";\n";
+                v->value = Variant(valueJson.get<double>());
             } else if (valueJson.is_string()) {
-                script += "v.value = \""; script += fsEscape(valueJson.get<std::string>()); script += "\";\n";
+                v->value = Variant(valueJson.get<std::string>().c_str());
             } else if (valueJson.is_array()) {
-                script += "Array seq = [";
-                for (size_t i = 0; i < valueJson.size(); ++i) {
-                    if (i) script += ",";
-                    if (valueJson[i].is_number()) script += std::to_string(valueJson[i].get<double>());
-                    else script += "0";
-                }
-                script += "];\n";
-                script += "v.value = seq;\n";
+                Array seq((int)valueJson.size());                       // 1-based
+                for (size_t i = 0; i < valueJson.size(); ++i)
+                    seq[(int)i + 1] = Variant(valueJson[i].is_number() ? valueJson[i].get<double>() : 0.0);
+                v->value = Variant(seq);
             }
         }
         if (!sequenceValues.empty()) {
-            script += "Array seq2 = [";
-            for (size_t i = 0; i < sequenceValues.size(); ++i) {
-                if (i) script += ",";
-                script += std::to_string(static_cast<int>(sequenceValues[i]));
-            }
-            script += "];\n";
-            script += "v.value = seq2;\n";
+            Array seq2((int)sequenceValues.size());
+            for (size_t i = 0; i < sequenceValues.size(); ++i)
+                seq2[(int)i + 1] = Variant((double)(int)sequenceValues[i]);
+            v->value = Variant(seq2);
         }
         if (hasDesc) {
-            script += "found.subnodes.assert(\"Description\").value = \""; script += fsEscape(description); script += "\";\n";
+            assertsubnode(found, "Description", DATATYPE_STRING)->value = Variant(description.c_str());
         }
         if (hasUnits) {
-            script += "found.subnodes.assert(\"Display Units\").value = \""; script += fsEscape(displayUnits); script += "\";\n";
+            assertsubnode(found, "Display Units", DATATYPE_STRING)->value = Variant(displayUnits.c_str());
         }
-        script += "return found;\n";
-
-        // Build a small debug payload helper — the generated FlexScript can
-        // run to 30+ lines, which is enormous for an AI tool-result. Surface
-        // a terse message; tuck the script + parameter context under `debug`
-        // so curious sessions can inspect, and dump to the bridge console
-        // for log-side debugging.
-        auto buildDebug = [&](const char* reason) {
-            nlohmann::json d;
-            d["script"]       = script;
-            d["table"]        = tableName;
-            d["parameter"]    = name;
-            d["failure_mode"] = reason;
-            return d;
-        };
 
         std::string newPath;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type != VariantType::TreeNode) {
-                ModelerAi::bridge::consolePrint(
-                    "[ModelerAI] set_parameter FlexScript returned non-treenode for '"
-                    + name + "'.\n");
-                return returnErrorWithDebug("update_failed",
-                    "Update FlexScript did not return a treenode for parameter '" + name +
-                    "'. See debug.script for the generated body.",
-                    buildDebug("non_treenode_return"));
-            }
-            treenode found = static_cast<treenode>(v);
-            if (!found) {
-                ModelerAi::bridge::consolePrint(
-                    "[ModelerAI] set_parameter FlexScript returned null for '" + name + "'.\n");
-                return returnErrorWithDebug("update_failed",
-                    "Update FlexScript returned a null node for parameter '" + name +
-                    "'. See debug.script for the generated body.",
-                    buildDebug("null_node_return"));
-            }
-            try { newPath = std::string(nodetomodelpath(found, 1).c_str()); } catch (...) {}
-        } catch (const std::exception& e) {
-            ModelerAi::bridge::consolePrint(
-                std::string("[ModelerAI] set_parameter threw: ") + e.what() + "\n");
-            return returnErrorWithDebug("update_failed",
-                std::string("FlexScript threw on parameter '") + name + "': " + e.what(),
-                buildDebug("std_exception"));
-        } catch (const char* msg) {
-            ModelerAi::bridge::consolePrint(
-                std::string("[ModelerAI] set_parameter threw: ") + (msg ? msg : "(null)") + "\n");
-            return returnErrorWithDebug("update_failed",
-                std::string("FlexScript threw on parameter '") + name + "': " +
-                (msg ? msg : "(unknown)"),
-                buildDebug("cstr_exception"));
-        } catch (...) {
-            ModelerAi::bridge::consolePrint(
-                "[ModelerAI] set_parameter threw a non-standard exception.\n");
-            return returnErrorWithDebug("update_failed",
-                "FlexScript threw a non-standard exception on parameter '" + name + "'.",
-                buildDebug("unknown_exception"));
-        }
+        if (const char* p = nodetomodelpath_cstr(found, 1)) newPath = std::string(p);
 
         nlohmann::json out;
         out["ok"]       = true;
-        out["table"]    = tableName;
+        out["table"]    = owningTable ? std::string(getname(owningTable)) : tableName;
         out["name"]     = name;
         out["path"]     = newPath;
         out["accessor"] = "Model.parameters[\"" + name + "\"]";
 
-        // Surface any onConstrain clamping that happened on the value update
-        // (same mechanism as add_parameter). See the corresponding block in
-        // ModelerAi_addParameter for rationale.
+        // Surface any onConstrain clamping on the value update (native read:
+        // Model::getParameters().findNode(name)->value).
         if (hasValue && valueJson.is_number()) {
-            std::string readback = "return Model.parameters[\"" + name + "\"].value;";
             try {
-                Variant av = executestring(readback.c_str(), nullptr, nullptr, Variant());
-                if (av.type == VariantType::Number) {
-                    double actual = static_cast<double>(av);
-                    double requested = valueJson.get<double>();
-                    out["actual_value"] = actual;
-                    if (std::abs(actual - requested) > 1e-6) {
-                        out["clamped"] = true;
-                        out["requested_value"] = requested;
-                        out["clamp_reason"] = "FlexSim's onConstrain adjusted the value. "
-                                              "Likely cause: value doesn't fit step_size or is "
-                                              "outside the current [lower_bound, upper_bound]. "
-                                              "Retry with a value that satisfies the constraints, "
-                                              "or update the bounds/step in the same call.";
+                Parameters params = Model::getParameters();
+                treenode pNode = params.findNode(name.c_str());
+                if (objectexists(pNode)) {
+                    Variant av = pNode->value;
+                    if (av.type == VariantType::Number) {
+                        double actual = static_cast<double>(av);
+                        double requested = valueJson.get<double>();
+                        out["actual_value"] = actual;
+                        if (std::abs(actual - requested) > 1e-6) {
+                            out["clamped"] = true;
+                            out["requested_value"] = requested;
+                            out["clamp_reason"] = "FlexSim's onConstrain adjusted the value. "
+                                                  "Likely cause: value doesn't fit step_size or is "
+                                                  "outside the current [lower_bound, upper_bound]. "
+                                                  "Retry with a value that satisfies the constraints, "
+                                                  "or update the bounds/step in the same call.";
+                        }
                     }
                 }
             } catch (...) {}
@@ -5306,6 +5175,37 @@ static TreeNode* owningPmTable(TreeNode* pm)
 {
     if (!pm || !pm->up || !pm->up->up) return nullptr;
     return pm->up->up->up;   // row -> performanceMeasures -> >variables -> table
+}
+
+// Parameter analogues of the PM helpers. Parameters live in each table's bound
+// `parameters` var space (getvarnode — never find("variables")); names are global
+// across all ParameterTables, same as PMs. Mirrors the remove_parameter walk.
+static TreeNode* findParamNodeByName(const std::string& name)
+{
+    TreeNode* allTables = model()->find("Tools/ParameterTables");
+    if (!allTables) return nullptr;
+    int nt = content(allTables);
+    for (int iT = 1; iT <= nt; ++iT) {
+        TreeNode* t = rank(allTables, iT);
+        if (!t) continue;
+        TreeNode* ps = getvarnode(t, "parameters");
+        if (!ps) continue;
+        int np = content(ps);
+        for (int iP = 1; iP <= np; ++iP) {
+            TreeNode* p = rank(ps, iP);
+            if (!p) continue;
+            TreeNode* nm = p->find("Name");
+            if (nm && std::string(nm->value) == name) return p;
+        }
+    }
+    return nullptr;
+}
+
+// row -> parameters -> >variables -> table (three parents up).
+static TreeNode* owningParamTable(TreeNode* p)
+{
+    if (!p || !p->up || !p->up->up) return nullptr;
+    return p->up->up->up;
 }
 
 // Evaluate a PM row node natively. Its Value/valueNode child holds the FlexScript
