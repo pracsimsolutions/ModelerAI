@@ -4951,6 +4951,11 @@ modelerai_export Variant ModelerAi_setRunSpeed(FLEXSIMINTERFACE)
 // script with reference bound to param(1) and returns whatever the script
 // returns. We marshal that Variant to JSON when reporting back.
 
+// PM tree-walk helpers (defined after the PM read tools below; forward-declared
+// here so the create/delete tools can share them).
+static TreeNode* findPmNodeByName(const std::string& name);
+static TreeNode* owningPmTable(TreeNode* pm);
+
 // ============================================================================
 // modelerai_create_performance_measure(json)
 //   json: { name, expression, reference?, units?, description?, table_name?, replace? }
@@ -5030,120 +5035,93 @@ modelerai_export Variant ModelerAi_createPerformanceMeasure(FLEXSIMINTERFACE)
             }
         }
 
-        // Build the FlexScript that locates / creates the table, allocates a
-        // row via addPfm, and writes Name/Value/Description.
-        std::string script;
-        script.reserve(1024 + expression.size());
+        // Native (.1000095 — was an ~80-line executestring builder). Locate or
+        // create the PerformanceMeasureTable, allocate a row via the table's own
+        // addPfm node-function (function_s — the same call the FlexScript made,
+        // now invoked natively), then write Name / Value.valueNode / reference /
+        // Description / Display Units directly. The valueNode body stays
+        // FlexScript (user code in the tree), compiled via switch_flexscript +
+        // buildnodeflexscript — never executestring.
 
-        // Table lookup with the same auto-fallback as add_parameter.
-        script += "treenode tbl = 0;\n";
-        if (!tableName.empty()) {
-            script += "tbl = Tools.get(\"PerformanceMeasureTable\", \""; script += fsEscape(tableName); script += "\");\n";
+        // Table lookup: exact name match, else first existing table, else create.
+        treenode tbl = 0;
+        TreeNode* container = model()->find("Tools/PerformanceMeasureTables");
+        if (!tableName.empty() && container) {
+            int nc = content(container);
+            for (int i = 1; i <= nc; ++i) {
+                TreeNode* t = rank(container, i);
+                if (t && std::string(getname(t)) == tableName) { tbl = t; break; }
+            }
         }
-        script += "if (!tbl) {\n";
-        script += "    treenode container = Model.find(\"Tools/PerformanceMeasureTables\");\n";
-        script += "    if (container && container.subnodes.length > 0) tbl = container.subnodes[1];\n";
-        script += "}\n";
-        script += "if (!tbl) {\n";
-        script += "    tbl = Tools.create(\"PerformanceMeasureTable\", \"\");\n";
-        script += "    tbl.name = \""; script += fsEscape(tableName.empty() ? std::string("PerformanceMeasures") : tableName); script += "\";\n";
-        script += "}\n";
-        script += "if (!tbl) { print(\"create_pm: could not find or create a PerformanceMeasureTable\"); return 0; }\n";
-
-        // Cross-table uniqueness check — like ParameterTable, the global
-        // accessor Model.performanceMeasures[Name] doesn't take a table arg.
-        script += "treenode allTables = Model.find(\"Tools/PerformanceMeasureTables\");\n";
-        script += "treenode crossTable = 0;\n";
-        script += "if (allTables) {\n";
-        script += "    for (int iT = 1; iT <= allTables.subnodes.length; iT++) {\n";
-        script += "        treenode t = allTables.subnodes[iT];\n";
-        script += "        if (t == tbl) continue;\n";
-        script += "        treenode pms = getvarnode(t, \"performanceMeasures\");\n";  // was t.find("variables").find(...)
-        script += "        if (!objectexists(pms)) continue;\n";
-        script += "        for (int iP = 1; iP <= pms.subnodes.length; iP++) {\n";
-        script += "            treenode pm = pms.subnodes[iP];\n";
-        script += "            treenode nm = pm.find(\"Name\");\n";
-        script += "            if (nm && nm.value == \""; script += fsEscape(name); script += "\") {\n";
-        script += "                crossTable = t; break;\n";
-        script += "            }\n";
-        script += "        }\n";
-        script += "        if (crossTable) break;\n";
-        script += "    }\n";
-        script += "}\n";
-        script += "if (crossTable) { print(\"create_pm: name '"; script += fsEscape(name);
-        script += "' already exists in another PM table: \" + crossTable.name + \". Names must be unique.\"); return 0; }\n";
-
-        // Same-table duplicate handling. Use the bound var accessor
-        // (getvarnode) — tbl.find("variables") can't traverse the bound
-        // attribute space, so the old path created a SHADOW "variables"
-        // subnode that Model.performanceMeasures could never see.
-        script += "treenode pms = getvarnode(tbl, \"performanceMeasures\");\n";
-        script += "if (!objectexists(pms)) { print(\"create_pm: performanceMeasures var node missing on table\"); return 0; }\n";
-        script += "treenode existing = 0;\n";
-        script += "for (int iX = 1; iX <= pms.subnodes.length; iX++) {\n";
-        script += "    treenode p = pms.subnodes[iX];\n";
-        script += "    treenode nm = p.find(\"Name\");\n";
-        script += "    if (nm && nm.value == \""; script += fsEscape(name); script += "\") { existing = p; break; }\n";
-        script += "}\n";
-        if (replace) {
-            script += "if (existing) existing.destroy();\n";
-        } else {
-            script += "if (existing) { print(\"create_pm: duplicate name in same table (use replace=true): "; script += fsEscape(name); script += "\"); return 0; }\n";
+        if (!tbl && container && content(container) > 0) tbl = rank(container, 1);
+        if (!tbl) {
+            tbl = Tools::create("PerformanceMeasureTable");
+            if (!objectexists(tbl)) {
+                return returnError("create_pm_failed", "Tools::create(\"PerformanceMeasureTable\") returned null.");
+            }
+            setname(tbl, tableName.empty() ? "PerformanceMeasures" : tableName.c_str());
         }
 
-        // Allocate the row via addPfm.
-        script += "treenode pm = function_s(tbl, \"addPfm\");\n";
-        script += "if (!pm) { print(\"create_pm: addPfm returned null\"); return 0; }\n";
-        script += "pm.subnodes.assert(\"Name\").value = \""; script += fsEscape(name); script += "\";\n";
+        // Uniqueness: PM names are global (Model.performanceMeasures[name] takes no
+        // table arg). Reuse the shared walk; a hit in THIS table is replace-or-reject,
+        // a hit in another table is always rejected.
+        if (TreeNode* dup = findPmNodeByName(name)) {
+            TreeNode* dupTbl = owningPmTable(dup);
+            if (dupTbl == tbl) {
+                if (replace) destroyobject(dup);
+                else return returnError("duplicate_name",
+                    "A performance measure named '" + name + "' already exists in this table (use replace=true).");
+            } else {
+                return returnError("duplicate_name_other_table",
+                    "A performance measure named '" + name + "' already exists in table '"
+                    + (dupTbl ? std::string(getname(dupTbl)) : std::string("?"))
+                    + "'. Performance-measure names must be globally unique.");
+            }
+        }
 
-        // Set the valueNode script + reference + description + display units.
-        // valueNode is S-flagged — must enablecode + buildnodeflexscript.
-        script += "treenode v  = pm.subnodes.assert(\"Value\");\n";
-        script += "treenode vn = v.subnodes.assert(\"valueNode\");\n";
-        script += "vn.value = \""; script += fsEscape(finalExpression); script += "\";\n";
-        script += "enablecode(vn);\n";
-        script += "buildnodeflexscript(vn);\n";
+        // Allocate the row via the table's addPfm method (gives a properly-formed
+        // row with Name / Value.valueNode / Description / Display Units subnodes).
+        treenode pm = 0;
+        {
+            Variant pmv = function_s(tbl, "addPfm");
+            if (pmv.type == VariantType::TreeNode) pm = static_cast<treenode>(pmv);
+        }
+        if (!objectexists(pm)) {
+            return returnError("create_pm_failed", "addPfm did not return a valid row node.");
+        }
+
+        // Name.
+        assertsubnode(pm, "Name", DATATYPE_STRING)->value = Variant(name.c_str());
+
+        // Value.valueNode = FlexScript body (S-flagged, compiled in-tree).
+        treenode v  = assertsubnode(pm, "Value", 0);
+        treenode vn = assertsubnode(v, "valueNode", DATATYPE_STRING);
+        vn->value = Variant(finalExpression.c_str());
+        switch_flexscript(vn, 1);
+        buildnodeflexscript(vn);
+
+        // Optional reference coupling + metadata. The reference must be a real
+        // one-way node-COUPLING (what FlexScript's `node.value = treenode` creates)
+        // so the PM eval can pass the object as param(1). pointTo() is the
+        // documented coupling primitive; evaluatePmNode passes Value/reference back
+        // in as param(1) at read time.
         if (!referencePath.empty()) {
-            script += "treenode refn = Model.find(\""; script += fsEscape(referencePath); script += "\");\n";
-            script += "if (refn) v.subnodes.assert(\"reference\").value = refn;\n";
-            script += "else print(\"create_pm: reference_path not found (PM still created without reference): "; script += fsEscape(referencePath); script += "\");\n";
+            treenode refn = model()->find(referencePath.c_str());
+            if (objectexists(refn)) {
+                treenode refNode = assertsubnode(v, "reference", 0);
+                refNode->pointTo(refn);
+            }
         }
         if (!description.empty()) {
-            script += "pm.subnodes.assert(\"Description\").value = \""; script += fsEscape(description); script += "\";\n";
+            assertsubnode(pm, "Description", DATATYPE_STRING)->value = Variant(description.c_str());
         }
         if (!units.empty()) {
-            script += "pm.subnodes.assert(\"Display Units\").value = \""; script += fsEscape(units); script += "\";\n";
+            assertsubnode(pm, "Display Units", DATATYPE_STRING)->value = Variant(units.c_str());
         }
-        script += "return pm;\n";
 
-        std::string newPath, owningTable;
-        try {
-            Variant v = executestring(script.c_str(), nullptr, nullptr, Variant());
-            if (v.type != VariantType::TreeNode) {
-                return returnError("create_pm_failed",
-                    "Registration script did not return a treenode (see console).");
-            }
-            treenode created = static_cast<treenode>(v);
-            if (!created) {
-                return returnError("create_pm_failed", "Registration script returned null.");
-            }
-            try { newPath = std::string(nodetomodelpath(created, 1).c_str()); } catch (...) {}
-            // Walk up to find the owning table name (subnodes -> performanceMeasures -> variables -> table).
-            try {
-                if (created->up) {
-                    treenode pmsNode = created->up;        // performanceMeasures
-                    if (pmsNode->up) {
-                        treenode varsNode = pmsNode->up;   // variables
-                        if (varsNode->up) {
-                            treenode tableNode = varsNode->up;
-                            owningTable = std::string(getname(tableNode));
-                        }
-                    }
-                }
-            } catch (...) {}
-        } catch (const std::exception& e) {
-            return returnError("create_pm_failed", e.what());
-        }
+        std::string newPath;
+        if (const char* p = nodetomodelpath_cstr(pm, 1)) newPath = std::string(p);
+        std::string owningTable = std::string(getname(tbl));
 
         nlohmann::json out;
         out["ok"]       = true;
@@ -5322,17 +5300,38 @@ static TreeNode* findPmNodeByName(const std::string& name)
     return nullptr;
 }
 
+// Walk up from a PM row node to its owning PerformanceMeasureTable. Layout is
+// <table>/>variables/performanceMeasures/<row>, so the table is three parents up.
+static TreeNode* owningPmTable(TreeNode* pm)
+{
+    if (!pm || !pm->up || !pm->up->up) return nullptr;
+    return pm->up->up->up;   // row -> performanceMeasures -> >variables -> table
+}
+
 // Evaluate a PM row node natively. Its Value/valueNode child holds the FlexScript
 // body; TreeNode::evaluate() runs the already-compiled node (engine_export instance
-// method — no executestring). Falls back to evaluating the Value node directly.
+// method — no executestring). FlexSim's PM framework passes the row's reference
+// coupling as param(1) (the body's `treenode reference = param(1)`); a bare
+// evaluate() leaves reference null, so getstat(reference,...) returns maxnum. Pass
+// the Value/reference node when the row has one so reference-based PMs resolve.
 static Variant evaluatePmNode(TreeNode* pm)
 {
     if (!pm) return Variant();
     TreeNode* valNode = pm->find("Value");
     if (!valNode) return Variant();
-    TreeNode* vn = valNode->find("valueNode");
-    if (vn) return vn->evaluate();
-    return valNode->evaluate();
+    TreeNode* vn      = valNode->find("valueNode");
+    TreeNode* refNode = valNode->find("reference");
+    TreeNode* target  = vn ? vn : valNode;
+    if (refNode) {
+        // reference is a one-way coupling; the PM body expects the DEREFERENCED
+        // object as param(1), not the coupling node (passing the node itself made
+        // `reference` resolve to the node named "reference", so getstat failed).
+        // CouplingDataType::evaluate() returns partner().get(), so evaluating the
+        // reference node yields the referenced object.
+        Variant refTarget = refNode->evaluate();
+        return target->evaluate(refTarget);
+    }
+    return target->evaluate();
 }
 
 // ============================================================================
