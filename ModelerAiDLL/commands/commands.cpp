@@ -6107,6 +6107,162 @@ modelerai_export Variant ModelerAi_createUserCommand(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("create_user_command", "unknown"); }
 }
 
+// ============================================================================
+// modelerai_create_dashboard(json | "name")
+//   json: { name?, parameter_table?, open? }
+//
+// Creates a Dashboard via the engine command (the same one the GUI uses):
+//   general      → applicationcommand("adddashboard")
+//   from a table → applicationcommand("adddashboard", <ParameterTable node>)
+// Dashboards live under Tools/Dashboards. Optionally rename + open it
+// (applicationcommand("dashboard", node)). NOTE on the dashboard lifecycle:
+// a dashboard round-trips its contents tree<->view on open/close, so WIDGETS
+// must be added through the open dashboard (a separate add-chart tool), not by
+// editing the tree while it's open. This tool only creates/names/opens.
+// ============================================================================
+modelerai_export Variant ModelerAi_createDashboard(FLEXSIMINTERFACE)
+{
+    try {
+        std::string name, paramTable;
+        bool openIt = false;
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            if (!s.empty()) {
+                bool parsed = false;
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object()) {
+                        name       = j.value("name", std::string(""));
+                        paramTable = j.value("parameter_table", std::string(""));
+                        openIt     = j.value("open", false);
+                        parsed = true;
+                    } else if (j.is_string()) {
+                        name = j.get<std::string>(); parsed = true;
+                    }
+                } catch (...) {}
+                if (!parsed) name = s;   // not JSON → bare dashboard name
+            }
+        }
+
+        // Optional source parameter table.
+        treenode ptNode = 0;
+        if (!paramTable.empty()) {
+            std::string path = "Tools/ParameterTables/" + paramTable;
+            ptNode = node(path.c_str(), model());
+            if (!objectexists(ptNode)) ptNode = model()->find(path.c_str());
+            if (!objectexists(ptNode)) {
+                return returnError("parameter_table_not_found",
+                    "parameter_table not found under Tools/ParameterTables: " + paramTable);
+            }
+        }
+
+        // Create via the engine command; it returns the new dashboard node.
+        treenode dash = 0;
+        Variant r = objectexists(ptNode)
+            ? applicationcommand("adddashboard", Variant(ptNode))
+            : applicationcommand("adddashboard");
+        if (r.type == VariantType::TreeNode) dash = static_cast<treenode>(r);
+        // Fallback: grab the newest child of Tools/Dashboards if no node returned.
+        if (!objectexists(dash)) {
+            treenode container = model()->find("Tools/Dashboards");
+            if (objectexists(container) && content(container) > 0)
+                dash = rank(container, content(container));
+        }
+        if (!objectexists(dash)) {
+            return returnError("create_failed", "adddashboard did not produce a dashboard node.");
+        }
+
+        if (!name.empty()) setname(dash, name.c_str());
+        if (openIt) { try { applicationcommand("dashboard", Variant(dash)); } catch (...) {} }
+
+        nlohmann::json out;
+        out["ok"]     = true;
+        out["name"]   = std::string(getname(dash));
+        out["opened"] = openIt;
+        if (!paramTable.empty()) out["from_parameter_table"] = paramTable;
+        if (const char* p = nodetomodelpath_cstr(dash, 1)) out["path"] = std::string(p);
+        out["accessor"] = "Model.find(\"Tools/Dashboards/" + std::string(getname(dash)) + "\")";
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("create_dashboard", e.what()); }
+      catch (...)                     { return returnException("create_dashboard", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_list_chart_templates(json | "category")
+//   json: { category? }   (filter to one category folder, e.g. "Output")
+//
+// Read-only catalog of every dashboard chart template under
+// MAIN:/project/exec/globals/ChartTemplateDefinitions/<category>/<name>.
+// Returns [{ category, name, template_path }].
+//
+// NOTE: the live definition nodes are empty leaves (content==0) — their
+// menuname/variables/replacements aren't readable here. That's fine:
+// createGraphWindow consumes a template BY PATH and materializes the real,
+// traversable structure into /Tools/Statistics + /Tools/ChartTemplates (which
+// add_dashboard_chart then edits). So this tool is purely the discovery catalog;
+// template_path is exactly what add_dashboard_chart needs. (See
+// docs/dashboards/chart-subsystem-map.html.)
+// ============================================================================
+modelerai_export Variant ModelerAi_listChartTemplates(FLEXSIMINTERFACE)
+{
+    try {
+        std::string catFilter;
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            if (!s.empty()) {
+                bool parsed = false;
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object()) { catFilter = j.value("category", std::string("")); parsed = true; }
+                    else if (j.is_string()) { catFilter = j.get<std::string>(); parsed = true; }
+                } catch (...) {}
+                if (!parsed) catFilter = s;
+            }
+        }
+
+        treenode defs = node("MAIN:/project/exec/globals/ChartTemplateDefinitions", nullptr);
+        if (!objectexists(defs)) {
+            return returnError("definitions_not_found",
+                "ChartTemplateDefinitions not found at "
+                "MAIN:/project/exec/globals/ChartTemplateDefinitions.");
+        }
+
+        nlohmann::json templates = nlohmann::json::array();
+        int nCat = content(defs);
+        for (int ci = 1; ci <= nCat; ++ci) {
+            treenode cat = rank(defs, ci);
+            if (!cat) continue;
+            std::string catName = getname(cat);
+            if (catName.empty()) continue;
+            if (!catFilter.empty() && catName != catFilter) continue;
+
+            int nT = content(cat);
+            for (int ti = 1; ti <= nT; ++ti) {
+                treenode T = rank(cat, ti);
+                if (!T) continue;
+                std::string tname = getname(T);
+                if (tname.empty()) continue;
+
+                nlohmann::json e;
+                e["category"]      = catName;
+                e["name"]          = tname;
+                e["template_path"] = "MAIN:/project/exec/globals/ChartTemplateDefinitions/"
+                                     + catName + "/" + tname;
+                templates.push_back(std::move(e));
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]        = true;
+        out["count"]     = (int)templates.size();
+        out["templates"] = std::move(templates);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_chart_templates", e.what()); }
+      catch (...)                     { return returnException("list_chart_templates", "unknown"); }
+}
+
 // Shared body for add/remove: walks a members list and applies an op to
 // each. Members can be passed as a single string OR an array of strings.
 namespace {

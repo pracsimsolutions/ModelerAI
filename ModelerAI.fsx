@@ -4404,7 +4404,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000111&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000115&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -8650,6 +8650,8 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_remove_label</name><data>dll:"module:ModelerAI" func:"ModelerAi_removeLabel"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_group</name><data>dll:"module:ModelerAI" func:"ModelerAi_createGroup"</data></node>
       <node f="1000042" dt="2"><name>modelerai_create_user_command</name><data>dll:"module:ModelerAI" func:"ModelerAi_createUserCommand"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_create_dashboard</name><data>dll:"module:ModelerAI" func:"ModelerAi_createDashboard"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_list_chart_templates</name><data>dll:"module:ModelerAI" func:"ModelerAi_listChartTemplates"</data></node>
       <node f="1000042" dt="2"><name>modelerai_group_add_member</name><data>dll:"module:ModelerAI" func:"ModelerAi_groupAddMember"</data></node>
       <node f="1000042" dt="2"><name>modelerai_group_remove_member</name><data>dll:"module:ModelerAI" func:"ModelerAi_groupRemoveMember"</data></node>
       <node f="1000042" dt="2"><name>modelerai_list_groups</name><data>dll:"module:ModelerAI" func:"ModelerAi_listGroups"</data></node>
