@@ -38,6 +38,7 @@ modelerai_export Variant ModelerAi_createGroup             (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_createUserCommand       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_createDashboard         (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_listChartTemplates      (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_addDashboardChart       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_groupAddMember          (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_groupRemoveMember       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_listGroups              (FLEXSIMINTERFACE);

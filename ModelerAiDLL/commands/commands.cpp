@@ -6174,15 +6174,20 @@ modelerai_export Variant ModelerAi_createDashboard(FLEXSIMINTERFACE)
         }
 
         if (!name.empty()) setname(dash, name.c_str());
-        if (openIt) { try { applicationcommand("dashboard", Variant(dash)); } catch (...) {} }
 
+        // adddashboard creates AND opens the dashboard — `dash` is its live VIEW
+        // node — and it STAYS open so the modeler can see it (like a placed 3D
+        // object). The persistent /Tools/Dashboards/<name> node only materializes
+        // once it's closed; add_dashboard_chart finds the open one in the view.
+        (void)openIt;   // always open after adddashboard; kept for arg compatibility
+        std::string effName = std::string(getname(dash));
         nlohmann::json out;
-        out["ok"]     = true;
-        out["name"]   = std::string(getname(dash));
-        out["opened"] = openIt;
+        out["ok"]       = true;
+        out["name"]     = effName;
+        out["opened"]   = true;
         if (!paramTable.empty()) out["from_parameter_table"] = paramTable;
-        if (const char* p = nodetomodelpath_cstr(dash, 1)) out["path"] = std::string(p);
-        out["accessor"] = "Model.find(\"Tools/Dashboards/" + std::string(getname(dash)) + "\")";
+        if (const char* p = nodetomodelpath_cstr(dash, 1)) out["view_path"] = std::string(p);
+        out["accessor"] = "Model.find(\"Tools/Dashboards/" + effName + "\")  (resolves once the tab is closed)";
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("create_dashboard", e.what()); }
       catch (...)                     { return returnException("create_dashboard", "unknown"); }
@@ -6261,6 +6266,145 @@ modelerai_export Variant ModelerAi_listChartTemplates(FLEXSIMINTERFACE)
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("list_chart_templates", e.what()); }
       catch (...)                     { return returnException("list_chart_templates", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_add_dashboard_chart(json)
+//   json: { dashboard, template (a template_path from list_chart_templates)
+//           | category + name, objects?: [names] }
+//
+// v1 — basic object-tracking charts. Flow (from the verified recipe):
+//   1. resolve the dashboard (Tools/Dashboards/<name>) and OPEN it →
+//      applicationcommand("dashboard", dash) returns the VIEW node
+//   2. function_s(view, "createGraphWindow", templateNode, 1) → the chart
+//      (a ChartTemplate instance under /Tools/ChartTemplates)
+//   3. resolve its primary tracked-objects Group at chart >stats/primaryGroup
+//      (.first), addMember each requested object
+//   4. function_s(chart, "onApply") + refreshview(view)
+//
+// Returns rich diagnostics (chart_path, group_path, group_resolved, view_path)
+// so we can verify and iterate per chart type. See
+// docs/dashboards/chart-subsystem-map.html.
+// ============================================================================
+modelerai_export Variant ModelerAi_addDashboardChart(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_add_dashboard_chart expects { dashboard, template | category+name, objects? } JSON.");
+        }
+        std::string dashboardName, templatePath, category, name;
+        std::vector<std::string> objectNames;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            dashboardName = j.value("dashboard", std::string(""));
+            templatePath  = j.value("template",  std::string(""));
+            category      = j.value("category",  std::string(""));
+            name          = j.value("name",      std::string(""));
+            if (j.contains("objects")) {
+                const auto& o = j["objects"];
+                if (o.is_array()) { for (const auto& it : o) if (it.is_string()) objectNames.push_back(it.get<std::string>()); }
+                else if (o.is_string()) objectNames.push_back(o.get<std::string>());
+            }
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (dashboardName.empty()) return returnError("missing_dashboard", "dashboard (name) is required.");
+        if (templatePath.empty()) {
+            if (category.empty() || name.empty())
+                return returnError("missing_template",
+                    "Provide template (a template_path from list_chart_templates) or category + name.");
+            templatePath = "MAIN:/project/exec/globals/ChartTemplateDefinitions/" + category + "/" + name;
+        }
+
+        treenode tmpl = node(templatePath.c_str(), nullptr);
+        if (!objectexists(tmpl)) {
+            return returnError("template_not_found", "chart template not found: " + templatePath);
+        }
+
+        // Resolve the dashboard's live VIEW node. Dashboards stay OPEN (in the VIEW
+        // tree), so /Tools/Dashboards/<name> only exists when CLOSED. Try the
+        // persisted node first (open it); otherwise find the already-open dashboard
+        // tab in the active view by name (a dashboard tab carries a GraphPanel).
+        treenode view = 0;
+        bool foundOpen = false;
+        treenode persisted = model()->find(("Tools/Dashboards/" + dashboardName).c_str());
+        if (objectexists(persisted)) {
+            Variant vv = applicationcommand("dashboard", Variant(persisted));
+            if (vv.type == VariantType::TreeNode) view = static_cast<treenode>(vv);
+        } else {
+            treenode active = node("VIEW:/active", nullptr);
+            if (objectexists(active)) {
+                long long visited = 0;
+                const long long VCAP = 300000;
+                for (treenode n = nextforobjecttreeunder(active, active);
+                     objectexists(n) && visited < VCAP && !objectexists(view);
+                     n = nextforobjecttreeunder(n, active)) {
+                    ++visited;
+                    if (std::string(getname(n)) == dashboardName && objectexists(n->find("GraphPanel"))) {
+                        view = n; foundOpen = true;
+                    }
+                }
+            }
+        }
+        if (!objectexists(view)) {
+            return returnError("dashboard_not_found",
+                "Dashboard '" + dashboardName + "' not found — neither persisted under "
+                "Tools/Dashboards (closed) nor open in the active view. Create it with "
+                "modelerai_create_dashboard.");
+        }
+        treenode host = view;
+        (void)foundOpen;
+
+        // Instantiate the chart from the template.
+        treenode chart = 0;
+        {
+            Variant cv = function_s(host, "createGraphWindow", Variant(tmpl), Variant(1.0));
+            if (cv.type == VariantType::TreeNode) chart = static_cast<treenode>(cv);
+        }
+        if (!objectexists(chart)) {
+            return returnError("create_chart_failed",
+                "createGraphWindow did not return a chart node (template may need a different host/args).");
+        }
+
+        // Resolve the primary tracked-objects Group: chart >stats/primaryGroup → .first.
+        treenode primaryContainer = node(">stats/primaryGroup", chart);
+        treenode groupNode = objectexists(primaryContainer) ? rank(primaryContainer, 1) : (treenode)0;
+
+        int added = 0;
+        bool groupOk = false;
+        nlohmann::json notFound = nlohmann::json::array();
+        if (objectexists(groupNode)) {
+            Group* g = groupNode->object<Group>();
+            if (g) {
+                groupOk = true;
+                for (const auto& nm : objectNames) {
+                    treenode o = model()->find(nm.c_str());
+                    if (objectexists(o)) { g->addMember(o); ++added; }
+                    else notFound.push_back(nm);
+                }
+            }
+        }
+
+        // Commit + refresh.
+        try { function_s(chart, "onApply"); } catch (...) {}
+        if (objectexists(view)) { try { refreshview(view); } catch (...) {} }
+
+        nlohmann::json out;
+        out["ok"]             = true;
+        out["dashboard"]      = dashboardName;
+        out["template"]       = templatePath;
+        out["members_added"]  = added;
+        out["group_resolved"] = groupOk;
+        if (!notFound.empty()) out["objects_not_found"] = std::move(notFound);
+        if (const char* p = nodetomodelpath_cstr(chart, 1)) out["chart_path"] = std::string(p);
+        if (objectexists(groupNode)) { if (const char* p = nodetomodelpath_cstr(groupNode, 1)) out["group_path"] = std::string(p); }
+        if (objectexists(view))      { if (const char* p = nodetomodelpath_cstr(view, 1))      out["view_path"]  = std::string(p); }
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("add_dashboard_chart", e.what()); }
+      catch (...)                     { return returnException("add_dashboard_chart", "unknown"); }
 }
 
 // Shared body for add/remove: walks a members list and applies an op to
