@@ -8139,29 +8139,124 @@ modelerai_export Variant ModelerAi_createStatisticsCollector(FLEXSIMINTERFACE)
 }
 
 // ----------------------------------------------------------------------------
-// modelerai_create_tracked_variable({ name, initial_value? })
+// modelerai_create_tracked_variable(json)
+//   json: { name, type?, start_value?, keep_history?, profile?,
+//           ignore_warmup? (alias survive_warmup), flags?, replace? }
 //
-// Create a TrackedVariable tool. Simpler than StatisticsCollector but
-// still needs an arg-shape and SDK-exposure check.
+// Creates a standalone TrackedVariable tool under Tools/TrackedVariables, the
+// way Josh does it by hand:
+//   treenode tv = Model.find("Tools").subnodes.assert("TrackedVariables").subnodes.add();
+//   TrackedVariable.init(tv, type, startValue, flags).as(treenode).name = name;
+// Native here: model()->find("Tools") -> assertsubnode("TrackedVariables") ->
+// nodeinsertinto() -> TrackedVariable::init() -> setname().
 //
-// TODO — needs context from user before implementing:
-//   1. Where do TrackedVariables get created in the tree? Under
-//      Tools/TrackedVariables, same shape as a label-Tracked-Variable
-//      under a node-label? Or distinct?
-//   2. Initial value: just a number, or also "tracked over time" + chart
-//      attachment from the start? Probably plain number for v1.
-//   3. Are there variants — Time-Weighted vs Sample? If yes, expose as
-//      an enum in args.
-//   4. Does the GUI's "New TrackedVariable" execute a specific
-//      app command we should mirror, or is it just createcopy(library
-//      template, Tools)?
+// THE point of this tool: the GUI doesn't let you set the stat FLAGS, so things
+// like surviving warmup / keeping history / profiling have always been painful.
+// We expose them as named booleans (no bit-math needed):
+//   keep_history   -> STAT_USE_HISTORY    (0x10)
+//   profile        -> STAT_USE_PROFILE    (0x20)
+//   ignore_warmup  -> STAT_IGNORE_WARMUP  (0x40)  (survives the warmup reset)
+// A raw `flags` int is OR'd in too for anything not covered by a named bool.
+//
+// type ∈ level (default), cumulative, time_series, categorical, kinetic_level,
+//        pointer, categorical_combo  (STAT_TYPE_* — same set as set_label).
 // ----------------------------------------------------------------------------
 modelerai_export Variant ModelerAi_createTrackedVariable(FLEXSIMINTERFACE)
 {
     try {
-        return returnError("not_implemented",
-            "modelerai_create_tracked_variable is shelled but not yet implemented. "
-            "See the TODO block above ModelerAi_createTrackedVariable in commands.cpp.");
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "modelerai_create_tracked_variable expects { name, type?, start_value?, "
+                "keep_history?, profile?, ignore_warmup?, flags?, replace? } JSON.");
+        }
+        std::string name, typeStr;
+        double startValue = 0.0;
+        bool keepHistory = false, profile = false, ignoreWarmup = false, replace = false;
+        int rawFlags = 0;
+        try {
+            auto j = nlohmann::json::parse(std::string(arg));
+            if (!j.is_object()) return returnError("bad_args_shape", "expected JSON object");
+            name    = j.value("name", std::string(""));
+            typeStr = j.value("type", std::string("level"));
+            if (j.contains("start_value") && j["start_value"].is_number())
+                startValue = j["start_value"].get<double>();
+            keepHistory  = j.value("keep_history", false);
+            profile      = j.value("profile", false);
+            ignoreWarmup = j.value("ignore_warmup", j.value("survive_warmup", false));
+            if (j.contains("flags") && j["flags"].is_number_integer())
+                rawFlags = j["flags"].get<int>();
+            replace = j.value("replace", false);
+        } catch (const std::exception& e) {
+            return returnError("bad_args_json", std::string("parse: ") + e.what());
+        }
+        if (name.empty()) return returnError("missing_name", "name is required.");
+
+        int tvType;
+        if      (typeStr == "level")             tvType = STAT_TYPE_LEVEL;
+        else if (typeStr == "cumulative")        tvType = STAT_TYPE_CUMULATIVE;
+        else if (typeStr == "time_series")       tvType = STAT_TYPE_TIME_SERIES;
+        else if (typeStr == "categorical")       tvType = STAT_TYPE_CATEGORICAL;
+        else if (typeStr == "kinetic_level")     tvType = STAT_TYPE_KINETIC_LEVEL;
+        else if (typeStr == "pointer")           tvType = STAT_TYPE_POINTER;
+        else if (typeStr == "categorical_combo") tvType = STAT_TYPE_CATEGORICAL_COMBO;
+        else return returnError("bad_type",
+            "type must be one of: level, cumulative, time_series, categorical, "
+            "kinetic_level, pointer, categorical_combo. Got: '" + typeStr + "'.");
+
+        int flags = rawFlags;
+        if (keepHistory)  flags |= STAT_USE_HISTORY;
+        if (profile)      flags |= STAT_USE_PROFILE;
+        if (ignoreWarmup) flags |= STAT_IGNORE_WARMUP;
+
+        treenode tools = model()->find("Tools");
+        if (!objectexists(tools)) return returnError("tools_missing", "model has no Tools node.");
+        treenode container = assertsubnode(tools, "TrackedVariables", 0);
+
+        // Duplicate-by-name handling (idempotent unless replace).
+        treenode existing = 0;
+        int nc = content(container);
+        for (int i = 1; i <= nc; ++i) {
+            treenode c = rank(container, i);
+            if (c && std::string(getname(c)) == name) { existing = c; break; }
+        }
+        if (existing) {
+            if (!replace) {
+                nlohmann::json out;
+                out["ok"]       = true;
+                out["existing"] = true;
+                out["name"]     = name;
+                if (const char* p = nodetomodelpath_cstr(existing, 1)) out["path"] = std::string(p);
+                out["note"]     = "A TrackedVariable with this name already exists. "
+                                  "Pass replace:true to recreate it with new type/flags.";
+                return returnJson(out);
+            }
+            destroyobject(existing);
+        }
+
+        // Create: add the subnode, init the TrackedVariable on it, then name it.
+        treenode newTV = nodeinsertinto(container);
+        if (!objectexists(newTV)) {
+            return returnError("create_failed", "could not add a Tools/TrackedVariables subnode.");
+        }
+        TrackedVariable::init(newTV, tvType, startValue, flags);
+        setname(newTV, name.c_str());
+
+        nlohmann::json out;
+        out["ok"]            = true;
+        out["existing"]      = false;
+        out["name"]          = name;
+        out["type"]          = typeStr;
+        out["start_value"]   = startValue;
+        out["flags"]         = flags;
+        out["flags_applied"] = {
+            { "keep_history",  (flags & STAT_USE_HISTORY)   != 0 },
+            { "profile",       (flags & STAT_USE_PROFILE)   != 0 },
+            { "ignore_warmup", (flags & STAT_IGNORE_WARMUP) != 0 }
+        };
+        if (const char* p = nodetomodelpath_cstr(newTV, 1)) out["path"] = std::string(p);
+        out["accessor"] = "Model.find(\"Tools/TrackedVariables/" + name + "\")";
+        return returnJson(out);
     } catch (const std::exception& e) { return returnException("create_tracked_variable", e.what()); }
       catch (...)                     { return returnException("create_tracked_variable", "unknown"); }
 }
