@@ -8038,31 +8038,139 @@ modelerai_export Variant ModelerAi_removeTrigger(FLEXSIMINTERFACE)
 }
 
 // ----------------------------------------------------------------------------
-// modelerai_find_objects({ name_pattern?, class?, in_group?, parent_path?,
-//                          recursive? })
+// modelerai_find_objects(json | "namesubstring")
+//   json: { name_pattern?, class?, in_group?, parent_path?, recursive?, limit? }
 //
-// Search the active model for objects matching the criteria. Returns
-// `[{ path, name, class }, ...]`. Read-only.
+// Read-only search of the model for 3D objects matching the criteria. Returns
+// { ok, count, truncated, objects:[{ name, path, class }] }.
 //
-// TODO — needs context from user before implementing:
-//   1. Name-pattern semantics: glob (`Source*`) or substring or regex or
-//      exact? The slash-command UI uses substring. Standard FlexSim
-//      Model.find takes exact-path strings — we'd need our own walker.
-//   2. Class match: by short class name only ("Source"), or also fully
-//      qualified ("ProcessFlow::Source")? Probably both.
-//   3. `in_group`: group by Tools name (and possibly nested groups)?
-//   4. `parent_path`: a tree path to start the walk from (e.g.
-//      "Model/Area1"). If absent, default to Model root.
-//   5. `recursive`: depth-first into subobjects? Default true is safer
-//      but slower on big models. Cap recursion?
-//   6. Cap result size — what's a reasonable upper bound? 200?
+// Resolved semantics:
+//   - name_pattern: case-insensitive SUBSTRING (matches the slash-command UI).
+//     A bare non-JSON string arg is treated as the name substring.
+//   - class: isclasstype() filter — accepts a short ("Source") OR qualified
+//     ("AGV::ControlPoint") name AND honors inheritance, so class:"FixedResource"
+//     matches every FR, class:"TaskExecuter" every TE, etc.
+//   - in_group: only objects that are (recursive) members of that Group.
+//   - parent_path: tree path to start from (default = model root).
+//   - recursive: descend the whole subtree (default true) vs direct children only.
+//   - limit: max matches returned (default 200); truncated=true if hit.
+// "Object" filter = isclasstype(n, "FlexSimObject") — the 3D-object base — so
+// Tools (tables/groups/PMs) and internal label/port nodes are excluded.
 // ----------------------------------------------------------------------------
 modelerai_export Variant ModelerAi_findObjects(FLEXSIMINTERFACE)
 {
     try {
-        return returnError("not_implemented",
-            "modelerai_find_objects is shelled but not yet implemented. "
-            "See the TODO block above ModelerAi_findObjects in commands.cpp.");
+        std::string namePattern, className, inGroup, parentPath;
+        bool recursive = true;
+        int limit = 200;
+
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            if (!s.empty()) {
+                bool parsed = false;
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object()) {
+                        namePattern = j.value("name_pattern", std::string(""));
+                        className   = j.value("class",        std::string(""));
+                        inGroup     = j.value("in_group",     std::string(""));
+                        parentPath  = j.value("parent_path",  std::string(""));
+                        recursive   = j.value("recursive",    true);
+                        if (j.contains("limit") && j["limit"].is_number_integer()) limit = j["limit"].get<int>();
+                        parsed = true;
+                    } else if (j.is_string()) {
+                        namePattern = j.get<std::string>(); parsed = true;
+                    }
+                } catch (...) {}
+                if (!parsed) namePattern = s;   // not JSON → bare name substring
+            }
+        }
+        if (limit <= 0) limit = 200;
+
+        // Start node (default model root).
+        treenode start = model();
+        if (!parentPath.empty()) {
+            treenode p = node(parentPath.c_str(), model());
+            if (!objectexists(p)) p = model()->find(parentPath.c_str());
+            if (!objectexists(p)) return returnError("parent_not_found", "parent_path not found: " + parentPath);
+            start = p;
+        }
+
+        // Optional group filter.
+        Group* groupObj = nullptr;
+        if (!inGroup.empty()) {
+            treenode gNode = resolveGroupNode(inGroup);
+            if (!gNode) return returnError("group_not_found", "in_group not found: " + inGroup);
+            groupObj = gNode->object<Group>();
+        }
+
+        // When searching from the model root (no explicit parent_path), exclude the
+        // Tools subtree — it holds FlexSimObjects that aren't placed model objects
+        // (FlowItemBin prototypes like Man/Woman/Truck, etc.). If the caller gives
+        // an explicit parent_path, respect it literally (no exclusion).
+        treenode toolsNode = parentPath.empty() ? model()->find("Tools") : (treenode)0;
+
+        // Lowercase the pattern once (manual ASCII — no <cctype> dependency).
+        std::string pat = namePattern;
+        for (auto& ch : pat) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+
+        nlohmann::json objects = nlohmann::json::array();
+        int matched = 0;
+        bool truncated = false;
+
+        // Test one node; returns false to signal "stop walking" (limit reached).
+        auto consider = [&](treenode n) -> bool {
+            if (!objectexists(n)) return true;
+            if (!isclasstype(n, "FlexSimObject")) return true;     // model objects only
+            if (objectexists(toolsNode)) {                         // skip Tools-resident objects
+                bool underTools = false;
+                for (treenode a = n->up; objectexists(a); a = a->up) {
+                    if (a == toolsNode) { underTools = true; break; }
+                    if (a == start) break;
+                }
+                if (underTools) return true;
+            }
+            if (!pat.empty()) {
+                std::string low = std::string(getname(n));
+                for (auto& ch : low) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+                if (low.find(pat) == std::string::npos) return true;
+            }
+            if (!className.empty() && !isclasstype(n, className.c_str())) return true;
+            if (groupObj && !groupObj->isMember(n, 1)) return true;
+
+            nlohmann::json o;
+            o["name"] = std::string(getname(n));
+            if (const char* p = nodetomodelpath_cstr(n, 1)) o["path"] = std::string(p);
+            treenode cls = classobject(n);
+            if (objectexists(cls)) o["class"] = std::string(getname(cls));
+            objects.push_back(std::move(o));
+            if (++matched >= limit) { truncated = true; return false; }
+            return true;
+        };
+
+        if (recursive) {
+            long long visited = 0;
+            const long long VISIT_CAP = 500000;   // safety net on pathological trees
+            for (treenode n = nextforobjecttreeunder(start, start);
+                 objectexists(n) && visited < VISIT_CAP;
+                 n = nextforobjecttreeunder(n, start)) {
+                ++visited;
+                if (!consider(n)) break;
+            }
+        } else {
+            int nc = content(start);
+            for (int i = 1; i <= nc; ++i) {
+                if (!consider(rank(start, i))) break;
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]        = true;
+        out["count"]     = matched;
+        out["truncated"] = truncated;
+        out["objects"]   = std::move(objects);
+        return returnJson(out);
     } catch (const std::exception& e) { return returnException("find_objects", e.what()); }
       catch (...)                     { return returnException("find_objects", "unknown"); }
 }
