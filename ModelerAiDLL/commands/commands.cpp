@@ -2488,8 +2488,14 @@ NavWalkResult fixedResourceNavigatorMemberships(const std::string& frName)
                      || isclasstype(owner, "AGV::ControlPoint")
                      || isclasstype(owner, "GIS::Point")) {
                         anchors.push_back(owner);
-                    } else if (objectexists(owner->up) && isclasstype(owner->up, "Navigator")) {
-                        anchors.push_back(owner->up);
+                    } else {
+                        // Some systems (A*) store the coupling target a level or
+                        // two beneath the navigator; walk up a few parents looking
+                        // for a Navigator ancestor instead of only owner->up.
+                        treenode anc = owner->up;
+                        for (int up = 0; up < 3 && objectexists(anc); ++up, anc = anc->up) {
+                            if (isclasstype(anc, "Navigator")) { anchors.push_back(anc); break; }
+                        }
                     }
                 } catch (...) { /* skip this node */ }
             }
@@ -2718,26 +2724,28 @@ modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator(FLEXSIMINTERFA
         // Read current navigator BEFORE — for already-connected detection
         // and to surface the prior binding in the response.
         std::string formerNavName;
+        TreeNode* formerNavNode = nullptr;
         {
             ObjectDataType* teObj = te->object<ObjectDataType>();
             if (teObj) {
                 Variant cur = teObj->getProperty("Navigator");
                 if (cur.type == VariantType::TreeNode) {
                     TreeNode* nv = static_cast<TreeNode*>(cur);
-                    if (objectexists(nv)) formerNavName = std::string(getname(nv));
+                    if (objectexists(nv)) { formerNavNode = nv; formerNavName = std::string(getname(nv)); }
                 }
             }
         }
 
-        // Already on the requested navigator? For non-GIS, that's a true
-        // no-op and we should reject as already_connected. For GIS, the
-        // contextdragconnection would auto-append a duplicate input port,
-        // so we also need to short-circuit BEFORE the wire add.
-        if (!formerNavName.empty() && formerNavName == navName) {
+        // Already on the requested navigator? Compare by NODE IDENTITY, not name
+        // (object names aren't globally unique, so a name compare could misfire).
+        // For non-GIS, that's a true no-op → reject. For GIS, contextdragconnection
+        // would auto-append a duplicate port, so short-circuit BEFORE the wire add.
+        if (formerNavNode && formerNavNode == nav) {
             if (isGIS) {
-                // Check if THIS specific point is already wired to the TE.
+                // Check if THIS specific point is already wired to the TE (either
+                // port direction — the wire can land TE-in/point or TE-out/point).
                 TreeNode* pt = model()->find(pointName.c_str());
-                if (objectexists(pt) && findInPortFor(te, pt) != 0) {
+                if (objectexists(pt) && (findInPortFor(te, pt) != 0 || findOutPortFor(te, pt) != 0)) {
                     return returnError("already_connected",
                         "task executer '" + teName + "' is already on navigator '" + navName +
                         "' with GIS point '" + pointName + "' already wired. "
@@ -2777,8 +2785,10 @@ modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator(FLEXSIMINTERFA
         }
 
         // POST-MUTATION VERIFICATION
-        // 1. Confirm the Navigator property now equals nav.
+        // 1. Confirm the Navigator property now points at nav (by NODE IDENTITY,
+        //    not name — names aren't globally unique).
         std::string nowNavName;
+        TreeNode* nowNavNode = nullptr;
         {
             ObjectDataType* teObj = te->object<ObjectDataType>();
             if (!teObj) {
@@ -2788,23 +2798,23 @@ modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator(FLEXSIMINTERFA
             Variant after = teObj->getProperty("Navigator");
             if (after.type == VariantType::TreeNode) {
                 TreeNode* nv = static_cast<TreeNode*>(after);
-                if (objectexists(nv)) nowNavName = std::string(getname(nv));
+                if (objectexists(nv)) { nowNavNode = nv; nowNavName = std::string(getname(nv)); }
             }
         }
-        if (nowNavName != navName) {
+        if (nowNavNode != nav) {
             return returnError("connect_unverified",
                 "setProperty(Navigator, " + navName + ") returned but task executer's "
                 "Navigator is now '" + nowNavName + "'. FlexSim may have "
                 "rejected the assignment.");
         }
-        // 2. For GIS, also verify the wire actually landed.
+        // 2. For GIS, also verify the wire actually landed (either port direction).
         if (isGIS) {
             TreeNode* pt = model()->find(pointName.c_str());
-            if (objectexists(pt) && findInPortFor(te, pt) == 0) {
+            if (objectexists(pt) && findInPortFor(te, pt) == 0 && findOutPortFor(te, pt) == 0) {
                 return returnError("connect_unverified",
                     "Navigator property was set but contextdragconnection "
                     "to GIS point '" + pointName + "' didn't materialize "
-                    "on the task executer's input ports.");
+                    "on the task executer's ports.");
             }
         }
 
@@ -3144,8 +3154,12 @@ modelerai_export Variant ModelerAi_disconnect(FLEXSIMINTERFACE)
             nlohmann::json out;
             out["ok"]                  = true;
             out["kind"]                = "flow";
-            out["removed_from_index"]  = existingTo;
-            out["removed_to_index"]    = existingFrom;
+            // Name the indices by what they actually are (the old
+            // removed_from/to_index names had their values swapped):
+            // existingFrom = the FROM node's output port; existingTo = the TO
+            // node's input port.
+            out["removed_from_outport"] = existingFrom;
+            out["removed_to_inport"]    = existingTo;
             out["from_outObjects_now"] = std::move(fromOut);
             out["to_inObjects_now"]    = std::move(toIn);
             return returnJson(out);
