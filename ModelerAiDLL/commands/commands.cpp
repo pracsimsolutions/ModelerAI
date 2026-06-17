@@ -8176,35 +8176,119 @@ modelerai_export Variant ModelerAi_findObjects(FLEXSIMINTERFACE)
 }
 
 // ----------------------------------------------------------------------------
-// modelerai_validate_model({ checks?: ["orphans", "undefined_process_times",
-//                                       "disconnected_sources", ...] })
+// modelerai_validate_model(json | ["check", ...])
+//   json: { checks?: ["source_no_output","sink_no_input","no_input","no_output"] }
 //
-// Run a set of read-only sanity checks across the active model.
-// Returns `[{ check, severity: "warn"|"error", path, message }, ...]`.
+// Read-only FLOW-CONNECTIVITY sanity checks across the model — the common
+// "forgot to wire it" mistakes, computed reliably from native port counts
+// (nrip/nrop). Returns { ok, checked_objects, issue_count, errors, warnings,
+// truncated, issues:[{check, severity, object, path, message}] }.
 //
-// TODO — needs context from user before implementing:
-//   1. What's the MVP check list? My proposed first set:
-//        - "orphans": objects in Tools but never referenced in 3D
-//        - "disconnected_sources": Sources with no output port wired
-//        - "disconnected_sinks": Sinks with no input port wired
-//        - "undefined_process_times": Processors with empty processTime
-//        - "no_arrival_schedule": Sources with neither inter-arrival
-//          nor schedule
-//        - "infinite_capacity_warning": Queues with capacity==MAXINT
-//      Do you want any of those dropped, or others added?
-//   2. Some checks (like "undefined" or "infinite") are warnings, not
-//      errors. Severity levels: error / warn / info — sound right?
-//   3. Should we batch-cap output? e.g. "show first 50 issues"?
-//   4. Some checks need to know what classes count as "Source", "Sink",
-//      "Processor" etc. — that's reasonable to hard-code OR let the
-//      caller pass class lists. Hardcode for v1?
+// v1 checks (all run by default; pass `checks` to subset):
+//   source_no_output : a Source with no output connection            (error)
+//   sink_no_input    : a Sink with no input connection               (warn)
+//   no_input         : a non-Source FixedResource with no input      (warn)
+//   no_output        : a non-Sink FixedResource with no output       (warn)
+// Only FixedResources are checked (flow objects); Tools-resident objects
+// (FlowItemBin prototypes) are skipped. Property-value checks (undefined
+// process times, infinite capacity, arrival schedules) are deferred — they
+// need fragile picklist-property reading and risk false positives.
 // ----------------------------------------------------------------------------
 modelerai_export Variant ModelerAi_validateModel(FLEXSIMINTERFACE)
 {
     try {
-        return returnError("not_implemented",
-            "modelerai_validate_model is shelled but not yet implemented. "
-            "See the TODO block above ModelerAi_validateModel in commands.cpp.");
+        std::set<std::string> only;
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            if (!s.empty()) {
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    if (j.is_object() && j.contains("checks") && j["checks"].is_array()) {
+                        for (auto& c : j["checks"]) if (c.is_string()) only.insert(c.get<std::string>());
+                    } else if (j.is_array()) {
+                        for (auto& c : j) if (c.is_string()) only.insert(c.get<std::string>());
+                    }
+                } catch (...) {}
+            }
+        }
+        auto wants = [&](const char* name) { return only.empty() || only.count(name) > 0; };
+
+        const int CAP = 300;
+        nlohmann::json issues = nlohmann::json::array();
+        int checkedObjects = 0;
+        bool truncated = false;
+        treenode toolsNode = model()->find("Tools");
+
+        auto addIssue = [&](const char* check, const char* severity, treenode obj,
+                            const std::string& msg) -> bool {
+            nlohmann::json it;
+            it["check"]    = check;
+            it["severity"] = severity;
+            it["object"]   = std::string(getname(obj));
+            if (const char* p = nodetomodelpath_cstr(obj, 1)) it["path"] = std::string(p);
+            it["message"]  = msg;
+            issues.push_back(std::move(it));
+            if ((int)issues.size() >= CAP) { truncated = true; return false; }
+            return true;
+        };
+
+        long long visited = 0;
+        const long long VISIT_CAP = 500000;
+        bool stop = false;
+        for (treenode n = nextforobjecttreeunder(model(), model());
+             objectexists(n) && visited < VISIT_CAP && !stop;
+             n = nextforobjecttreeunder(n, model())) {
+            ++visited;
+            if (!isclasstype(n, "FixedResource")) continue;
+            // skip Tools-resident FixedResources (FlowItemBin prototypes etc.)
+            if (objectexists(toolsNode)) {
+                bool underTools = false;
+                for (treenode a = n->up; objectexists(a); a = a->up) {
+                    if (a == toolsNode) { underTools = true; break; }
+                    if (a == model()) break;
+                }
+                if (underTools) continue;
+            }
+
+            ++checkedObjects;
+            int in  = (int)nrip(n);
+            int out = (int)nrop(n);
+
+            if (isclasstype(n, "Source")) {
+                if (out == 0 && wants("source_no_output"))
+                    if (!addIssue("source_no_output", "error", n,
+                        "Source has no output connection — created items have nowhere to go.")) stop = true;
+            } else if (isclasstype(n, "Sink")) {
+                if (in == 0 && wants("sink_no_input"))
+                    if (!addIssue("sink_no_input", "warn", n,
+                        "Sink has no input connection — nothing will arrive here.")) stop = true;
+            } else {
+                if (in == 0 && wants("no_input"))
+                    if (!addIssue("no_input", "warn", n,
+                        "FixedResource has no input connection — nothing flows in.")) stop = true;
+                if (!stop && out == 0 && wants("no_output"))
+                    if (!addIssue("no_output", "warn", n,
+                        "FixedResource has no output connection — items can't leave (dead end).")) stop = true;
+            }
+        }
+
+        int errors = 0, warns = 0;
+        for (auto& it : issues) {
+            std::string sev = it.value("severity", std::string(""));
+            if      (sev == "error") ++errors;
+            else if (sev == "warn")  ++warns;
+        }
+
+        nlohmann::json out;
+        out["ok"]              = true;
+        out["checked_objects"] = checkedObjects;
+        out["issue_count"]     = (int)issues.size();
+        out["errors"]          = errors;
+        out["warnings"]        = warns;
+        out["truncated"]       = truncated;
+        out["issues"]          = std::move(issues);
+        return returnJson(out);
     } catch (const std::exception& e) { return returnException("validate_model", e.what()); }
       catch (...)                     { return returnException("validate_model", "unknown"); }
 }
