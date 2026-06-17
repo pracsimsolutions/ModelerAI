@@ -4449,13 +4449,26 @@ modelerai_export Variant ModelerAi_runUntil(FLEXSIMINTERFACE)
 modelerai_export Variant ModelerAi_run(FLEXSIMINTERFACE)
 {
     try {
-        // Native (.1000084 — was executestring). go() is fsvisible.
-        go();
+        // Reset before go() so freshly-added chart statistics-collectors bind and
+        // stats start clean — charts created since the last reset don't collect
+        // until a reset. Pass {reset:false} to resume without resetting.
+        bool doReset = true;
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            if (!s.empty()) {
+                try { auto j = nlohmann::json::parse(s); if (j.is_object()) doReset = j.value("reset", true); }
+                catch (...) {}
+            }
+        }
+        if (doReset) resetmodel(1);
+        go();   // fsvisible
         double t = time();
         nlohmann::json out;
         out["ok"]        = true;
         out["run_state"] = "Running";
         out["sim_time"]  = t;
+        out["reset"]     = doReset;
         out["note"]      = "Async — use modelerai_get_run_state to poll, "
                            "modelerai_stop_model to halt.";
         return returnJson(out);
@@ -6358,6 +6371,21 @@ modelerai_export Variant ModelerAi_addDashboardChart(FLEXSIMINTERFACE)
         treenode host = view;
         (void)foundOpen;
 
+        // State-based charts (State / StaffState / LocationState) read their data
+        // from a StateTable. FlexSim neither auto-creates nor auto-binds one, so
+        // the chart comes up empty (collector's StateTable label = 0x0). Resolve a
+        // table now — reuse the FIRST existing one, else create a default — and
+        // point the chart's collector at it after the chart is instantiated.
+        treenode stateTable = 0;
+        if (templatePath.find("State") != std::string::npos) {
+            treenode stCont = node("Tools/StateTables", model());
+            if (objectexists(stCont) && content(stCont) > 0) {
+                stateTable = rank(stCont, 1);            // first available
+            } else {
+                stateTable = Tools::create("StateTable", "Default");
+            }
+        }
+
         // Instantiate the chart from the template.
         treenode chart = 0;
         {
@@ -6388,8 +6416,54 @@ modelerai_export Variant ModelerAi_addDashboardChart(FLEXSIMINTERFACE)
             }
         }
 
-        // Commit + refresh.
+        // Commit.
         try { function_s(chart, "onApply"); } catch (...) {}
+
+        // Bind the StateTable AFTER onApply. onApply rebuilds the collector from
+        // the template and resets the StateTable label to null (0x0), so wiring it
+        // before onApply gets clobbered. Re-resolve the label and point the
+        // coupling at the resolved table — FlexScript equivalent:
+        //   node("<chart>>stats/statisticsCollector/StatisticsCollector>labels/StateTable").value = StateTable.
+        // The label ships as a null coupling; without this the collector has no
+        // table to read and the chart renders empty.
+        bool stateTableBound = false;
+        std::string stateTablePath;
+        if (objectexists(stateTable)) {
+            treenode stLabel = node(">stats/statisticsCollector/StatisticsCollector>labels/StateTable", chart);
+            if (objectexists(stLabel)) {
+                nodeadddata(stLabel, DATATYPE_COUPLING);
+                nodepoint(stLabel, stateTable);
+                stateTableBound = true;
+                if (const char* p = nodetomodelpath_cstr(stateTable, 1)) stateTablePath = p;
+            }
+        }
+
+        // Grid placement — FlexSim's default widget placement is inconsistent
+        // (some stack top-left). Tile the new widget so charts don't overlap: the
+        // newest widget is the last child of the dashboard's GraphPanel; place it
+        // by its 0-based index into a `cols`-wide grid, stepping by its own size.
+        nlohmann::json placement = nlohmann::json::object();
+        treenode panel = objectexists(view) ? view->find("GraphPanel") : (treenode)0;
+        if (objectexists(panel) && content(panel) > 0) {
+            int n = content(panel);
+            treenode widget = rank(panel, n);   // newest widget = last child
+            if (objectexists(widget)) {
+                double w = 250.0, h = 180.0;
+                try { double rw = (double)(spatialsx(widget)->value); if (rw > 1.0) w = rw; } catch (...) {}
+                try { double rh = (double)(spatialsy(widget)->value); if (rh > 1.0) h = rh; } catch (...) {}
+                const int cols = 3;
+                const double gap = 12.0;
+                int index = n - 1;
+                double x = (index % cols) * (w + gap);
+                double y = (index / cols) * (h + gap);
+                try { spatialx(widget)->value = Variant(x); } catch (...) {}
+                try { spatialy(widget)->value = Variant(y); } catch (...) {}
+                placement["index"] = index;
+                placement["cols"]  = cols;
+                placement["w"] = w; placement["h"] = h; placement["x"] = x; placement["y"] = y;
+            }
+        }
+
         if (objectexists(view)) { try { refreshview(view); } catch (...) {} }
 
         nlohmann::json out;
@@ -6402,6 +6476,8 @@ modelerai_export Variant ModelerAi_addDashboardChart(FLEXSIMINTERFACE)
         if (const char* p = nodetomodelpath_cstr(chart, 1)) out["chart_path"] = std::string(p);
         if (objectexists(groupNode)) { if (const char* p = nodetomodelpath_cstr(groupNode, 1)) out["group_path"] = std::string(p); }
         if (objectexists(view))      { if (const char* p = nodetomodelpath_cstr(view, 1))      out["view_path"]  = std::string(p); }
+        if (!placement.empty()) out["placement"] = std::move(placement);
+        if (stateTableBound) { out["state_table_bound"] = true; if (!stateTablePath.empty()) out["state_table"] = stateTablePath; }
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("add_dashboard_chart", e.what()); }
       catch (...)                     { return returnException("add_dashboard_chart", "unknown"); }
