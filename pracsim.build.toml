@@ -8,7 +8,13 @@ url            = "https://github.com/pracsimsolutions/ModelerAI"
 # FIXED FOREVER. Ported from the pre-MIT-cleanup bundle. Changing either
 # GUID breaks MSI upgrade behaviour for users on prior installs.
 upgrade_code         = "0247D13E-9A35-40A0-80DF-BAD224809F49"
-component_guid_prefix = "EF04C8EF-BC82-468D-9766-000000000"
+# The reserved tail sets how many files this module can ship: width =
+# 12 - (chars after the last '-'). Six zeros -> 6 index digits -> up to
+# 999,999 components. ModelerAI's KNOWLEDGE/ pushes the file count past
+# the old 3-digit (999) limit, which produced illegal 13-digit GUIDs.
+# Trailing zeros mean GUIDs for index <= 999 are unchanged from the
+# old 9-zero prefix, so MSI upgrade behaviour is preserved.
+component_guid_prefix = "EF04C8EF-BC82-468D-9766-000000"
 
 [brand]
 icon_svg     = "modelerai.svg"
