@@ -6,7 +6,7 @@
 >
 > Curious, suggestions, bugs? **<josh@pracsimsolutions.com>** — happy to hear from you.
 
-An AI assistant that lives inside FlexSim 2026's 3D modeler. Chat about your model in plain English; the assistant can read its structure, answer questions, and (with your approval) build and modify it for you.
+An AI assistant that lives inside FlexSim's 3D modeler. Chat about your model in plain English; the assistant can read its structure, answer questions, and (with your approval) build and modify it for you.
 
 **[MIT License](LICENSE.txt) — clone, build, modify, ship. No installer, no activation, no telemetry.**
 
@@ -14,8 +14,8 @@ An AI assistant that lives inside FlexSim 2026's 3D modeler. Chat about your mod
 |---|---|
 | **Status** | v0.1 — chat, tool calls under approval, multi-device remote viewer, BYOK. |
 | **Providers** | Anthropic Claude (Haiku 4.5 default, Sonnet 4.6, Opus 4.8), OpenAI, Google Gemini, xAI Grok, Mistral; OpenAI-compatible adapter covers Ollama, DeepSeek, etc. |
-| **Platform** | Windows-only. FlexSim 2026 required. |
-| **Build** | Visual Studio 2022 (C++ desktop workload) + Node.js 20+. |
+| **Platform** | Windows-only. FlexSim required. |
+| **Build** | Ships with a prebuilt `ModelerAI.dll` — drop it in and run. Rebuild only to test your own changes (Visual Studio 2022, C++ workload). Node.js 20+ for the knowledge base. |
 
 ---
 
@@ -27,7 +27,7 @@ Heavyweight C++ DLL plus a dumb HTML viewer. Provider calls, agent loop, tool im
 
 ## Setup
 
-Prerequisites: **FlexSim 2026** (full install — ModelerAI reads its bundled API reference and optional manual), **Visual Studio 2022** with the *Desktop development with C++* workload, **Node.js 20+ LTS**, **Git**.
+Prerequisites: **FlexSim** (full install — ModelerAI reads its bundled API reference and optional manual), **Node.js 20+ LTS**, **Git**. The module ships with a prebuilt `ModelerAI.dll`, so **Visual Studio 2022** (with the *Desktop development with C++* workload) is only needed if you want to rebuild the DLL to test your own changes.
 
 ### 1. Get a provider API key
 
@@ -46,34 +46,40 @@ Cheap models are fractions of a cent per turn. For pricier models (Opus, GPT-4o,
 ### 2. Clone into FlexSim's modules folder
 
 ```powershell
-cd "C:\Program Files\FlexSim 2026\modules"
+cd "C:\Program Files\FlexSim <version>\modules"
 git clone https://github.com/pracsimsolutions/ModelerAI.git
 ```
 
 If `git clone` fails with "Access denied," re-run PowerShell as administrator.
 
-### 3. Build the DLL
+The repo ships with a prebuilt `ModelerAI.dll` at its root — **no build step is required to run.** Rebuilding from source is only needed if you want to test your own changes (see [Building from source](#building-from-source)).
+
+### 3. Build the knowledge base
+
+Double-click `setup.bat` (or `node tools/build-kb.js` from PowerShell). This regenerates the KB locally from your FlexSim install's API + command XML — nothing FlexSim-derived ships in this repo. Re-run any time FlexSim updates.
+
+### 4. Open the panel
+
+Launch FlexSim, open or create a model, open the **Toolbox**, and double-click **ModelerAI**. The chat panel docks itself; drag the tab wherever you like. It auto-reopens with that model going forward.
+
+### 5. First-launch wizard
+
+The first time the panel opens, it walks you through: welcome → paste API key (encrypted via Windows DPAPI to `%APPDATA%\PRACSIM\ModelerAI\keys.dat`) → optional cost cap (try `warn=$2, stop=$5`) → pick default model → done. Skip it and configure from **Settings → Setup** if you prefer.
+
+Send a test message: *"Hi, can you see my model?"*
+
+---
+
+## Building from source
+
+You don't need to build anything to run ModelerAI — a prebuilt `ModelerAI.dll` ships at the repo root and is kept in sync with the source. **Building is only required if you want to test your own changes** (for example, when working on the `main` branch, where the source is a moving target).
 
 ```powershell
 cd ModelerAI\ModelerAiDLL
 start ModelerAi.sln
 ```
 
-In Visual Studio: set platform to **x64**, press **Ctrl + Shift + B**. After 1–3 minutes you'll see "Build: 1 succeeded." `ModelerAI.dll` lands at the repo root.
-
-### 4. Build the knowledge base
-
-Double-click `setup.bat` (or `node tools/build-kb.js` from PowerShell). This regenerates the KB locally from your FlexSim install's API + command XML — nothing FlexSim-derived ships in this repo. Re-run any time FlexSim updates.
-
-### 5. Open the panel
-
-Launch FlexSim, open or create a model, open the **Toolbox**, and double-click **ModelerAI**. The chat panel docks itself; drag the tab wherever you like. It auto-reopens with that model going forward.
-
-### 6. First-launch wizard
-
-The first time the panel opens, it walks you through: welcome → paste API key (encrypted via Windows DPAPI to `%APPDATA%\PRACSIM\ModelerAI\keys.dat`) → optional cost cap (try `warn=$2, stop=$5`) → pick default model → done. Skip it and configure from **Settings → Setup** if you prefer.
-
-Send a test message: *"Hi, can you see my model?"*
+In Visual Studio: set platform to **x64**, press **Ctrl + Shift + B**. After 1–3 minutes you'll see "Build: 1 succeeded." The rebuilt `ModelerAI.dll` lands at the repo root, replacing the shipped one.
 
 ---
 
