@@ -8706,7 +8706,13 @@ static nlohmann::json applyTriggerPickImpl(const nlohmann::json& j)
         e["message"] = "assertEventWithCode returned no storage node for '" + triggerName + "'.";
         return e;
     }
-    std::string finalCode = tm.header + tmpl;   // codeHeader ends with \n
+    // Header: prefer the PICKLIST's own header — it declares the variables its
+    // picks reference (e.g. AGV picks need `te`/`agv`, which the event header does
+    // NOT). Fall back to the event's codeHeader when the picklist carries none.
+    // For the general trigger picklists the two are equivalent (item/current/port).
+    std::string pickHeader = safePickStr(pl);
+    if (pickHeader.empty()) pickHeader = tm.header;
+    std::string finalCode = pickHeader + tmpl;
     storage->value = Variant(finalCode.c_str());
 
     e["ok"]        = true;
