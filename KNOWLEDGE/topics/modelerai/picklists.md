@@ -19,6 +19,7 @@ A pick is a code template with two things you fill in:
 | `parameter` (default) | `parameterpicklist` | the parameter's `Value/onSet` | runs when the parameter's value changes (e.g. on reset) |
 | `performance_measure` | `performancemeasurepicklist` | the PM's `Value/valueNode` | computes the PM's value when read |
 | `trigger` | a named event-type picklist (you supply it) | the object's trigger event storage | runs when that event fires on the object |
+| `property` | a named picklist (you supply it) | the object's property value node (variable) | a FlexScript-valued property (e.g. a Processor's process time) |
 
 ## `modelerai_list_picks` — discover picks (read-only)
 
@@ -82,6 +83,26 @@ modelerai_apply_pick {
 modelerai_get_pick { "surface": "trigger", "object": "Queue1", "trigger": "OnEntry" }
 ```
 A wrong `trigger` returns the available event names; a wrong `pick_name` returns the available picks. Choose the picklist whose event type matches the trigger — applying an entry/exit pick to an unrelated event can reference variables the event's header doesn't declare.
+
+## Properties (surface `property`)
+
+For a property whose value is a FlexScript expression (e.g. a Processor's process time). The target is an **(object, property)** pair where `property` is the **variable name** (e.g. `cycletime` for a Processor's process time — not the GUI label). You supply the picklist:
+
+- `statisticaldistribution` — the 32 distributions (Normal, Exponential, Triangular, …). Each pick has a `distribution` tag plus `par1`–`par5` (note: par2+ carry a leading comma, e.g. `", 5"`).
+- `timepicklist` — time-value presets (Values By Case, By Global Table Lookup, By Percentage, Periodic Rates). Its "Statistical Distribution" entry is a **link** into `statisticaldistribution` — apply returns `pick_is_a_link` pointing you there.
+
+The property keeps its **own header** (`current`/`item` declarations) — apply preserves it and swaps in the pick body.
+
+```json
+// set a Processor's process time to Exponential(0, 8, getstream(current))
+modelerai_apply_pick {
+  "surface": "property", "object": "Processor1", "property": "cycletime",
+  "picklist": "statisticaldistribution", "pick_name": "Exponential",
+  "tags": { "par1": "0", "par2": ", 8" }
+}
+// read back
+modelerai_get_pick { "surface": "property", "object": "Processor1", "property": "cycletime" }
+```
 
 ## Worked example — count-driven duplication
 

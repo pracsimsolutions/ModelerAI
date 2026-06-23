@@ -2309,12 +2309,32 @@ std::string parsePickLabel(const std::string& code)
     while (true) {
         size_t lb = code.find("/**", s);
         if (lb == std::string::npos) return "";
-        size_t le = code.find("*/", lb + 3);
-        if (le == std::string::npos) return "";
-        std::string label = code.substr(lb + 3, le - (lb + 3));
-        if (!label.empty()) return label;        // skip empty /**/ tag delimiters
-        s = le + 2;
+        // A comment closes at the first "*/" after its "/*" (lb+2), so the empty
+        // "/**/" delimiter closes immediately (close == lb+2, before content start).
+        size_t close = code.find("*/", lb + 2);
+        if (close == std::string::npos) return "";
+        std::string label = (close >= lb + 3) ? code.substr(lb + 3, close - (lb + 3)) : "";
+        s = close + 2;
+        // Accept only a real /**Label*/ — non-empty, NOT a /***tag:/***popup marker
+        // (content starts with '*') and NOT a stray value delimiter (starts with '/').
+        if (!label.empty() && label[0] != '*' && label[0] != '/') return label;
     }
+}
+
+// Extract a property's code header — the leading declarations (e.g. "Object
+// current = ownerobject(c);\nObject item = param(1);") — from its current stored
+// value, so an applied pick keeps the SAME header (the picklist itself doesn't
+// supply it). The body starts at the first picklist marker / return / block, so
+// the header is everything before that. Returns "" if no body marker is found.
+std::string extractPropertyHeader(const std::string& code)
+{
+    size_t best = std::string::npos;
+    for (const char* m : { "/***popup:", "return", "{" }) {
+        size_t p = code.find(m);
+        if (p < best) best = p;   // npos sorts as max, so the earliest marker wins
+    }
+    if (best == std::string::npos) return "";
+    return code.substr(0, best);
 }
 
 // Find a parameter row node by name across ALL ParameterTables (parameter
@@ -2462,6 +2482,8 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
 // to them. Internal linkage; same translation unit.
 static nlohmann::json applyTriggerPickImpl(const nlohmann::json& j);
 static nlohmann::json getTriggerPickImpl(const nlohmann::json& j);
+static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j);
+static nlohmann::json getPropertyPickImpl(const nlohmann::json& j);
 
 // ============================================================================
 // modelerai_apply_pick({ surface?, parameter|performance_measure, pick_name,
@@ -2496,10 +2518,11 @@ modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
             return returnError("bad_args_shape", "apply_pick expects a JSON object.");
         }
 
-        // Trigger surface has a different shape (object + trigger + picklist,
-        // header from the event, write to the event storage) — dispatch out.
-        if (j.value("surface", std::string("parameter")) == "trigger") {
-            return returnJson(applyTriggerPickImpl(j));
+        // Trigger / property surfaces have a different shape — dispatch out.
+        {
+            std::string sfc = j.value("surface", std::string("parameter"));
+            if (sfc == "trigger")  return returnJson(applyTriggerPickImpl(j));
+            if (sfc == "property") return returnJson(applyPropertyPickImpl(j));
         }
 
         std::string pickName = j.value("pick_name", std::string(""));
@@ -2641,8 +2664,10 @@ modelerai_export Variant ModelerAi_getPick(FLEXSIMINTERFACE)
             j = nlohmann::json{ {"parameter", s} };
         }
 
-        if (j.value("surface", std::string("parameter")) == "trigger") {
-            return returnJson(getTriggerPickImpl(j));
+        {
+            std::string sfc = j.value("surface", std::string("parameter"));
+            if (sfc == "trigger")  return returnJson(getTriggerPickImpl(j));
+            if (sfc == "property") return returnJson(getPropertyPickImpl(j));
         }
 
         PickSurface surf;
@@ -8720,6 +8745,175 @@ static nlohmann::json getTriggerPickImpl(const nlohmann::json& j)
     parsePickPopup(code, popupName, popupParams);
     if (label.empty()) {
         out["current_pick"] = nullptr;   // hand-written / non-pick code
+    } else {
+        out["current_pick"] = label;
+        out["popup"]        = popupName;
+        nlohmann::json tarr = nlohmann::json::array();
+        for (const auto& t : parsePickTags(code)) {
+            nlohmann::json tj = { {"name", t.name}, {"value", t.defVal} };
+            if (!t.options.empty()) tj["options"] = t.options;
+            tarr.push_back(std::move(tj));
+        }
+        out["tags"] = std::move(tarr);
+    }
+    return out;
+}
+
+// ============================================================================
+// Property picklist surface. Target is an (object, property) pair where the
+// property's value is a FlexScript expression (e.g. a Processor's process time,
+// variable "cycletime"). The picklist is supplied by the AI (e.g.
+// "statisticaldistribution" for distributions, "timepicklist" for time presets).
+// The property keeps its OWN header (declarations like current/item) — we
+// preserve it from the current value and write header + filled template to the
+// value node, then compile. A picklist-reference option (code is a
+// VIEW:/picklists/... path) is reported so the caller drills into that picklist.
+// ============================================================================
+static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j)
+{
+    nlohmann::json e;
+    std::string objectName   = j.value("object",    std::string(""));
+    std::string propertyName = j.value("property",  std::string(""));
+    std::string picklistName = j.value("picklist",  std::string(""));
+    std::string pickName     = j.value("pick_name", std::string(""));
+    if (objectName.empty() || propertyName.empty() || picklistName.empty() || pickName.empty()) {
+        e["ok"] = false; e["error"] = "missing_args";
+        e["message"] = "property apply_pick requires object, property (the VARIABLE name, "
+                       "e.g. \"cycletime\" for a Processor's process time), picklist, pick_name.";
+        return e;
+    }
+
+    treenode obj = model()->find(objectName.c_str());
+    if (!objectexists(obj)) {
+        e["ok"] = false; e["error"] = "not_found";
+        e["message"] = "Object '" + objectName + "' did not resolve via Model.find.";
+        return e;
+    }
+
+    treenode vnode = getvarnode(obj, propertyName.c_str());
+    if (!objectexists(vnode)) {
+        e["ok"] = false; e["error"] = "property_not_found";
+        e["message"] = "No variable '" + propertyName + "' on '" + objectName + "' — this surface "
+                       "takes the VARIABLE name (e.g. cycletime for a Processor's process time).";
+        return e;
+    }
+
+    // Preserve the property's own header (current/item declarations).
+    std::string current;
+    try { current = std::string(vnode->value.toString()); } catch (...) {}
+    std::string header = extractPropertyHeader(current);
+    // Fall back to the standard per-item property header when the current value
+    // carried none (e.g. a bare value or an already-headerless pick) — distribution
+    // picks reference `current` (getstream(current)), so it must be declared.
+    if (header.empty()) header = "Object current = ownerobject(c);\r\nObject item = param(1);\r\n";
+
+    // Resolve the named picklist + find the pick (recursive, handles nesting).
+    std::string viewPath = "VIEW:/picklists/" + picklistName;
+    treenode pl = node(viewPath.c_str(), nullptr);
+    if (!pl) {
+        e["ok"] = false; e["error"] = "not_found";
+        e["message"] = viewPath + " not found — check the picklist name.";
+        return e;
+    }
+    nlohmann::json all = nlohmann::json::array();
+    collectPicks(pl, "", all);
+    std::string tmpl;
+    bool found = false;
+    nlohmann::json available = nlohmann::json::array();
+    for (auto& p : all) {
+        std::string nm = p.value("pick_name", std::string(""));
+        available.push_back(nm);
+        if (nm == pickName) { tmpl = p.value("code_template", std::string("")); found = true; }
+    }
+    if (!found) {
+        e["ok"] = false; e["error"] = "pick_not_found";
+        e["message"] = "No pick named '" + pickName + "' in " + picklistName + ". See `available`.";
+        e["available"] = std::move(available);
+        return e;
+    }
+
+    // A picklist-reference option (code is a VIEW:/picklists/... path) isn't code.
+    const std::string linkPrefix = "VIEW:/picklists/";
+    if (tmpl.rfind(linkPrefix, 0) == 0) {
+        e["ok"] = false; e["error"] = "pick_is_a_link";
+        e["message"] = "'" + pickName + "' links to another picklist; re-run with picklist=\""
+                       + tmpl.substr(linkPrefix.size()) + "\".";
+        return e;
+    }
+
+    // Fill tags. Unknown tag => error with the valid names.
+    nlohmann::json validTags = nlohmann::json::array();
+    for (const auto& t : parsePickTags(tmpl)) validTags.push_back(t.name);
+    nlohmann::json unknownTags = nlohmann::json::array();
+    if (j.contains("tags") && j["tags"].is_object()) {
+        for (auto it = j["tags"].begin(); it != j["tags"].end(); ++it) {
+            if (!it.value().is_string()) continue;
+            if (!fillOneTag(tmpl, it.key(), it.value().get<std::string>())) {
+                unknownTags.push_back(it.key());
+            }
+        }
+    }
+    if (!unknownTags.empty()) {
+        e["ok"] = false; e["error"] = "unknown_tag";
+        e["message"] = "Tag name(s) not present in this pick's template.";
+        e["unknown_tags"] = std::move(unknownTags);
+        e["valid_tags"]   = std::move(validTags);
+        return e;
+    }
+
+    // Write header + filled template to the property value node + compile.
+    std::string finalCode = header + tmpl;
+    vnode->value = Variant(finalCode.c_str());
+    switch_flexscript(vnode, 1);
+    buildnodeflexscript(vnode);
+
+    e["ok"]        = true;
+    e["surface"]   = "property";
+    e["object"]    = objectName;
+    e["property"]  = propertyName;
+    e["picklist"]  = picklistName;
+    e["pick_name"] = pickName;
+    e["written"]   = finalCode;
+    return e;
+}
+
+static nlohmann::json getPropertyPickImpl(const nlohmann::json& j)
+{
+    nlohmann::json out;
+    std::string objectName   = j.value("object",   std::string(""));
+    std::string propertyName = j.value("property", std::string(""));
+    if (objectName.empty() || propertyName.empty()) {
+        out["ok"] = false; out["error"] = "missing_args";
+        out["message"] = "property get_pick requires object and property.";
+        return out;
+    }
+    treenode obj = model()->find(objectName.c_str());
+    if (!objectexists(obj)) {
+        out["ok"] = false; out["error"] = "not_found";
+        out["message"] = "Object '" + objectName + "' did not resolve via Model.find.";
+        return out;
+    }
+    treenode vnode = getvarnode(obj, propertyName.c_str());
+    if (!objectexists(vnode)) {
+        out["ok"] = false; out["error"] = "property_not_found";
+        out["message"] = "No variable '" + propertyName + "' on '" + objectName + "'.";
+        return out;
+    }
+
+    out["ok"]       = true;
+    out["surface"]  = "property";
+    out["object"]   = objectName;
+    out["property"] = propertyName;
+    std::string code;
+    try { code = std::string(vnode->value.toString()); } catch (...) {}
+    std::string label = parsePickLabel(code);
+    std::string popupName, popupParams;
+    parsePickPopup(code, popupName, popupParams);
+    // Distributions carry no /**Label*/ — fall back to the popup name so the
+    // caller still sees what kind of pick is set.
+    if (label.empty() && !popupName.empty()) label = popupName;
+    if (label.empty()) {
+        out["current_pick"] = nullptr;
     } else {
         out["current_pick"] = label;
         out["popup"]        = popupName;
