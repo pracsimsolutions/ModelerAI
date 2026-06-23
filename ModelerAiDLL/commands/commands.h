@@ -68,6 +68,18 @@ modelerai_export Variant ModelerAi_removeLabel             (FLEXSIMINTERFACE);
 // KNOWLEDGE/schemas/<Class>.json.
 modelerai_export Variant ModelerAi_extractClassSchema      (FLEXSIMINTERFACE);
 
+// Picklists — live lookup. Reads VIEW:/picklists/<name> on demand (defaults
+// to the parameter onSet picklist) and returns its PickOptions + parsed tags.
+// No stored catalog: the live engine tree is the single source of truth, so
+// results never go stale. Generic over picklist name for other surfaces.
+modelerai_export Variant ModelerAi_listPicks               (FLEXSIMINTERFACE);
+// Apply a pick BY NAME to a parameter instance — resolves the pick live, fills
+// tags, writes + compiles the parameter's Value/onSet. Self-validating (bad
+// name returns the available list).
+modelerai_export Variant ModelerAi_applyPick               (FLEXSIMINTERFACE);
+// Read back which pick a parameter's onSet currently uses + its tag values.
+modelerai_export Variant ModelerAi_getPick                 (FLEXSIMINTERFACE);
+
 // Connections (Tools 4-8 of the redesign — semantic split by class-pair role)
 modelerai_export Variant ModelerAi_connectFixedResources                (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator       (FLEXSIMINTERFACE);

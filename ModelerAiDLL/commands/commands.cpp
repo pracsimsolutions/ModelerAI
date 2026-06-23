@@ -2117,6 +2117,501 @@ modelerai_export Variant ModelerAi_extractClassSchema(FLEXSIMINTERFACE)
 }
 
 // ============================================================================
+// PICKLISTS — live lookup (.1000125)
+//
+// modelerai_list_picks({ picklist?: "<name>" }):
+//   Read VIEW:/picklists/<name> LIVE and return its PickOptions as JSON.
+//   Defaults to "parameterpicklist" (the parameter "Set" behaviour picklist).
+//   The running engine is the SINGLE SOURCE OF TRUTH — no stored catalog, so
+//   results can never go stale or drift from the user's FlexSim version.
+//   Confirmed tree shape (2026-06-22 probes):
+//     - picklist node's string value  = the shared header (param decls).
+//     - each child is a PickOption. Parameter options are object nodes whose
+//       code lives in a hidden ">content" subnode; other picklists store the
+//       code on the option node itself. We try ">content", then fall back to
+//       the option node, so the same tool generalizes across surfaces.
+//     - the template wraps: /***popup:NAME*/ marker, a /**Display*/ label,
+//       and fillable /***tag:NAME*//**/VALUE/**/ slots.
+// ============================================================================
+namespace {
+
+struct PickTag {
+    std::string name;
+    std::string defVal;
+    std::vector<std::string> options;   // from a /**list:a~b~c*/ closer, if present
+};
+
+// Pull tag slots out of a PickOption template. A slot is:
+//     /***tag:NAME*/ /**/ VALUE CLOSER
+// where the opener is the empty comment "/**/" and CLOSER is the next comment,
+// either "/**/" (plain) or "/**list:a~b~c*/" (a dropdown's allowed values).
+// The value is therefore everything between the opener and the next comment
+// start "/*" — NOT specifically the next "/**/" (that v1 assumption swallowed
+// list-style closers whole). Confirmed against parameterpicklist (plain) and
+// performancemeasurepicklist (list) on 2026-06-22.
+std::vector<PickTag> parsePickTags(const std::string& tmpl)
+{
+    std::vector<PickTag> tags;
+    const std::string open = "/***tag:";
+    size_t pos = 0;
+    while ((pos = tmpl.find(open, pos)) != std::string::npos) {
+        size_t nameStart = pos + open.size();
+        size_t nameEnd   = tmpl.find("*/", nameStart);
+        if (nameEnd == std::string::npos) break;
+        PickTag t;
+        t.name = tmpl.substr(nameStart, nameEnd - nameStart);
+
+        size_t openerPos = nameEnd + 2;             // first char after the tag's "*/"
+        if (openerPos + 4 <= tmpl.size() && tmpl.compare(openerPos, 4, "/**/") == 0) {
+            size_t valStart = openerPos + 4;
+            size_t valEnd   = tmpl.find("/*", valStart);   // start of the closer comment
+            if (valEnd != std::string::npos) {
+                t.defVal = tmpl.substr(valStart, valEnd - valStart);
+                size_t closerEnd = tmpl.find("*/", valEnd + 2);
+                if (closerEnd != std::string::npos) {
+                    std::string closer = tmpl.substr(valEnd, closerEnd - valEnd);
+                    size_t lp = closer.find("list:");
+                    if (lp != std::string::npos) {
+                        std::string opts = closer.substr(lp + 5);   // "a~b~c"
+                        size_t start = 0;
+                        while (true) {
+                            size_t tilde = opts.find('~', start);
+                            std::string o = (tilde == std::string::npos)
+                                ? opts.substr(start) : opts.substr(start, tilde - start);
+                            if (!o.empty()) t.options.push_back(o);
+                            if (tilde == std::string::npos) break;
+                            start = tilde + 1;
+                        }
+                    }
+                    pos = closerEnd + 2;
+                } else {
+                    pos = valStart;
+                }
+            } else {
+                pos = nameEnd + 2;
+            }
+        } else {
+            pos = nameEnd + 2;
+        }
+        tags.push_back(std::move(t));
+    }
+    return tags;
+}
+
+// Pull the /***popup:NAME[:params]*/ marker. Params (rare on parameters) are
+// kept as the raw colon-delimited tail.
+void parsePickPopup(const std::string& tmpl, std::string& name, std::string& params)
+{
+    name.clear(); params.clear();
+    const std::string open = "/***popup:";
+    size_t s = tmpl.find(open);
+    if (s == std::string::npos) return;
+    s += open.size();
+    size_t e = tmpl.find("*/", s);
+    if (e == std::string::npos) return;
+    std::string body = tmpl.substr(s, e - s);
+    size_t colon = body.find(':');
+    if (colon == std::string::npos) { name = body; return; }
+    name   = body.substr(0, colon);
+    params = body.substr(colon + 1);
+}
+
+// Replace one tag's value in-place: /***tag:NAME*//**/OLD/**/ -> .../**/NEW/**/.
+// Keeps the tag markers intact so FlexSim's popup editor still recognizes the
+// slot. Returns false if the named tag isn't present in the template.
+bool fillOneTag(std::string& tmpl, const std::string& name, const std::string& value)
+{
+    std::string marker = "/***tag:" + name + "*/";
+    size_t pos = tmpl.find(marker);
+    if (pos == std::string::npos) return false;
+    size_t openerPos = pos + marker.size();
+    if (!(openerPos + 4 <= tmpl.size() && tmpl.compare(openerPos, 4, "/**/") == 0)) return false;
+    size_t valStart = openerPos + 4;
+    size_t valEnd = tmpl.find("/*", valStart);    // start of the closer — value ends here
+    if (valEnd == std::string::npos) return false;
+    // Replace only the value; preserve the closer (incl. any /**list:...*/ spec).
+    tmpl = tmpl.substr(0, valStart) + value + tmpl.substr(valEnd);
+    return true;
+}
+
+// Extract the /**Display*/ label that immediately follows the /***popup:*/
+// marker — this equals the pick's display name, so it round-trips an applied
+// pick back to its name. Returns "" if no popup marker is present (custom code).
+std::string parsePickLabel(const std::string& code)
+{
+    size_t p = code.find("/***popup:");
+    if (p == std::string::npos) return "";
+    size_t pe = code.find("*/", p);
+    if (pe == std::string::npos) return "";
+    size_t s = pe + 2;                          // scan after the popup marker
+    while (true) {
+        size_t lb = code.find("/**", s);
+        if (lb == std::string::npos) return "";
+        size_t le = code.find("*/", lb + 3);
+        if (le == std::string::npos) return "";
+        std::string label = code.substr(lb + 3, le - (lb + 3));
+        if (!label.empty()) return label;        // skip empty /**/ tag delimiters
+        s = le + 2;
+    }
+}
+
+// Find a parameter row node by name across ALL ParameterTables (parameter
+// names are global). Returns the row node (parent of Name + Value) or null,
+// and sets tableOut to the owning table node on a hit. Confirmed tree shape:
+// Tools/ParameterTables/<Table>>variables/parameters/<rank>/{Name, Value}.
+treenode findParamRowByName(const std::string& paramName, treenode& tableOut)
+{
+    tableOut = nullptr;
+    treenode container = model()->find("Tools/ParameterTables");
+    if (!objectexists(container)) return nullptr;
+    int nt = 0; try { nt = (int)container->subnodes.length; } catch (...) {}
+    for (int t = 1; t <= nt; ++t) {
+        treenode tbl = nullptr; try { tbl = container->subnodes[t]; } catch (...) {}
+        if (!tbl) continue;
+        treenode plist = nullptr; try { plist = tbl->find(">variables/parameters"); } catch (...) {}
+        if (!plist) continue;
+        int np = 0; try { np = (int)plist->subnodes.length; } catch (...) {}
+        for (int i = 1; i <= np; ++i) {
+            treenode row = nullptr; try { row = plist->subnodes[i]; } catch (...) {}
+            if (!row) continue;
+            treenode nameNode = nullptr; try { nameNode = row->find("Name"); } catch (...) {}
+            if (!nameNode) continue;
+            std::string nm; try { nm = getnodestr(nameNode); } catch (...) {}
+            if (nm == paramName) { tableOut = tbl; return row; }
+        }
+    }
+    return nullptr;
+}
+
+// PM analogue of findParamRowByName. PM rows live in each table's bound
+// performanceMeasures var space (getvarnode — find("variables") does not
+// traverse it). Names are global across all PerformanceMeasureTables. Returns
+// the row node (parent of Name + Value) and sets tableOut on a hit.
+treenode findPmRowByName(const std::string& pmName, treenode& tableOut)
+{
+    tableOut = nullptr;
+    treenode allTables = model()->find("Tools/PerformanceMeasureTables");
+    if (!objectexists(allTables)) return nullptr;
+    int nt = content(allTables);
+    for (int iT = 1; iT <= nt; ++iT) {
+        treenode t = rank(allTables, iT);
+        if (!t) continue;
+        treenode pms = getvarnode(t, "performanceMeasures");
+        if (!pms) continue;
+        int np = content(pms);
+        for (int iP = 1; iP <= np; ++iP) {
+            treenode pm = rank(pms, iP);
+            if (!pm) continue;
+            treenode nm = pm->find("Name");
+            if (!nm) continue;
+            std::string s; try { s = getnodestr(nm); } catch (...) {}
+            if (s == pmName) { tableOut = t; return pm; }
+        }
+    }
+    return nullptr;
+}
+
+// A pick surface: which picklist supplies the options, which Value subnode on
+// the instance holds the applied code, and the resolved instance row. Keeps the
+// per-surface knowledge in one place so apply/get share a single code path.
+struct PickSurface {
+    std::string picklist;     // VIEW:/picklists/<picklist>
+    std::string writeNode;    // "onSet" (parameter) | "valueNode" (PM)
+    std::string targetName;   // resolved instance name
+    treenode    row = nullptr;
+    treenode    table = nullptr;
+};
+
+// Resolve the surface from the request JSON. surface defaults to "parameter".
+// Returns false and fills errKey/errMsg on a bad surface or a missing instance.
+bool resolvePickSurface(const nlohmann::json& j, PickSurface& out,
+                        std::string& errKey, std::string& errMsg)
+{
+    std::string surface = j.value("surface", std::string("parameter"));
+    if (surface == "parameter") {
+        out.picklist   = "parameterpicklist";
+        out.writeNode  = "onSet";
+        out.targetName = j.value("parameter", j.value("target", std::string("")));
+        if (out.targetName.empty()) { errKey = "missing_args"; errMsg = "apply/get_pick requires `parameter`."; return false; }
+        out.row = findParamRowByName(out.targetName, out.table);
+        if (!objectexists(out.row)) { errKey = "not_found"; errMsg = "Parameter '" + out.targetName + "' not found in any ParameterTable."; return false; }
+        return true;
+    }
+    if (surface == "performance_measure" || surface == "pm") {
+        out.picklist   = "performancemeasurepicklist";
+        out.writeNode  = "valueNode";
+        out.targetName = j.value("performance_measure", j.value("target", std::string("")));
+        if (out.targetName.empty()) { errKey = "missing_args"; errMsg = "apply/get_pick requires `performance_measure`."; return false; }
+        out.row = findPmRowByName(out.targetName, out.table);
+        if (!objectexists(out.row)) { errKey = "not_found"; errMsg = "Performance measure '" + out.targetName + "' not found."; return false; }
+        return true;
+    }
+    errKey = "bad_surface";
+    errMsg = "surface must be 'parameter' or 'performance_measure'.";
+    return false;
+}
+
+} // namespace
+
+modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
+{
+    try {
+        // Optional arg: { "picklist": "<name>" }. Defaults to the parameter
+        // onSet picklist. A bare/empty/missing arg keeps the default.
+        std::string picklistName = "parameterpicklist";
+        Variant arg = param(1);
+        if (arg.type == VariantType::String) {
+            try {
+                auto j = nlohmann::json::parse(std::string(arg));
+                if (j.is_object()) picklistName = j.value("picklist", picklistName);
+            } catch (...) { /* tolerate non-JSON arg — keep default */ }
+        }
+        if (picklistName.empty()) picklistName = "parameterpicklist";
+
+        std::string viewPath = "VIEW:/picklists/" + picklistName;
+        treenode pl = node(viewPath.c_str(), nullptr);
+        if (!pl) {
+            return returnError("not_found",
+                viewPath + " not found — is a model open, and is the picklist name correct?");
+        }
+
+        std::string header;
+        try { header = getnodestr(pl); } catch (...) {}
+
+        nlohmann::json picks = nlohmann::json::array();
+        int n = 0;
+        try { n = (int)pl->subnodes.length; } catch (...) {}
+        for (int i = 1; i <= n; ++i) {
+            treenode opt = nullptr;
+            try { opt = pl->subnodes[i]; } catch (...) {}
+            if (!opt) continue;
+
+            std::string pickName;
+            try { pickName = getname(opt); } catch (...) {}
+
+            // Parameter options are object nodes — code lives in a hidden
+            // ">content" subnode. Other picklists store code on the option
+            // node itself. Try ">content", fall back to the option node.
+            treenode content = nullptr;
+            try { content = opt->find(">content"); } catch (...) {}
+            std::string tmpl;
+            try { tmpl = content ? getnodestr(content) : getnodestr(opt); } catch (...) {}
+
+            std::string popupName, popupParams;
+            parsePickPopup(tmpl, popupName, popupParams);
+            std::vector<PickTag> tags = parsePickTags(tmpl);
+
+            nlohmann::json j;
+            j["pick_name"]     = pickName;
+            j["popup"]         = popupName;
+            if (!popupParams.empty()) j["popup_params"] = popupParams;
+            nlohmann::json tarr = nlohmann::json::array();
+            for (const auto& t : tags) {
+                nlohmann::json tj = { {"name", t.name}, {"default", t.defVal} };
+                if (!t.options.empty()) tj["options"] = t.options;
+                tarr.push_back(std::move(tj));
+            }
+            j["tags"]          = std::move(tarr);
+            j["code_template"] = tmpl;
+            picks.push_back(std::move(j));
+        }
+
+        nlohmann::json out;
+        out["ok"]         = true;
+        out["picklist"]   = picklistName;
+        out["header"]     = header;
+        out["pick_count"] = static_cast<int>(picks.size());
+        out["picks"]      = std::move(picks);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_picks", e.what()); }
+      catch (...)                     { return returnException("list_picks", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_apply_pick({ parameter, pick_name, tags?: { name: expr, ... } }):
+//   Apply a parameter onSet pick BY NAME to a parameter instance. Resolves the
+//   pick LIVE from VIEW:/picklists/parameterpicklist (so it can't apply a pick
+//   that doesn't exist), fills any provided tags into the template, then writes
+//   header + filled template to the parameter's Value/onSet node and compiles
+//   it (switch_flexscript + buildnodeflexscript) — the same path add_parameter
+//   uses. The embedded /***popup:Name*/ marker makes FlexSim's UI show the pick
+//   as selected (proven 2026-06-22).
+//
+//   Self-validating: a bad pick_name returns { error:"pick_not_found",
+//   available:[...] }; an unknown tag returns { error:"unknown_tag",
+//   valid_tags:[...] }. Tag VALUES are raw FlexScript expressions — quote
+//   string literals yourself (e.g. tags:{ property: "\"ItemPlacement\"" }).
+// ============================================================================
+modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "apply_pick expects { surface?, parameter|performance_measure, pick_name, tags? } as a JSON string.");
+        }
+        nlohmann::json j;
+        try { j = nlohmann::json::parse(std::string(arg)); }
+        catch (const std::exception& e) { return returnError("bad_args_json", e.what()); }
+        if (!j.is_object()) {
+            return returnError("bad_args_shape", "apply_pick expects a JSON object.");
+        }
+
+        std::string pickName = j.value("pick_name", std::string(""));
+        if (pickName.empty()) {
+            return returnError("missing_args", "apply_pick requires `pick_name`.");
+        }
+
+        // --- Resolve the surface (parameter | performance_measure) + instance. ---
+        PickSurface surf;
+        std::string errKey, errMsg;
+        if (!resolvePickSurface(j, surf, errKey, errMsg)) {
+            return returnError(errKey.c_str(), errMsg);
+        }
+
+        // --- Resolve the live picklist + the requested pick. ---
+        std::string viewPath = "VIEW:/picklists/" + surf.picklist;
+        treenode pl = node(viewPath.c_str(), nullptr);
+        if (!pl) {
+            return returnError("not_found", viewPath + " not found.");
+        }
+        std::string header;
+        try { header = getnodestr(pl); } catch (...) {}
+
+        treenode opt = nullptr;
+        nlohmann::json available = nlohmann::json::array();
+        int n = 0; try { n = (int)pl->subnodes.length; } catch (...) {}
+        for (int i = 1; i <= n; ++i) {
+            treenode o = nullptr; try { o = pl->subnodes[i]; } catch (...) {}
+            if (!o) continue;
+            std::string nm; try { nm = getname(o); } catch (...) {}
+            available.push_back(nm);
+            if (nm == pickName) opt = o;
+        }
+        if (!opt) {
+            nlohmann::json e;
+            e["ok"]        = false;
+            e["error"]     = "pick_not_found";
+            e["message"]   = "No pick named '" + pickName + "' in " + surf.picklist + ". See `available`.";
+            e["available"] = std::move(available);
+            return returnJson(e);
+        }
+
+        treenode content = nullptr;
+        try { content = opt->find(">content"); } catch (...) {}
+        std::string tmpl;
+        try { tmpl = content ? getnodestr(content) : getnodestr(opt); } catch (...) {}
+
+        // --- Fill tags (raw FlexScript expressions). Unknown tag => error. ---
+        nlohmann::json validTags = nlohmann::json::array();
+        for (const auto& t : parsePickTags(tmpl)) validTags.push_back(t.name);
+        nlohmann::json unknownTags = nlohmann::json::array();
+        if (j.contains("tags") && j["tags"].is_object()) {
+            for (auto it = j["tags"].begin(); it != j["tags"].end(); ++it) {
+                if (!it.value().is_string()) continue;
+                if (!fillOneTag(tmpl, it.key(), it.value().get<std::string>())) {
+                    unknownTags.push_back(it.key());
+                }
+            }
+        }
+        if (!unknownTags.empty()) {
+            nlohmann::json e;
+            e["ok"]           = false;
+            e["error"]        = "unknown_tag";
+            e["message"]      = "Tag name(s) not present in this pick's template.";
+            e["unknown_tags"] = std::move(unknownTags);
+            e["valid_tags"]   = std::move(validTags);
+            return returnJson(e);
+        }
+
+        // --- Write header + filled template to the surface's code node + compile.
+        // Same path add_parameter / create_performance_measure use. ---
+        treenode vNode  = assertsubnode(surf.row, "Value", 0);
+        treenode target = assertsubnode(vNode, surf.writeNode.c_str(), DATATYPE_STRING);
+
+        std::string finalCode = header + tmpl;
+        target->value = Variant(finalCode.c_str());
+        switch_flexscript(target, 1);
+        buildnodeflexscript(target);
+
+        nlohmann::json out;
+        out["ok"]        = true;
+        out["surface"]   = j.value("surface", std::string("parameter"));
+        out["target"]    = surf.targetName;
+        out["table"]     = std::string(getname(surf.table));
+        out["pick_name"] = pickName;
+        out["written"]   = finalCode;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("apply_pick", e.what()); }
+      catch (...)                     { return returnException("apply_pick", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_get_pick({ parameter }):
+//   Read back which onSet pick a parameter currently uses, plus the current
+//   tag values. Parses the live Value/onSet text: the /**Display*/ label after
+//   the /***popup:*/ marker gives current_pick; parsePickTags gives the filled
+//   tag values. current_pick is null when the onSet holds no picklist marker
+//   (hand-written / custom code). Read-side mirror of apply_pick.
+// ============================================================================
+modelerai_export Variant ModelerAi_getPick(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "get_pick requires a name (string or { surface?, parameter|performance_measure }).");
+        }
+        // Bare string => parameter name (backward compatible). JSON object =>
+        // { surface?, parameter|performance_measure }.
+        std::string s(arg);
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(s);
+            if (!j.is_object()) j = nlohmann::json{ {"parameter", s} };
+        } catch (...) {
+            j = nlohmann::json{ {"parameter", s} };
+        }
+
+        PickSurface surf;
+        std::string errKey, errMsg;
+        if (!resolvePickSurface(j, surf, errKey, errMsg)) {
+            return returnError(errKey.c_str(), errMsg);
+        }
+
+        treenode vNode    = assertsubnode(surf.row, "Value", 0);
+        treenode codeNode = assertsubnode(vNode, surf.writeNode.c_str(), DATATYPE_STRING);
+        std::string code;
+        try { code = getnodestr(codeNode); } catch (...) {}
+
+        std::string label = parsePickLabel(code);
+        std::string popupName, popupParams;
+        parsePickPopup(code, popupName, popupParams);
+
+        nlohmann::json out;
+        out["ok"]        = true;
+        out["surface"]   = j.value("surface", std::string("parameter"));
+        out["target"]    = surf.targetName;
+        out["table"]     = std::string(getname(surf.table));
+        if (label.empty()) {
+            out["current_pick"] = nullptr;       // custom / hand-written code
+        } else {
+            out["current_pick"] = label;
+            out["popup"]        = popupName;
+            nlohmann::json tarr = nlohmann::json::array();
+            for (const auto& t : parsePickTags(code)) {
+                nlohmann::json tj = { {"name", t.name}, {"value", t.defVal} };
+                if (!t.options.empty()) tj["options"] = t.options;
+                tarr.push_back(std::move(tj));
+            }
+            out["tags"] = std::move(tarr);
+        }
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_pick", e.what()); }
+      catch (...)                     { return returnException("get_pick", "unknown"); }
+}
+
+// ============================================================================
 // modelerai_create_port_connection — REMOVED 2026-06-02.
 // Superseded by the semantic split: connect_fixed_resources,
 // connect_task_executer_to_navigator, connect_fixed_resource_to_navigator,
