@@ -27,6 +27,7 @@ A pick is a code template with two things you fill in:
 { "picklist": "parameterpicklist" }
 ```
 - `picklist` (optional, default `parameterpicklist`) — any picklist node under `VIEW:/picklists/`. For PMs use `performancemeasurepicklist`.
+- `module` (optional) — read a **module's own** picklists at `VIEW:/modules/<module>/picklists/` instead of the general collection. Families: `ProcessFlow` (44), `People` (19), `AGV` (8: `InitializeTravel`, `WayPointRequirement`, `WayPointTrigger`, `AGVStartMethod`, `OffsetTravelPicklist`, `PathCondition`, `PathCost`, `GeneralTrigger`). The same `module` arg works on `apply_pick`/`get_pick` (trigger/property surfaces).
 - Returns `{ header, pick_count, picks: [ { pick_name, popup, tags: [ { name, default, options? } ], code_template } ] }`.
 - Use this first to learn the exact `pick_name` and which `tags` a pick exposes.
 

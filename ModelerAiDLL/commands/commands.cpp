@@ -2232,6 +2232,16 @@ std::string safePickStr(treenode n)
     return "";
 }
 
+// Build the VIEW path to a picklist. With a module it lives under that module's
+// own collection (VIEW:/modules/<module>/picklists/<name>); otherwise the general
+// collection (VIEW:/picklists/<name>). Module families: ProcessFlow, People, AGV.
+std::string picklistViewPath(const std::string& picklist, const std::string& module)
+{
+    if (!module.empty())
+        return "VIEW:/modules/" + module + "/picklists/" + picklist;
+    return "VIEW:/picklists/" + picklist;
+}
+
 // Recursively collect leaf PickOptions from a picklist into `out`. Picklists may
 // nest CATEGORY containers (trigger picklists: Data / Control / Visual / ...).
 // A node is a LEAF pick if it has a ">content" subnode (parameters) OR no visible
@@ -2441,16 +2451,20 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
         // Optional arg: { "picklist": "<name>" }. Defaults to the parameter
         // onSet picklist. A bare/empty/missing arg keeps the default.
         std::string picklistName = "parameterpicklist";
+        std::string moduleName;
         Variant arg = param(1);
         if (arg.type == VariantType::String) {
             try {
                 auto j = nlohmann::json::parse(std::string(arg));
-                if (j.is_object()) picklistName = j.value("picklist", picklistName);
+                if (j.is_object()) {
+                    picklistName = j.value("picklist", picklistName);
+                    moduleName   = j.value("module", std::string(""));
+                }
             } catch (...) { /* tolerate non-JSON arg — keep default */ }
         }
         if (picklistName.empty()) picklistName = "parameterpicklist";
 
-        std::string viewPath = "VIEW:/picklists/" + picklistName;
+        std::string viewPath = picklistViewPath(picklistName, moduleName);
         treenode pl = node(viewPath.c_str(), nullptr);
         if (!pl) {
             return returnError("not_found",
@@ -2469,6 +2483,7 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
         nlohmann::json out;
         out["ok"]         = true;
         out["picklist"]   = picklistName;
+        if (!moduleName.empty()) out["module"] = moduleName;
         out["header"]     = header;
         out["pick_count"] = static_cast<int>(picks.size());
         out["picks"]      = std::move(picks);
@@ -8639,7 +8654,7 @@ static nlohmann::json applyTriggerPickImpl(const nlohmann::json& j)
     }
 
     // Resolve the named picklist + find the pick (recursive, handles category nesting).
-    std::string viewPath = "VIEW:/picklists/" + picklistName;
+    std::string viewPath = picklistViewPath(picklistName, j.value("module", std::string("")));
     treenode pl = node(viewPath.c_str(), nullptr);
     if (!pl) {
         e["ok"] = false; e["error"] = "not_found";
@@ -8808,7 +8823,7 @@ static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j)
     if (header.empty()) header = "Object current = ownerobject(c);\r\nObject item = param(1);\r\n";
 
     // Resolve the named picklist + find the pick (recursive, handles nesting).
-    std::string viewPath = "VIEW:/picklists/" + picklistName;
+    std::string viewPath = picklistViewPath(picklistName, j.value("module", std::string("")));
     treenode pl = node(viewPath.c_str(), nullptr);
     if (!pl) {
         e["ok"] = false; e["error"] = "not_found";
