@@ -2162,6 +2162,9 @@ std::vector<PickTag> parsePickTags(const std::string& tmpl)
         t.name = tmpl.substr(nameStart, nameEnd - nameStart);
 
         size_t openerPos = nameEnd + 2;             // first char after the tag's "*/"
+        while (openerPos < tmpl.size() &&           // some tags put a space before "/**/"
+               (tmpl[openerPos] == ' ' || tmpl[openerPos] == '\t' ||
+                tmpl[openerPos] == '\r' || tmpl[openerPos] == '\n')) ++openerPos;
         if (openerPos + 4 <= tmpl.size() && tmpl.compare(openerPos, 4, "/**/") == 0) {
             size_t valStart = openerPos + 4;
             size_t valEnd   = tmpl.find("/*", valStart);   // start of the closer comment
@@ -2281,6 +2284,9 @@ bool fillOneTag(std::string& tmpl, const std::string& name, const std::string& v
     size_t pos = tmpl.find(marker);
     if (pos == std::string::npos) return false;
     size_t openerPos = pos + marker.size();
+    while (openerPos < tmpl.size() &&               // some tags put a space before "/**/"
+           (tmpl[openerPos] == ' ' || tmpl[openerPos] == '\t' ||
+            tmpl[openerPos] == '\r' || tmpl[openerPos] == '\n')) ++openerPos;
     if (!(openerPos + 4 <= tmpl.size() && tmpl.compare(openerPos, 4, "/**/") == 0)) return false;
     size_t valStart = openerPos + 4;
     size_t valEnd = tmpl.find("/*", valStart);    // start of the closer — value ends here
@@ -2451,6 +2457,12 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
       catch (...)                     { return returnException("list_picks", "unknown"); }
 }
 
+// Trigger-surface impls — defined further below (after matchTrigger) so they can
+// reuse its event enumeration; declared here so apply_pick/get_pick can dispatch
+// to them. Internal linkage; same translation unit.
+static nlohmann::json applyTriggerPickImpl(const nlohmann::json& j);
+static nlohmann::json getTriggerPickImpl(const nlohmann::json& j);
+
 // ============================================================================
 // modelerai_apply_pick({ surface?, parameter|performance_measure, pick_name,
 //                        tags?: { name: expr }, reference?: "<object|group>" }):
@@ -2482,6 +2494,12 @@ modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
         catch (const std::exception& e) { return returnError("bad_args_json", e.what()); }
         if (!j.is_object()) {
             return returnError("bad_args_shape", "apply_pick expects a JSON object.");
+        }
+
+        // Trigger surface has a different shape (object + trigger + picklist,
+        // header from the event, write to the event storage) — dispatch out.
+        if (j.value("surface", std::string("parameter")) == "trigger") {
+            return returnJson(applyTriggerPickImpl(j));
         }
 
         std::string pickName = j.value("pick_name", std::string(""));
@@ -2621,6 +2639,10 @@ modelerai_export Variant ModelerAi_getPick(FLEXSIMINTERFACE)
             if (!j.is_object()) j = nlohmann::json{ {"parameter", s} };
         } catch (...) {
             j = nlohmann::json{ {"parameter", s} };
+        }
+
+        if (j.value("surface", std::string("parameter")) == "trigger") {
+            return returnJson(getTriggerPickImpl(j));
         }
 
         PickSurface surf;
@@ -8553,6 +8575,164 @@ TriggerMatch matchTrigger(treenode obj, const std::string& triggerName)
 }
 
 } // namespace
+
+// ============================================================================
+// Trigger picklist surface (forward-declared above apply_pick/get_pick).
+//
+// Triggers differ from parameters/PMs: the target is an (object, trigger) pair,
+// the picklist is NOT derivable from the event (the AI supplies its name, e.g.
+// "entryexittriggerpicklist"), the code header comes from the EVENT (matchTrigger),
+// and the write goes to the event's storage node via assertEventWithCode — the
+// same path set_trigger uses. Reuses the shared pick parser + collectPicks.
+// ============================================================================
+static nlohmann::json applyTriggerPickImpl(const nlohmann::json& j)
+{
+    nlohmann::json e;
+    std::string objectName   = j.value("object",    std::string(""));
+    std::string triggerName  = j.value("trigger",   std::string(""));
+    std::string picklistName = j.value("picklist",  std::string(""));
+    std::string pickName     = j.value("pick_name", std::string(""));
+    if (objectName.empty() || triggerName.empty() || picklistName.empty() || pickName.empty()) {
+        e["ok"] = false; e["error"] = "missing_args";
+        e["message"] = "trigger apply_pick requires object, trigger, picklist, pick_name.";
+        return e;
+    }
+
+    treenode obj = model()->find(objectName.c_str());
+    if (!objectexists(obj)) {
+        e["ok"] = false; e["error"] = "not_found";
+        e["message"] = "Object '" + objectName + "' did not resolve via Model.find.";
+        return e;
+    }
+
+    TriggerMatch tm = matchTrigger(obj, triggerName);
+    if (!tm.matched) {
+        e["ok"] = false; e["error"] = "trigger_not_found";
+        e["message"] = "Trigger '" + triggerName + "' is not on this object.";
+        e["available"] = tm.availableNames;
+        return e;
+    }
+
+    // Resolve the named picklist + find the pick (recursive, handles category nesting).
+    std::string viewPath = "VIEW:/picklists/" + picklistName;
+    treenode pl = node(viewPath.c_str(), nullptr);
+    if (!pl) {
+        e["ok"] = false; e["error"] = "not_found";
+        e["message"] = viewPath + " not found — check the picklist name.";
+        return e;
+    }
+    nlohmann::json all = nlohmann::json::array();
+    collectPicks(pl, "", all);
+    std::string tmpl;
+    bool found = false;
+    nlohmann::json available = nlohmann::json::array();
+    for (auto& p : all) {
+        std::string nm = p.value("pick_name", std::string(""));
+        available.push_back(nm);
+        if (nm == pickName) { tmpl = p.value("code_template", std::string("")); found = true; }
+    }
+    if (!found) {
+        e["ok"] = false; e["error"] = "pick_not_found";
+        e["message"] = "No pick named '" + pickName + "' in " + picklistName + ". See `available`.";
+        e["available"] = std::move(available);
+        return e;
+    }
+
+    // Fill tags. Unknown tag => error with the valid names.
+    nlohmann::json validTags = nlohmann::json::array();
+    for (const auto& t : parsePickTags(tmpl)) validTags.push_back(t.name);
+    nlohmann::json unknownTags = nlohmann::json::array();
+    if (j.contains("tags") && j["tags"].is_object()) {
+        for (auto it = j["tags"].begin(); it != j["tags"].end(); ++it) {
+            if (!it.value().is_string()) continue;
+            if (!fillOneTag(tmpl, it.key(), it.value().get<std::string>())) {
+                unknownTags.push_back(it.key());
+            }
+        }
+    }
+    if (!unknownTags.empty()) {
+        e["ok"] = false; e["error"] = "unknown_tag";
+        e["message"] = "Tag name(s) not present in this pick's template.";
+        e["unknown_tags"] = std::move(unknownTags);
+        e["valid_tags"]   = std::move(validTags);
+        return e;
+    }
+
+    // Write event header + filled template to the event storage (set_trigger path).
+    Variant storageV = function_s(obj, "assertEventWithCode", Variant(triggerName.c_str()));
+    treenode storage = (storageV.type == VariantType::TreeNode) ? static_cast<treenode>(storageV) : nullptr;
+    if (!objectexists(storage)) {
+        e["ok"] = false; e["error"] = "apply_failed";
+        e["message"] = "assertEventWithCode returned no storage node for '" + triggerName + "'.";
+        return e;
+    }
+    std::string finalCode = tm.header + tmpl;   // codeHeader ends with \n
+    storage->value = Variant(finalCode.c_str());
+
+    e["ok"]        = true;
+    e["surface"]   = "trigger";
+    e["object"]    = objectName;
+    e["trigger"]   = triggerName;
+    e["picklist"]  = picklistName;
+    e["pick_name"] = pickName;
+    e["written"]   = finalCode;
+    return e;
+}
+
+static nlohmann::json getTriggerPickImpl(const nlohmann::json& j)
+{
+    nlohmann::json out;
+    std::string objectName  = j.value("object",  std::string(""));
+    std::string triggerName = j.value("trigger", std::string(""));
+    if (objectName.empty() || triggerName.empty()) {
+        out["ok"] = false; out["error"] = "missing_args";
+        out["message"] = "trigger get_pick requires object and trigger.";
+        return out;
+    }
+
+    treenode obj = model()->find(objectName.c_str());
+    if (!objectexists(obj)) {
+        out["ok"] = false; out["error"] = "not_found";
+        out["message"] = "Object '" + objectName + "' did not resolve via Model.find.";
+        return out;
+    }
+
+    TriggerMatch tm = matchTrigger(obj, triggerName);
+    if (!tm.matched) {
+        out["ok"] = false; out["error"] = "trigger_not_found";
+        out["available"] = tm.availableNames;
+        return out;
+    }
+
+    out["ok"]      = true;
+    out["surface"] = "trigger";
+    out["object"]  = objectName;
+    out["trigger"] = triggerName;
+    if (!objectexists(tm.storage)) {
+        out["set"]          = false;
+        out["current_pick"] = nullptr;
+        return out;
+    }
+    out["set"] = true;
+    std::string code = std::string(tm.storage->value.toString());
+    std::string label = parsePickLabel(code);
+    std::string popupName, popupParams;
+    parsePickPopup(code, popupName, popupParams);
+    if (label.empty()) {
+        out["current_pick"] = nullptr;   // hand-written / non-pick code
+    } else {
+        out["current_pick"] = label;
+        out["popup"]        = popupName;
+        nlohmann::json tarr = nlohmann::json::array();
+        for (const auto& t : parsePickTags(code)) {
+            nlohmann::json tj = { {"name", t.name}, {"value", t.defVal} };
+            if (!t.options.empty()) tj["options"] = t.options;
+            tarr.push_back(std::move(tj));
+        }
+        out["tags"] = std::move(tarr);
+    }
+    return out;
+}
 
 modelerai_export Variant ModelerAi_setTrigger(FLEXSIMINTERFACE)
 {

@@ -18,6 +18,7 @@ A pick is a code template with two things you fill in:
 |---|---|---|---|
 | `parameter` (default) | `parameterpicklist` | the parameter's `Value/onSet` | runs when the parameter's value changes (e.g. on reset) |
 | `performance_measure` | `performancemeasurepicklist` | the PM's `Value/valueNode` | computes the PM's value when read |
+| `trigger` | a named event-type picklist (you supply it) | the object's trigger event storage | runs when that event fires on the object |
 
 ## `modelerai_list_picks` — discover picks (read-only)
 
@@ -53,6 +54,34 @@ Applying writes `header + filled template` to the instance's code node and compi
 { "surface": "parameter", "parameter": "Queues" }
 ```
 A bare string is treated as a parameter name. Returns `{ current_pick, popup, tags: [ { name, value, options? } ] }`, or `current_pick: null` when the code node holds hand-written (non-pick) code.
+
+## Triggers (surface `trigger`)
+
+Triggers differ from parameters/PMs: the target is an **(object, trigger)** pair, and the picklist is **not** derivable from the event — **you supply its name**, chosen by event type:
+
+| trigger event | picklist |
+|---|---|
+| OnEntry / OnExit | `entryexittriggerpicklist` |
+| OnMessage | `messagetriggerpicklist` |
+| OnStateChange | `statechangepicklist` |
+| OnReset | `resettriggerpicklist` |
+| (others) | the matching `*triggerpicklist` / `*picklist` |
+
+Trigger picklists are **nested under categories** (Data / Control / Visual / Lists), so `list_picks` returns each pick with a `category` field. The code header comes from the **event** (not the picklist), and there is **no `reference`**.
+
+```json
+// discover
+modelerai_list_picks { "picklist": "entryexittriggerpicklist" }
+// apply
+modelerai_apply_pick {
+  "surface": "trigger", "object": "Queue1", "trigger": "OnEntry",
+  "picklist": "entryexittriggerpicklist",
+  "pick_name": "Set Object Color", "tags": { "color": "Color.red" }
+}
+// read back
+modelerai_get_pick { "surface": "trigger", "object": "Queue1", "trigger": "OnEntry" }
+```
+A wrong `trigger` returns the available event names; a wrong `pick_name` returns the available picks. Choose the picklist whose event type matches the trigger — applying an entry/exit pick to an unrelated event can reference variables the event's header doesn't declare.
 
 ## Worked example — count-driven duplication
 
