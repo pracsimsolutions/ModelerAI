@@ -4333,7 +4333,7 @@ var qrcode = function() {
   <!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. -->
-  <div id="app-version">.1000139</div>
+  <div id="app-version">.1000142</div>
 
   <!-- tabs -->
   <div id="tabbar">
@@ -5547,6 +5547,27 @@ var qrcode = function() {
 
       // ----- chat state -----
       var messagesEl = document.getElementById('messages');
+      // Belt-and-suspenders for the SELECT-then-copy path: rebuild the clipboard
+      // text from the selection with any action bar ("Copy"/"Regenerate") removed,
+      // in case the embedded engine includes button labels in a selection. (The
+      // Copy button itself reads .bubble-content, so it's already clean.)
+      messagesEl.addEventListener('copy', function (e) {
+        try {
+          var sel = window.getSelection();
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+          var frag = document.createElement('div');
+          for (var i = 0; i < sel.rangeCount; i++)
+            frag.appendChild(sel.getRangeAt(i).cloneContents());
+          var bars = frag.querySelectorAll('.bubble-actions');
+          for (var k = 0; k < bars.length; k++)
+            if (bars[k].parentNode) bars[k].parentNode.removeChild(bars[k]);
+          var text = (frag.textContent || '').replace(/\s+$/, '');
+          if (e.clipboardData && text) {
+            e.clipboardData.setData('text/plain', text);
+            e.preventDefault();
+          }
+        } catch (err) {}
+      });
       var composerEl = document.getElementById('composer');
       var inputEl    = document.getElementById('input');
       var sendBtnEl  = document.getElementById('send');
@@ -6195,7 +6216,17 @@ var qrcode = function() {
         copyBtn.title = 'Copy message text';
         copyBtn.textContent = 'Copy';
         copyBtn.addEventListener('click', function () {
-          var raw = el.getAttribute('data-md') || el.textContent || '';
+          // Prefer the stored markdown source. Fall back to the rendered text
+          // with the action bar removed, so its button labels ("Copy" /
+          // "Regenerate") never end up in the clipboard.
+          var raw = el.getAttribute('data-md');
+          if (!raw) {
+            // Read ONLY the content child. The action bar (Copy/Regenerate) and
+            // any attachment strip are SIBLINGS of .bubble-content, so this can
+            // never pull their text into the clipboard.
+            var contentEl = el.querySelector('.bubble-content');
+            raw = (contentEl ? contentEl.textContent : el.textContent) || '';
+          }
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(raw).then(function () {
               copyBtn.textContent = 'Copied';

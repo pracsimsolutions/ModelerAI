@@ -4404,7 +4404,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000123&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000142&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -5618,6 +5618,27 @@ var qrcode = function() {
 
       // ----- chat state -----
       var messagesEl = document.getElementById('messages');
+      // Belt-and-suspenders for the SELECT-then-copy path: rebuild the clipboard
+      // text from the selection with any action bar ("Copy"/"Regenerate") removed,
+      // in case the embedded engine includes button labels in a selection. (The
+      // Copy button itself reads .bubble-content, so it's already clean.)
+      messagesEl.addEventListener('copy', function (e) {
+        try {
+          var sel = window.getSelection();
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+          var frag = document.createElement('div');
+          for (var i = 0; i &lt; sel.rangeCount; i++)
+            frag.appendChild(sel.getRangeAt(i).cloneContents());
+          var bars = frag.querySelectorAll('.bubble-actions');
+          for (var k = 0; k &lt; bars.length; k++)
+            if (bars[k].parentNode) bars[k].parentNode.removeChild(bars[k]);
+          var text = (frag.textContent || '').replace(/\s+$/, '');
+          if (e.clipboardData &amp;&amp; text) {
+            e.clipboardData.setData('text/plain', text);
+            e.preventDefault();
+          }
+        } catch (err) {}
+      });
       var composerEl = document.getElementById('composer');
       var inputEl    = document.getElementById('input');
       var sendBtnEl  = document.getElementById('send');
@@ -6266,7 +6287,17 @@ var qrcode = function() {
         copyBtn.title = 'Copy message text';
         copyBtn.textContent = 'Copy';
         copyBtn.addEventListener('click', function () {
-          var raw = el.getAttribute('data-md') || el.textContent || '';
+          // Prefer the stored markdown source. Fall back to the rendered text
+          // with the action bar removed, so its button labels ("Copy" /
+          // "Regenerate") never end up in the clipboard.
+          var raw = el.getAttribute('data-md');
+          if (!raw) {
+            // Read ONLY the content child. The action bar (Copy/Regenerate) and
+            // any attachment strip are SIBLINGS of .bubble-content, so this can
+            // never pull their text into the clipboard.
+            var contentEl = el.querySelector('.bubble-content');
+            raw = (contentEl ? contentEl.textContent : el.textContent) || '';
+          }
           if (navigator.clipboard &amp;&amp; navigator.clipboard.writeText) {
             navigator.clipboard.writeText(raw).then(function () {
               copyBtn.textContent = 'Copied';
@@ -7369,6 +7400,31 @@ var qrcode = function() {
         qt.textContent = qtext;
         el.appendChild(qt);
 
+        // Free-text input row builder — used as the sole answer path when there
+        // are no options, and as an "Other" escape hatch alongside options so the
+        // user is never forced to pick only a suggestion.
+        function makeFreetextRow(placeholder) {
+          var row = document.createElement('div');
+          row.className = 'q-freetext-row';
+          var input = document.createElement('input');
+          input.type = 'text';
+          input.placeholder = placeholder;
+          var send = document.createElement('button');
+          send.className = 'q-option';
+          send.textContent = 'Send';
+          send.addEventListener('click', function () {
+            var v = input.value.trim();
+            if (!v) return;
+            answerQuestion(iid, el, v, v);
+          });
+          input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); send.click(); }
+          });
+          row.appendChild(input);
+          row.appendChild(send);
+          return { row: row, input: input };
+        }
+
         if (options.length) {
           var opts = document.createElement('div');
           opts.className = 'q-options';
@@ -7391,28 +7447,15 @@ var qrcode = function() {
             opts.appendChild(btn);
           });
           el.appendChild(opts);
+          // Escape hatch: let the user answer with their own idea, not just a pick.
+          var other = makeFreetextRow('Or type a different answer…');
+          other.row.style.marginTop = '8px';
+          el.appendChild(other.row);
         } else {
-          // No options → free-text input.
-          var row = document.createElement('div');
-          row.className = 'q-freetext-row';
-          var input = document.createElement('input');
-          input.type = 'text';
-          input.placeholder = 'Type your answer…';
-          var send = document.createElement('button');
-          send.className = 'q-option';
-          send.textContent = 'Send';
-          send.addEventListener('click', function () {
-            var v = input.value.trim();
-            if (!v) return;
-            answerQuestion(iid, el, v, v);
-          });
-          input.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') { e.preventDefault(); send.click(); }
-          });
-          row.appendChild(input);
-          row.appendChild(send);
-          el.appendChild(row);
-          setTimeout(function () { input.focus(); }, 50);
+          // No options → free-text input only.
+          var ft = makeFreetextRow('Type your answer…');
+          el.appendChild(ft.row);
+          setTimeout(function () { ft.input.focus(); }, 50);
         }
         var wasAtBottom = isNearBottom();
         messagesEl.appendChild(el);
