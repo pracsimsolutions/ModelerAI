@@ -240,6 +240,8 @@ ToolResult ModelerAiCallTool::run(std::string_view args_json)
         "modelerai_get_activity_variable",
         "modelerai_get_activity_table_cell",
         "modelerai_get_activity_table_size",
+        "modelerai_list_picks",
+        "modelerai_get_pick",
     };
     if (!kReadOnly.count(commandName)) {
         ModelerAi::tree::invalidateCondenseCache();
