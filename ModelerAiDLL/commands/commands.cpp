@@ -2428,19 +2428,22 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
 }
 
 // ============================================================================
-// modelerai_apply_pick({ parameter, pick_name, tags?: { name: expr, ... } }):
-//   Apply a parameter onSet pick BY NAME to a parameter instance. Resolves the
-//   pick LIVE from VIEW:/picklists/parameterpicklist (so it can't apply a pick
-//   that doesn't exist), fills any provided tags into the template, then writes
-//   header + filled template to the parameter's Value/onSet node and compiles
-//   it (switch_flexscript + buildnodeflexscript) — the same path add_parameter
-//   uses. The embedded /***popup:Name*/ marker makes FlexSim's UI show the pick
-//   as selected (proven 2026-06-22).
+// modelerai_apply_pick({ surface?, parameter|performance_measure, pick_name,
+//                        tags?: { name: expr }, reference?: "<object|group>" }):
+//   Apply a pick BY NAME to a parameter (surface "parameter", default →
+//   Value/onSet) or performance measure (surface "performance_measure" →
+//   Value/valueNode). Resolves the pick LIVE from VIEW:/picklists/<picklist> (so
+//   it can't apply one that doesn't exist), fills the tags, optionally binds
+//   Value/reference (the object/group the behaviour acts on), then writes header
+//   + filled template and compiles it (switch_flexscript + buildnodeflexscript)
+//   — the same path add_parameter / create_performance_measure use. The embedded
+//   /***popup:Name*/ marker makes FlexSim's UI show the pick as selected.
 //
 //   Self-validating: a bad pick_name returns { error:"pick_not_found",
 //   available:[...] }; an unknown tag returns { error:"unknown_tag",
-//   valid_tags:[...] }. Tag VALUES are raw FlexScript expressions — quote
-//   string literals yourself (e.g. tags:{ property: "\"ItemPlacement\"" }).
+//   valid_tags:[...] }; an unresolvable reference returns
+//   { error:"reference_not_found" }. Tag VALUES are raw FlexScript expressions —
+//   quote string literals yourself (e.g. tags:{ property: "\"ItemPlacement\"" }).
 // ============================================================================
 modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
 {
@@ -2524,9 +2527,31 @@ modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
             return returnJson(e);
         }
 
+        treenode vNode = assertsubnode(surf.row, "Value", 0);
+
+        // --- Optional: bind the instance's reference (the object/group the pick
+        // acts on via `reference.as(...)`). Both surfaces store it at
+        // Value/reference as a node coupling (pointTo) — same path
+        // add_parameter / create_performance_measure use. Validate FIRST so a
+        // bad reference can't leave a half-applied pick. ---
+        std::string boundReference;
+        if (j.contains("reference") && j["reference"].is_string()
+            && !j["reference"].get<std::string>().empty()) {
+            std::string refName = j["reference"].get<std::string>();
+            treenode refNode = model()->find(refName.c_str());
+            if (!objectexists(refNode))
+                refNode = model()->find(("Tools/Groups/" + refName).c_str());
+            if (!objectexists(refNode)) {
+                return returnError("reference_not_found",
+                    "reference '" + refName + "' did not resolve as an object "
+                    "(Model.find) or a group (Tools/Groups/" + refName + ").");
+            }
+            assertsubnode(vNode, "reference", 0)->pointTo(refNode);
+            boundReference = refName;
+        }
+
         // --- Write header + filled template to the surface's code node + compile.
         // Same path add_parameter / create_performance_measure use. ---
-        treenode vNode  = assertsubnode(surf.row, "Value", 0);
         treenode target = assertsubnode(vNode, surf.writeNode.c_str(), DATATYPE_STRING);
 
         std::string finalCode = header + tmpl;
@@ -2540,6 +2565,7 @@ modelerai_export Variant ModelerAi_applyPick(FLEXSIMINTERFACE)
         out["target"]    = surf.targetName;
         out["table"]     = std::string(getname(surf.table));
         out["pick_name"] = pickName;
+        if (!boundReference.empty()) out["reference"] = boundReference;
         out["written"]   = finalCode;
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("apply_pick", e.what()); }
