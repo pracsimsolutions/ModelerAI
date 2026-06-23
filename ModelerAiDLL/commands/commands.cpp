@@ -2216,6 +2216,62 @@ void parsePickPopup(const std::string& tmpl, std::string& name, std::string& par
     params = body.substr(colon + 1);
 }
 
+// getnodestr() only on text (DATA_BYTEBLOCK) nodes. Calling it on object /
+// coupling / empty nodes hard-faults inside FlexSim (NOT a catchable C++
+// exception), which crashed list_picks on picklists whose node holds no header
+// string (e.g. triggerpicklist). Returns "" for any non-text node.
+std::string safePickStr(treenode n)
+{
+    if (!n) return "";
+    try {
+        if (n->dataType == DATA_BYTEBLOCK) return std::string(getnodestr(n));
+    } catch (...) {}
+    return "";
+}
+
+// Recursively collect leaf PickOptions from a picklist into `out`. Picklists may
+// nest CATEGORY containers (trigger picklists: Data / Control / Visual / ...).
+// A node is a LEAF pick if it has a ">content" subnode (parameters) OR no visible
+// children (PMs, trigger leaves — code is the node's own value); otherwise it's a
+// category to descend into, prefixing the pick's `category` with the path.
+void collectPicks(treenode container, const std::string& category, nlohmann::json& out)
+{
+    int n = 0; try { n = (int)container->subnodes.length; } catch (...) {}
+    for (int i = 1; i <= n; ++i) {
+        treenode o = nullptr; try { o = container->subnodes[i]; } catch (...) {}
+        if (!o) continue;
+        std::string name; try { name = getname(o); } catch (...) {}
+
+        treenode content = nullptr; try { content = o->find(">content"); } catch (...) {}
+        int kids = 0; try { kids = (int)o->subnodes.length; } catch (...) {}
+
+        if (!content && kids > 0) {                       // category — recurse
+            std::string sub = category.empty() ? name : (category + " / " + name);
+            collectPicks(o, sub, out);
+            continue;
+        }
+
+        std::string tmpl = content ? safePickStr(content) : safePickStr(o);
+        std::string popupName, popupParams;
+        parsePickPopup(tmpl, popupName, popupParams);
+
+        nlohmann::json j;
+        j["pick_name"] = name;
+        if (!category.empty()) j["category"] = category;
+        j["popup"] = popupName;
+        if (!popupParams.empty()) j["popup_params"] = popupParams;
+        nlohmann::json tarr = nlohmann::json::array();
+        for (const auto& t : parsePickTags(tmpl)) {
+            nlohmann::json tj = { {"name", t.name}, {"default", t.defVal} };
+            if (!t.options.empty()) tj["options"] = t.options;
+            tarr.push_back(std::move(tj));
+        }
+        j["tags"] = std::move(tarr);
+        j["code_template"] = tmpl;
+        out.push_back(std::move(j));
+    }
+}
+
 // Replace one tag's value in-place: /***tag:NAME*//**/OLD/**/ -> .../**/NEW/**/.
 // Keeps the tag markers intact so FlexSim's popup editor still recognizes the
 // slot. Returns false if the named tag isn't present in the template.
@@ -2375,46 +2431,14 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
                 viewPath + " not found — is a model open, and is the picklist name correct?");
         }
 
-        std::string header;
-        try { header = getnodestr(pl); } catch (...) {}
+        // Header is "" for picklists that carry none on the node (e.g. trigger
+        // picklists — header comes from the event). safePickStr never faults.
+        std::string header = safePickStr(pl);
 
+        // Recursive walk: flattens category nesting and reads each leaf's code
+        // via the type-guarded reader, so no picklist shape can hard-fault.
         nlohmann::json picks = nlohmann::json::array();
-        int n = 0;
-        try { n = (int)pl->subnodes.length; } catch (...) {}
-        for (int i = 1; i <= n; ++i) {
-            treenode opt = nullptr;
-            try { opt = pl->subnodes[i]; } catch (...) {}
-            if (!opt) continue;
-
-            std::string pickName;
-            try { pickName = getname(opt); } catch (...) {}
-
-            // Parameter options are object nodes — code lives in a hidden
-            // ">content" subnode. Other picklists store code on the option
-            // node itself. Try ">content", fall back to the option node.
-            treenode content = nullptr;
-            try { content = opt->find(">content"); } catch (...) {}
-            std::string tmpl;
-            try { tmpl = content ? getnodestr(content) : getnodestr(opt); } catch (...) {}
-
-            std::string popupName, popupParams;
-            parsePickPopup(tmpl, popupName, popupParams);
-            std::vector<PickTag> tags = parsePickTags(tmpl);
-
-            nlohmann::json j;
-            j["pick_name"]     = pickName;
-            j["popup"]         = popupName;
-            if (!popupParams.empty()) j["popup_params"] = popupParams;
-            nlohmann::json tarr = nlohmann::json::array();
-            for (const auto& t : tags) {
-                nlohmann::json tj = { {"name", t.name}, {"default", t.defVal} };
-                if (!t.options.empty()) tj["options"] = t.options;
-                tarr.push_back(std::move(tj));
-            }
-            j["tags"]          = std::move(tarr);
-            j["code_template"] = tmpl;
-            picks.push_back(std::move(j));
-        }
+        collectPicks(pl, "", picks);
 
         nlohmann::json out;
         out["ok"]         = true;
