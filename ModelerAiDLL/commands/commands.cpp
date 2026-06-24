@@ -2601,16 +2601,64 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
         // onSet picklist. A bare/empty/missing arg keeps the default.
         std::string picklistName = "parameterpicklist";
         std::string moduleName;
+        nlohmann::json j;
         Variant arg = param(1);
         if (arg.type == VariantType::String) {
             try {
-                auto j = nlohmann::json::parse(std::string(arg));
+                j = nlohmann::json::parse(std::string(arg));
                 if (j.is_object()) {
                     picklistName = j.value("picklist", picklistName);
                     moduleName   = j.value("module", std::string(""));
                 }
-            } catch (...) { /* tolerate non-JSON arg — keep default */ }
+            } catch (...) { j = nlohmann::json(); /* tolerate non-JSON arg — keep default */ }
         }
+
+        // Property surface — DISCOVER the picks for an (object, property) pair the
+        // same way apply/get_pick RESOLVE them: walk the QuickProperties panel for
+        // the picklist union, then flatten it WITH link-following so distribution
+        // picks behind timeitempicklist -> statisticaldistribution are listed too.
+        // { surface:"property", object, property(DISPLAY name) [, picklist to override] }.
+        if (j.is_object() && j.value("surface", std::string("")) == "property") {
+            std::string objectName   = j.value("object",   std::string(""));
+            std::string propertyName = j.value("property", std::string(""));
+            if (objectName.empty() || propertyName.empty()) {
+                return returnError("missing_args",
+                    "list_picks {surface:\"property\"} requires object and property.");
+            }
+            treenode obj = model()->find(objectName.c_str());
+            if (!objectexists(obj)) {
+                return returnError("not_found",
+                    "Object '" + objectName + "' did not resolve via Model.find.");
+            }
+            PropPanelResult panel = resolvePropertyPanel(obj, propertyName);
+            std::vector<std::string> paths;
+            if (j.contains("picklist") && !picklistName.empty()) {
+                paths.push_back(picklistViewPath(picklistName, moduleName));   // explicit override
+            } else if (panel.found) {
+                paths = panel.picklistPaths;
+            }
+            if (paths.empty()) {
+                return returnError("picklist_unresolved",
+                    "Could not auto-resolve a picklist for '" + propertyName + "' on "
+                    + objectName + " — use the property's DISPLAY name (e.g. \"ProcessTime\"), "
+                    "or pass an explicit `picklist`.");
+            }
+            nlohmann::json picks = nlohmann::json::array();
+            std::vector<std::string> seen;
+            for (const auto& p : paths) collectPicksDeep(p, picks, seen, 0);
+
+            nlohmann::json out;
+            out["ok"]         = true;
+            out["surface"]    = "property";
+            out["object"]     = objectName;
+            out["property"]   = propertyName;
+            if (panel.found) out["variable"] = panel.variable;
+            out["picklists"]  = paths;
+            out["pick_count"] = static_cast<int>(picks.size());
+            out["picks"]      = std::move(picks);
+            return returnJson(out);
+        }
+
         if (picklistName.empty()) picklistName = "parameterpicklist";
 
         std::string viewPath = picklistViewPath(picklistName, moduleName);
