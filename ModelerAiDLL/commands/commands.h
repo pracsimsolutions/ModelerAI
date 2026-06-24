@@ -79,6 +79,9 @@ modelerai_export Variant ModelerAi_listPicks               (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_applyPick               (FLEXSIMINTERFACE);
 // Read back which pick a parameter's onSet currently uses + its tag values.
 modelerai_export Variant ModelerAi_getPick                 (FLEXSIMINTERFACE);
+// Resolve a property's picklist surface (variable + codeheader + picklist union)
+// from the QuickProperties panel tree. Read-only; basis for property auto-resolve.
+modelerai_export Variant ModelerAi_resolvePropertyPicklist (FLEXSIMINTERFACE);
 
 // Connections (Tools 4-8 of the redesign — semantic split by class-pair role)
 modelerai_export Variant ModelerAi_connectFixedResources                (FLEXSIMINTERFACE);

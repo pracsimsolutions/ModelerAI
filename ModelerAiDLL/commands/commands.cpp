@@ -2443,6 +2443,136 @@ bool resolvePickSurface(const nlohmann::json& j, PickSurface& out,
     return false;
 }
 
+// ---- Property picklist resolution from the QuickProperties panel tree --------
+// VIEW:/standardviews/modelingutilities/QuickProperties >variables/propertiesPanels
+// lists, per class, an Edit control per picklist-backed property. Everything is
+// stored as ATTRIBUTES (the control node has 0 regular subnodes), so:
+//   >variables/propName   — the property (e.g. "ProcessTime")
+//   >variables/picklist   — a picklist VIEW path; its subnodes are ADDITIONAL
+//                           picklist paths (the dropdown is their union)
+//   >variables/codeheader — the exact header to prepend
+//   >objectfocus          — "...>variables/<var>"; the tail is the real variable
+// A panel applies to an object when isclasstype(obj, panelName). The same propName
+// can appear under multiple matching panels with different variables (e.g.
+// processTime vs cycletime) — pick the candidate getvarnode(obj, var) resolves to.
+// Confirmed via FlexScript prototype 2026-06-23.
+
+// Read any node's value as a string (plain string / coupling / byteblock) —
+// QuickProperties values are paths/strings, not just FlexScript bodies.
+std::string nodeValueStr(treenode n)
+{
+    if (!n) return "";
+    try { return std::string(n->value.toString()); } catch (...) {}
+    return "";
+}
+
+struct PropPanelResult {
+    bool                     found = false;
+    std::string              codeHeader;
+    std::vector<std::string> picklistPaths;   // VIEW:/picklists/... (+ nested union)
+    std::string              variable;        // chosen write-target variable
+    std::vector<std::string> varCandidates;
+};
+
+void walkPropertyControls(treenode container, const std::string& prop,
+                          PropPanelResult& out, int depth)
+{
+    if (!container || depth > 12) return;
+    int n = 0; try { n = content(container); } catch (...) {}
+    for (int i = 1; i <= n; ++i) {
+        treenode c = nullptr; try { c = rank(container, i); } catch (...) {}
+        if (!c) continue;
+
+        treenode pn = nullptr; try { pn = c->find(">variables/propName"); } catch (...) {}
+        if (pn && nodeValueStr(pn) == prop) {
+            out.found = true;
+            if (out.codeHeader.empty()) {
+                treenode ch = nullptr; try { ch = c->find(">variables/codeheader"); } catch (...) {}
+                if (ch) out.codeHeader = nodeValueStr(ch);
+            }
+            treenode pl = nullptr; try { pl = c->find(">variables/picklist"); } catch (...) {}
+            if (pl) {
+                std::string v = nodeValueStr(pl);
+                if (!v.empty()) out.picklistPaths.push_back(v);
+                int sn = 0; try { sn = content(pl); } catch (...) {}
+                for (int k = 1; k <= sn; ++k) {
+                    treenode s = nullptr; try { s = rank(pl, k); } catch (...) {}
+                    if (s) { std::string sv = nodeValueStr(s); if (!sv.empty()) out.picklistPaths.push_back(sv); }
+                }
+            }
+            treenode of = nullptr; try { of = c->find(">objectfocus"); } catch (...) {}
+            if (of) {
+                std::string ofv = nodeValueStr(of);
+                size_t slash = ofv.rfind('/');
+                std::string var = (slash == std::string::npos) ? ofv : ofv.substr(slash + 1);
+                if (!var.empty()) out.varCandidates.push_back(var);
+            }
+        }
+        walkPropertyControls(c, prop, out, depth + 1);
+    }
+}
+
+// Resolve (object, property) -> { variable, codeHeader, picklistPaths } via panels.
+PropPanelResult resolvePropertyPanel(treenode obj, const std::string& property)
+{
+    PropPanelResult res;
+    treenode qp = node("VIEW:/standardviews/modelingutilities/QuickProperties", nullptr);
+    if (!qp) return res;
+    treenode panels = getvarnode(qp, "propertiesPanels");
+    if (!panels) return res;
+    int np = 0; try { np = content(panels); } catch (...) {}
+    for (int i = 1; i <= np; ++i) {
+        treenode panel = nullptr; try { panel = rank(panels, i); } catch (...) {}
+        if (!panel) continue;
+        std::string pname; try { pname = getname(panel); } catch (...) {}
+        bool match = false;
+        try { match = (isclasstype(obj, pname.c_str()) != 0); } catch (...) {}  // non-class names => false
+        if (!match) continue;
+        walkPropertyControls(panel, property, res, 0);
+    }
+    // Disambiguate the variable: the one that actually exists on the object.
+    for (const auto& v : res.varCandidates) {
+        treenode vn = nullptr; try { vn = getvarnode(obj, v.c_str()); } catch (...) {}
+        if (objectexists(vn)) { res.variable = v; break; }
+    }
+    if (res.variable.empty() && !res.varCandidates.empty()) res.variable = res.varCandidates.front();
+    return res;
+}
+
+// Collect picks from a picklist VIEW path, FOLLOWING picklist-reference options
+// (a pick whose code_template is just "VIEW:/picklists/<other>", e.g.
+// timeitempicklist's "Statistical Distribution" -> statisticaldistribution) so
+// nested picks are reachable. `seen` guards against cycles / re-walks.
+void collectPicksDeep(const std::string& viewPath, nlohmann::json& out,
+                      std::vector<std::string>& seen, int depth)
+{
+    if (depth > 5) return;
+    for (const auto& s : seen) if (s == viewPath) return;
+    seen.push_back(viewPath);
+
+    treenode pl = node(viewPath.c_str(), nullptr);
+    if (!pl) return;
+
+    nlohmann::json local = nlohmann::json::array();
+    collectPicks(pl, "", local);
+
+    const std::string linkPrefix = "VIEW:/picklists/";
+    for (auto& p : local) {
+        std::string tmpl = p.value("code_template", std::string(""));
+        // Trim leading/trailing whitespace + a trailing ';'.
+        size_t a = tmpl.find_first_not_of(" \t\r\n");
+        std::string trimmed = (a == std::string::npos) ? "" : tmpl.substr(a);
+        size_t b = trimmed.find_last_not_of(" \t\r\n;");
+        trimmed = (b == std::string::npos) ? "" : trimmed.substr(0, b + 1);
+
+        bool isLink = trimmed.rfind(linkPrefix, 0) == 0
+                      && trimmed.find('\n') == std::string::npos
+                      && trimmed.find(' ')  == std::string::npos;
+        if (isLink)            collectPicksDeep(trimmed, out, seen, depth + 1);
+        else if (!tmpl.empty()) out.push_back(p);
+    }
+}
+
 } // namespace
 
 modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
@@ -2721,6 +2851,59 @@ modelerai_export Variant ModelerAi_getPick(FLEXSIMINTERFACE)
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_pick", e.what()); }
       catch (...)                     { return returnException("get_pick", "unknown"); }
+}
+
+// ============================================================================
+// modelerai_resolve_property_picklist({ object, property }):
+//   Read-only. Resolves a FlexScript-valued property's picklist surface from the
+//   QuickProperties panel tree — returns { variable, codeheader, picklists }
+//   where `variable` is the real write-target var (e.g. ProcessTime -> cycletime),
+//   `codeheader` is the panel's exact header, and `picklists` is the VIEW-path
+//   union the dropdown offers. The basis for apply_pick property auto-resolution.
+// ============================================================================
+modelerai_export Variant ModelerAi_resolvePropertyPicklist(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        if (arg.type != VariantType::String) {
+            return returnError("missing_args",
+                "resolve_property_picklist expects { object, property } as a JSON string.");
+        }
+        nlohmann::json j;
+        try { j = nlohmann::json::parse(std::string(arg)); }
+        catch (const std::exception& e) { return returnError("bad_args_json", e.what()); }
+        std::string objectName = j.value("object",   std::string(""));
+        std::string property   = j.value("property", std::string(""));
+        if (objectName.empty() || property.empty()) {
+            return returnError("missing_args",
+                "resolve_property_picklist requires `object` and `property` (the display name, e.g. \"ProcessTime\").");
+        }
+
+        treenode obj = model()->find(objectName.c_str());
+        if (!objectexists(obj)) {
+            return returnError("not_found", "Object '" + objectName + "' did not resolve via Model.find.");
+        }
+
+        PropPanelResult r = resolvePropertyPanel(obj, property);
+        std::string cls; try { cls = std::string(getname(classobject(obj))); } catch (...) {}
+        if (!r.found) {
+            return returnError("property_not_found",
+                "No picklist-backed control for property '" + property + "' on " + objectName
+                + " (class " + cls + "). Check the display name.");
+        }
+
+        nlohmann::json out;
+        out["ok"]             = true;
+        out["object"]         = objectName;
+        out["class"]          = cls;
+        out["property"]       = property;
+        out["variable"]       = r.variable;
+        out["codeheader"]     = r.codeHeader;
+        out["picklists"]      = r.picklistPaths;
+        out["var_candidates"] = r.varCandidates;
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("resolve_property_picklist", e.what()); }
+      catch (...)                     { return returnException("resolve_property_picklist", "unknown"); }
 }
 
 // ============================================================================
@@ -8782,25 +8965,25 @@ static nlohmann::json getTriggerPickImpl(const nlohmann::json& j)
 
 // ============================================================================
 // Property picklist surface. Target is an (object, property) pair where the
-// property's value is a FlexScript expression (e.g. a Processor's process time,
-// variable "cycletime"). The picklist is supplied by the AI (e.g.
-// "statisticaldistribution" for distributions, "timepicklist" for time presets).
-// The property keeps its OWN header (declarations like current/item) — we
-// preserve it from the current value and write header + filled template to the
-// value node, then compile. A picklist-reference option (code is a
-// VIEW:/picklists/... path) is reported so the caller drills into that picklist.
+// property's value is a FlexScript expression (e.g. a Processor's process time).
+// AUTO-RESOLVES from the QuickProperties panel: `property` may be the DISPLAY name
+// (e.g. "ProcessTime") — resolvePropertyPanel gives the real variable (cycletime),
+// the panel's codeheader, and the picklist union, so `picklist` is OPTIONAL. Picks
+// are collected with link-following (timeitempicklist -> statisticaldistribution).
+// Backward compatible: if the panel doesn't know `property`, it's treated as the
+// variable name directly and `picklist` is required.
 // ============================================================================
 static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j)
 {
     nlohmann::json e;
     std::string objectName   = j.value("object",    std::string(""));
     std::string propertyName = j.value("property",  std::string(""));
-    std::string picklistName = j.value("picklist",  std::string(""));
+    std::string picklistName = j.value("picklist",  std::string(""));   // optional
     std::string pickName     = j.value("pick_name", std::string(""));
-    if (objectName.empty() || propertyName.empty() || picklistName.empty() || pickName.empty()) {
+    if (objectName.empty() || propertyName.empty() || pickName.empty()) {
         e["ok"] = false; e["error"] = "missing_args";
-        e["message"] = "property apply_pick requires object, property (the VARIABLE name, "
-                       "e.g. \"cycletime\" for a Processor's process time), picklist, pick_name.";
+        e["message"] = "property apply_pick requires object, property, pick_name "
+                       "(picklist is optional — auto-resolved from the property's panel).";
         return e;
     }
 
@@ -8811,54 +8994,61 @@ static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j)
         return e;
     }
 
-    treenode vnode = getvarnode(obj, propertyName.c_str());
+    // Auto-resolve from the QuickProperties panel (real variable + header + picklist
+    // union). `property` may be a display name; if the panel doesn't know it, fall
+    // back to treating `property` as the variable directly (then `picklist` required).
+    PropPanelResult panel = resolvePropertyPanel(obj, propertyName);
+    std::string variable = panel.found ? panel.variable    : propertyName;
+    std::string header   = panel.found ? panel.codeHeader  : std::string("");
+
+    std::vector<std::string> paths;
+    if (!picklistName.empty()) {
+        paths.push_back(picklistViewPath(picklistName, j.value("module", std::string(""))));
+    } else if (panel.found) {
+        paths = panel.picklistPaths;
+    } else {
+        e["ok"] = false; e["error"] = "picklist_unresolved";
+        e["message"] = "Could not auto-resolve a picklist for '" + propertyName + "' on "
+                       + objectName + " — pass `picklist` explicitly, or use the property's "
+                       "display name (e.g. \"ProcessTime\").";
+        return e;
+    }
+
+    treenode vnode = getvarnode(obj, variable.c_str());
     if (!objectexists(vnode)) {
         e["ok"] = false; e["error"] = "property_not_found";
-        e["message"] = "No variable '" + propertyName + "' on '" + objectName + "' — this surface "
-                       "takes the VARIABLE name (e.g. cycletime for a Processor's process time).";
+        e["message"] = "No variable '" + variable + "' on '" + objectName + "'.";
         return e;
     }
 
-    // Preserve the property's own header (current/item declarations).
-    std::string current;
-    try { current = std::string(vnode->value.toString()); } catch (...) {}
-    std::string header = extractPropertyHeader(current);
-    // Fall back to the standard per-item property header when the current value
-    // carried none (e.g. a bare value or an already-headerless pick) — distribution
-    // picks reference `current` (getstream(current)), so it must be declared.
+    // Header: the panel's is authoritative; else preserve the current value's
+    // header; else the standard per-item fallback (picks reference `current`).
+    if (header.empty()) {
+        std::string current; try { current = std::string(vnode->value.toString()); } catch (...) {}
+        header = extractPropertyHeader(current);
+    }
     if (header.empty()) header = "Object current = ownerobject(c);\r\nObject item = param(1);\r\n";
 
-    // Resolve the named picklist + find the pick (recursive, handles nesting).
-    std::string viewPath = picklistViewPath(picklistName, j.value("module", std::string("")));
-    treenode pl = node(viewPath.c_str(), nullptr);
-    if (!pl) {
-        e["ok"] = false; e["error"] = "not_found";
-        e["message"] = viewPath + " not found — check the picklist name.";
-        return e;
-    }
+    // Collect picks from the picklist union, following picklist-reference links.
     nlohmann::json all = nlohmann::json::array();
-    collectPicks(pl, "", all);
+    std::vector<std::string> seen;
+    for (const auto& path : paths) collectPicksDeep(path, all, seen, 0);
+
     std::string tmpl;
     bool found = false;
     nlohmann::json available = nlohmann::json::array();
     for (auto& p : all) {
         std::string nm = p.value("pick_name", std::string(""));
         available.push_back(nm);
-        if (nm == pickName) { tmpl = p.value("code_template", std::string("")); found = true; }
+        if (!found && nm == pickName) { tmpl = p.value("code_template", std::string("")); found = true; }
     }
     if (!found) {
         e["ok"] = false; e["error"] = "pick_not_found";
-        e["message"] = "No pick named '" + pickName + "' in " + picklistName + ". See `available`.";
+        e["message"]   = "No pick named '" + pickName + "' in the resolved picklist(s). See `available`.";
         e["available"] = std::move(available);
-        return e;
-    }
-
-    // A picklist-reference option (code is a VIEW:/picklists/... path) isn't code.
-    const std::string linkPrefix = "VIEW:/picklists/";
-    if (tmpl.rfind(linkPrefix, 0) == 0) {
-        e["ok"] = false; e["error"] = "pick_is_a_link";
-        e["message"] = "'" + pickName + "' links to another picklist; re-run with picklist=\""
-                       + tmpl.substr(linkPrefix.size()) + "\".";
+        nlohmann::json pj = nlohmann::json::array();
+        for (const auto& path : paths) pj.push_back(path);
+        e["picklists"] = std::move(pj);
         return e;
     }
 
@@ -8888,13 +9078,14 @@ static nlohmann::json applyPropertyPickImpl(const nlohmann::json& j)
     switch_flexscript(vnode, 1);
     buildnodeflexscript(vnode);
 
-    e["ok"]        = true;
-    e["surface"]   = "property";
-    e["object"]    = objectName;
-    e["property"]  = propertyName;
-    e["picklist"]  = picklistName;
-    e["pick_name"] = pickName;
-    e["written"]   = finalCode;
+    e["ok"]            = true;
+    e["surface"]       = "property";
+    e["object"]        = objectName;
+    e["property"]      = propertyName;
+    e["variable"]      = variable;
+    e["auto_resolved"] = (panel.found && picklistName.empty());
+    e["pick_name"]     = pickName;
+    e["written"]       = finalCode;
     return e;
 }
 
@@ -8914,12 +9105,17 @@ static nlohmann::json getPropertyPickImpl(const nlohmann::json& j)
         out["message"] = "Object '" + objectName + "' did not resolve via Model.find.";
         return out;
     }
-    treenode vnode = getvarnode(obj, propertyName.c_str());
+    // Accept the DISPLAY name (auto-resolve the variable from the panel) or the
+    // variable name directly.
+    PropPanelResult panel = resolvePropertyPanel(obj, propertyName);
+    std::string variable = panel.found ? panel.variable : propertyName;
+    treenode vnode = getvarnode(obj, variable.c_str());
     if (!objectexists(vnode)) {
         out["ok"] = false; out["error"] = "property_not_found";
-        out["message"] = "No variable '" + propertyName + "' on '" + objectName + "'.";
+        out["message"] = "No variable '" + variable + "' on '" + objectName + "'.";
         return out;
     }
+    out["variable"] = variable;
 
     out["ok"]       = true;
     out["surface"]  = "property";

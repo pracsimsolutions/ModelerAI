@@ -4404,7 +4404,7 @@ var qrcode = function() {
   &lt;!-- Build version marker. Bumped by .0000001 on every source change so
        smoke tests can verify which build is running. Starting from .1000001
        on 2026-06-09. --&gt;
-  &lt;div id="app-version"&gt;.1000142&lt;/div&gt;
+  &lt;div id="app-version"&gt;.1000144&lt;/div&gt;
 
   &lt;!-- tabs --&gt;
   &lt;div id="tabbar"&gt;
@@ -8715,6 +8715,7 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_list_picks</name><data>dll:"module:ModelerAI" func:"ModelerAi_listPicks"</data></node>
       <node f="1000042" dt="2"><name>modelerai_apply_pick</name><data>dll:"module:ModelerAI" func:"ModelerAi_applyPick"</data></node>
       <node f="1000042" dt="2"><name>modelerai_get_pick</name><data>dll:"module:ModelerAI" func:"ModelerAi_getPick"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_resolve_property_picklist</name><data>dll:"module:ModelerAI" func:"ModelerAi_resolvePropertyPicklist"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_fixed_resources</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectFixedResources"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_task_executer_to_navigator</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectTaskExecuterToNavigator"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_fixed_resource_to_navigator</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectFixedResourceToNavigator"</data></node>
