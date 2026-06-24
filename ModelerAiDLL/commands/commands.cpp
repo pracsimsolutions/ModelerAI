@@ -2301,8 +2301,27 @@ bool fillOneTag(std::string& tmpl, const std::string& name, const std::string& v
     size_t valStart = openerPos + 4;
     size_t valEnd = tmpl.find("/*", valStart);    // start of the closer — value ends here
     if (valEnd == std::string::npos) return false;
+
+    // Positional picks (e.g. statisticaldistribution) store each arg's SEPARATOR
+    // inside the value slot — par2's default is ", 8", where the leading ", "
+    // belongs to the function arg list, not the value. If the existing default
+    // begins with (whitespace +) ',' and the caller's replacement doesn't already
+    // start with that comma, preserve the separator so the AI can pass a plain
+    // value: par2:"40" -> ", 40" (not "40" -> "exponential(040, ...)").
+    std::string filled = value;
+    std::string oldVal = tmpl.substr(valStart, valEnd - valStart);
+    size_t sp = 0;
+    while (sp < oldVal.size() && (oldVal[sp] == ' ' || oldVal[sp] == '\t')) ++sp;
+    if (sp < oldVal.size() && oldVal[sp] == ',') {
+        ++sp;                                       // past the comma
+        while (sp < oldVal.size() && (oldVal[sp] == ' ' || oldVal[sp] == '\t')) ++sp;
+        size_t firstNonWs = filled.find_first_not_of(" \t");
+        bool callerHasComma = (firstNonWs != std::string::npos && filled[firstNonWs] == ',');
+        if (!callerHasComma) filled = oldVal.substr(0, sp) + filled;
+    }
+
     // Replace only the value; preserve the closer (incl. any /**list:...*/ spec).
-    tmpl = tmpl.substr(0, valStart) + value + tmpl.substr(valEnd);
+    tmpl = tmpl.substr(0, valStart) + filled + tmpl.substr(valEnd);
     return true;
 }
 
