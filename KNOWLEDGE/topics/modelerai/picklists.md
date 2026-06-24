@@ -112,6 +112,19 @@ modelerai_apply_pick {
 modelerai_get_pick { "surface": "property", "object": "Processor1", "property": "ProcessTime" }
 ```
 
+### Map every picklist-backed property — `modelerai_list_object_picklists`
+
+`list_picks {surface:"property"}` drills into ONE property. To see **every** property an object can drive with a preset (process time, setup time, operator ref, …) in one read-only call:
+
+```json
+modelerai_list_object_picklists { "object": "Processor1" }
+// → { ok, object, class, property_count,
+//     properties: [ { property: "ProcessTime", variable: "cycletime",
+//                     picklists: ["VIEW:/picklists/timeitempicklist"] }, … ] }
+```
+
+Each entry's `property` is the DISPLAY name to feed straight into `apply_pick`/`get_pick`. `picklists` is the panel's dropdown union and may include **custom** picklists at `VIEW:/custompicklists/<name>` (model/class-specific) alongside the general ones — the property surface reads both. Accepts a bare object-name string too.
+
 ## Worked example — count-driven duplication
 
 ```

@@ -8716,6 +8716,7 @@ return theView;</data></node>
       <node f="1000042" dt="2"><name>modelerai_apply_pick</name><data>dll:"module:ModelerAI" func:"ModelerAi_applyPick"</data></node>
       <node f="1000042" dt="2"><name>modelerai_get_pick</name><data>dll:"module:ModelerAI" func:"ModelerAi_getPick"</data></node>
       <node f="1000042" dt="2"><name>modelerai_resolve_property_picklist</name><data>dll:"module:ModelerAI" func:"ModelerAi_resolvePropertyPicklist"</data></node>
+      <node f="1000042" dt="2"><name>modelerai_list_object_picklists</name><data>dll:"module:ModelerAI" func:"ModelerAi_listObjectPicklists"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_fixed_resources</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectFixedResources"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_task_executer_to_navigator</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectTaskExecuterToNavigator"</data></node>
       <node f="1000042" dt="2"><name>modelerai_connect_fixed_resource_to_navigator</name><data>dll:"module:ModelerAI" func:"ModelerAi_connectFixedResourceToNavigator"</data></node>

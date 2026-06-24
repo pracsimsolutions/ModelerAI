@@ -2558,6 +2558,86 @@ PropPanelResult resolvePropertyPanel(treenode obj, const std::string& property)
     return res;
 }
 
+// One picklist-backed property the object's panels expose — its display name, the
+// write-target variable, and the picklist union (for discovery, not application).
+struct PropSurfaceEntry {
+    std::string              property;
+    std::string              variable;
+    std::vector<std::string> picklists;
+};
+
+// Like walkPropertyControls but collects EVERY control that carries a picklist
+// (not just one propName), so we can map an object's whole picklist surface.
+void collectAllPropertyControls(treenode container, std::vector<PropSurfaceEntry>& out, int depth)
+{
+    if (!container || depth > 12) return;
+    int n = 0; try { n = content(container); } catch (...) {}
+    for (int i = 1; i <= n; ++i) {
+        treenode c = nullptr; try { c = rank(container, i); } catch (...) {}
+        if (!c) continue;
+        treenode pn = nullptr; try { pn = c->find(">variables/propName"); } catch (...) {}
+        treenode pl = nullptr; try { pl = c->find(">variables/picklist"); } catch (...) {}
+        std::string prop = pn ? nodeValueStr(pn) : std::string("");
+        std::string plv  = pl ? nodeValueStr(pl)  : std::string("");
+        if (!prop.empty() && !plv.empty()) {
+            PropSurfaceEntry e;
+            e.property = prop;
+            e.picklists.push_back(plv);
+            int sn = 0; try { sn = content(pl); } catch (...) {}
+            for (int k = 1; k <= sn; ++k) {
+                treenode s = nullptr; try { s = rank(pl, k); } catch (...) {}
+                if (s) { std::string sv = nodeValueStr(s); if (!sv.empty()) e.picklists.push_back(sv); }
+            }
+            treenode of = nullptr; try { of = c->find(">objectfocus"); } catch (...) {}
+            if (of) {
+                std::string ofv = nodeValueStr(of);
+                size_t sl = ofv.rfind('/');
+                e.variable = (sl == std::string::npos) ? ofv : ofv.substr(sl + 1);
+            }
+            out.push_back(std::move(e));
+        }
+        collectAllPropertyControls(c, out, depth + 1);
+    }
+}
+
+// Enumerate every picklist-backed property surface on `obj` from its matching
+// QuickProperties panels. Deduped by property: for a property seen under several
+// panels, keep the variable that actually resolves on the object and union the
+// picklist paths.
+std::vector<PropSurfaceEntry> resolveObjectPropertyPicklists(treenode obj)
+{
+    std::vector<PropSurfaceEntry> raw;
+    treenode qp = node("VIEW:/standardviews/modelingutilities/QuickProperties", nullptr);
+    if (qp) {
+        treenode panels = getvarnode(qp, "propertiesPanels");
+        if (panels) {
+            int np = 0; try { np = content(panels); } catch (...) {}
+            for (int i = 1; i <= np; ++i) {
+                treenode panel = nullptr; try { panel = rank(panels, i); } catch (...) {}
+                if (!panel) continue;
+                std::string pname; try { pname = getname(panel); } catch (...) {}
+                bool match = false;
+                try { match = (isclasstype(obj, pname.c_str()) != 0); } catch (...) {}
+                if (match) collectAllPropertyControls(panel, raw, 0);
+            }
+        }
+    }
+    std::vector<PropSurfaceEntry> outv;
+    for (auto& e : raw) {
+        PropSurfaceEntry* dst = nullptr;
+        for (auto& o : outv) if (o.property == e.property) { dst = &o; break; }
+        if (!dst) { outv.push_back(e); continue; }   // first sighting keeps its variable
+        for (auto& p : e.picklists) {                // union picklists
+            bool seen = false;
+            for (auto& q : dst->picklists) if (q == p) { seen = true; break; }
+            if (!seen) dst->picklists.push_back(p);
+        }
+        treenode vn = nullptr; try { vn = getvarnode(obj, e.variable.c_str()); } catch (...) {}
+        if (objectexists(vn)) dst->variable = e.variable;   // prefer a resolvable variable
+    }
+    return outv;
+}
+
 // Collect picks from a picklist VIEW path, FOLLOWING picklist-reference options
 // (a pick whose code_template is just "VIEW:/picklists/<other>", e.g.
 // timeitempicklist's "Statistical Distribution" -> statisticaldistribution) so
@@ -2687,6 +2767,57 @@ modelerai_export Variant ModelerAi_listPicks(FLEXSIMINTERFACE)
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("list_picks", e.what()); }
       catch (...)                     { return returnException("list_picks", "unknown"); }
+}
+
+// modelerai_list_object_picklists({ object }): map EVERY picklist-backed property
+// surface the object exposes — one entry per property with its write-target
+// variable and the picklist(s) its dropdown draws from. Discovery companion to
+// list_picks {surface:"property"} (which drills into ONE property): this answers
+// "what on this object can I drive with a preset?" Read-only. Accepts a bare
+// object-name string too (for Console smoke tests).
+modelerai_export Variant ModelerAi_listObjectPicklists(FLEXSIMINTERFACE)
+{
+    try {
+        Variant arg = param(1);
+        std::string objectName;
+        if (arg.type == VariantType::String) {
+            std::string s(arg);
+            try {
+                auto j = nlohmann::json::parse(s);
+                objectName = j.is_object() ? j.value("object", std::string("")) : s;
+            } catch (...) { objectName = s; }   // tolerate a bare object name
+        }
+        if (objectName.empty()) {
+            return returnError("missing_args", "list_object_picklists requires { object }.");
+        }
+        treenode obj = model()->find(objectName.c_str());
+        if (!objectexists(obj)) {
+            return returnError("not_found",
+                "Object '" + objectName + "' did not resolve via Model.find.");
+        }
+
+        std::string className;
+        try { TreeNode* cn = classobject(obj); if (cn) className = getname(cn); } catch (...) {}
+
+        std::vector<PropSurfaceEntry> entries = resolveObjectPropertyPicklists(obj);
+        nlohmann::json props = nlohmann::json::array();
+        for (const auto& e : entries) {
+            nlohmann::json pj;
+            pj["property"]  = e.property;
+            pj["variable"]  = e.variable;
+            pj["picklists"] = e.picklists;
+            props.push_back(std::move(pj));
+        }
+
+        nlohmann::json out;
+        out["ok"]             = true;
+        out["object"]         = objectName;
+        out["class"]          = className;
+        out["property_count"] = static_cast<int>(entries.size());
+        out["properties"]     = std::move(props);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_object_picklists", e.what()); }
+      catch (...)                     { return returnException("list_object_picklists", "unknown"); }
 }
 
 // Trigger-surface impls — defined further below (after matchTrigger) so they can
