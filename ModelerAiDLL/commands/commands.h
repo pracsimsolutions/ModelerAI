@@ -93,6 +93,7 @@ modelerai_export Variant ModelerAi_addListField            (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_listPremadeFields       (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_setListInitialContent   (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_getListInfo             (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_setListFieldExpression  (FLEXSIMINTERFACE);
 
 // Connections (Tools 4-8 of the redesign — semantic split by class-pair role)
 modelerai_export Variant ModelerAi_connectFixedResources                (FLEXSIMINTERFACE);

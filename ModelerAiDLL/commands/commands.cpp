@@ -8916,15 +8916,22 @@ static const char* kListFieldHeader =
     "Variant value = param(1);\r\nVariant puller = param(2);\r\n"
     "treenode entry = param(3);\r\ndouble pushTime = param(4);\r\n";
 
-void writeFieldExpression(treenode field, const std::string& body)
+// Write header+body into a field's `expression` S-node and compile. Idempotent on
+// the header: a body that already starts with kListFieldHeader is not doubled.
+// Returns false if the field has no expression node (i.e. it's a Label field).
+bool writeFieldExpression(treenode field, const std::string& body)
 {
-    if (!field) return;
+    if (!field) return false;
     treenode expr = field->find("expression");
-    if (!expr) return;
-    std::string full = std::string(kListFieldHeader) + body;
+    if (!expr) return false;
+    std::string hdr = kListFieldHeader;
+    std::string b   = body;
+    if (b.rfind(hdr, 0) == 0) b = b.substr(hdr.size());   // strip a leading header
+    std::string full = hdr + b;
     expr->value = Variant(full.c_str());
     switch_flexscript(expr, 1);
     buildnodeflexscript(expr);
+    return true;
 }
 
 void setFieldDynamic(treenode field, bool dyn)
@@ -9219,6 +9226,55 @@ modelerai_export Variant ModelerAi_getListInfo(FLEXSIMINTERFACE)
         return returnJson(out);
     } catch (const std::exception& e) { return returnException("get_list_info", e.what()); }
       catch (...)                     { return returnException("get_list_info", "unknown"); }
+}
+
+// Edit an existing Expression field's code (replace semantics; header auto-applied,
+// idempotent). Pair with get_list_info, which returns the current header-stripped
+// body. Field must exist and be an Expression field (Label fields have no code).
+modelerai_export Variant ModelerAi_setListFieldExpression(FLEXSIMINTERFACE)
+{
+    try {
+        nlohmann::json j;
+        if (!parseListArg(param(1), j))
+            return returnError("missing_args",
+                "set_list_field_expression requires { list, field, expression }.");
+        std::string listName  = j.value("list",  std::string(""));
+        std::string fieldName = j.value("field", std::string(""));
+        if (fieldName.empty())
+            return returnError("missing_args", "set_list_field_expression requires `field`.");
+        treenode list = resolveListNode(listName);
+        if (!list) return returnError("not_found", "List '" + listName + "' not found.");
+
+        treenode fields = listFieldsNode(list);
+        treenode field  = fields ? fields->find(fieldName.c_str()) : nullptr;
+        if (!field) {
+            nlohmann::json avail = nlohmann::json::array();
+            if (fields)
+                for (int i = 1; i <= content(fields); ++i)
+                    avail.push_back(std::string(getname(rank(fields, i))));
+            nlohmann::json e;
+            e["ok"] = false; e["error"] = "field_not_found";
+            e["message"]   = "No field '" + fieldName + "' on list '" + listName + "'.";
+            e["available"] = std::move(avail);
+            return returnJson(e);
+        }
+        if (!field->find("expression"))
+            return returnError("not_an_expression_field",
+                "Field '" + fieldName + "' is a Label field (no editable code). Only "
+                "Expression fields have code.");
+
+        writeFieldExpression(field, j.value("expression", std::string("0")));
+        if (j.contains("dynamic") && j["dynamic"].is_boolean())
+            setFieldDynamic(field, j["dynamic"].get<bool>());
+
+        nlohmann::json out;
+        out["ok"]      = true;
+        out["list"]    = listName;
+        out["field"]   = fieldName;
+        out["written"] = std::string(field->find("expression")->value.toString());
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_list_field_expression", e.what()); }
+      catch (...)                     { return returnException("set_list_field_expression", "unknown"); }
 }
 
 // ============================================================================

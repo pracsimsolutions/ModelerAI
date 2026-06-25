@@ -48,7 +48,15 @@ Each name resolves as a model object, else a **Group** (`Tools/Groups/<name>`). 
     fields: [ { name, type:"expression"|"label", dynamic, expression? } ],
     initial_content: [ "Operator1", ... ] }
 ```
-`type` is classified by the node's structure (has an `expression` subnode → expression, else label) — so a premade field reports its *actual* type, which may be `label`.
+`type` is classified by the node's structure (has an `expression` subnode → expression, else label) — so a premade field reports its *actual* type, which may be `label`. The `expression` value is **header-stripped** — exactly the body you'd pass back to edit it.
+
+## `modelerai_set_list_field_expression`
+```json
+{ "list": "AvailableOps", "field": "idleAge",
+  "expression": "return (Model.time - pushTime) / 60;", "dynamic"?: true }
+→ { ok, list, field, written }
+```
+Edit an existing **Expression** field's code (replace semantics — pass the full new body; the 4-param header is (re)applied, idempotently). The field must exist and be an Expression field (a Label field returns `not_an_expression_field`; a missing field returns `{error:"field_not_found", available:[...]}`). **Read-then-edit:** `get_list_info` returns the current header-stripped body, so the natural flow is read it, modify, write it back. Starting fresh works too — just pass the new body.
 
 ## Worked example
 ```
