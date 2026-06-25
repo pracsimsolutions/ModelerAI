@@ -9030,7 +9030,7 @@ modelerai_export Variant ModelerAi_createList(FLEXSIMINTERFACE)
                 treenode tgt = nullptr;
                 if (cor && resolveContentTarget(nm, tgt)) {
                     std::string tn = getname(tgt);
-                    assertsubnode(cor, tn.c_str(), 0)->pointTo(tgt);
+                    assertsubnode(cor, tn.c_str(), 0)->value = Variant(tgt);   // value = object node
                     contentNames.push_back(tn);
                 } else unresolved.push_back(nm);
             }
@@ -9158,7 +9158,10 @@ modelerai_export Variant ModelerAi_setListInitialContent(FLEXSIMINTERFACE)
 
         nlohmann::json contentNames = nlohmann::json::array();
         for (auto& t : targets) {
-            assertsubnode(cor, t.first.c_str(), 0)->pointTo(t.second);
+            // The list's reset reads each contentsOnReset subnode's VALUE as the
+            // object to push — set value to the target node (NOT a pointTo
+            // coupling). Mirrors FlexScript `newNode.value = Group("...")`.
+            assertsubnode(cor, t.first.c_str(), 0)->value = Variant(t.second);
             contentNames.push_back(t.first);
         }
 
