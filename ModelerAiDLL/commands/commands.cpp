@@ -8878,6 +8878,347 @@ modelerai_export Variant ModelerAi_deleteGlobalTable(FLEXSIMINTERFACE)
 }
 
 // ============================================================================
+// Lists (create + configure). FlexSim global Lists live under Tools/GlobalLists.
+// v1 surface: create the list, add fields (expression/label/premade), set the
+// initial content pushed on reset, and read back the config. Native: Tools::create
+// + function_s("addField") / createcopy for premade + pointTo couplings for
+// contentsOnReset — no executestring. (Design: docs/.../2026-06-24-modelerai-list-tools.)
+// ============================================================================
+namespace {
+
+// Resolve a List instance by name (under Tools/GlobalLists) or by path. Returns
+// null unless the resolved node is actually a List.
+treenode resolveListNode(const std::string& nameOrPath)
+{
+    treenode n = nullptr;
+    if (treenode lists = model()->find("Tools/GlobalLists")) {
+        int c = content(lists);
+        for (int i = 1; i <= c; ++i) {
+            treenode ch = rank(lists, i);
+            if (ch && std::string(getname(ch)) == nameOrPath) { n = ch; break; }
+        }
+    }
+    if (!n) n = node(nameOrPath.c_str(), model());   // allow a model path
+    if (n && isclasstype(n, "List")) return n;
+    return nullptr;
+}
+
+treenode listFieldsNode(treenode list) { return getvarnode(list, "fields"); }
+
+// The premade-field catalog lives on the List *class*, not the instance.
+treenode menuFieldsRoot()
+{
+    return node("MAIN:/project/library/List>behaviour/eventfunctions/menuFields", nullptr);
+}
+
+// The 4 params in scope inside an expression field's body (value/puller/entry/pushTime).
+static const char* kListFieldHeader =
+    "Variant value = param(1);\r\nVariant puller = param(2);\r\n"
+    "treenode entry = param(3);\r\ndouble pushTime = param(4);\r\n";
+
+void writeFieldExpression(treenode field, const std::string& body)
+{
+    if (!field) return;
+    treenode expr = field->find("expression");
+    if (!expr) return;
+    std::string full = std::string(kListFieldHeader) + body;
+    expr->value = Variant(full.c_str());
+    switch_flexscript(expr, 1);
+    buildnodeflexscript(expr);
+}
+
+void setFieldDynamic(treenode field, bool dyn)
+{
+    if (!field) return;
+    treenode d = field->find("isDynamic");
+    if (d) d->value = dyn ? 1.0 : 0.0;
+}
+
+// Add+configure one field from a spec { source, name?, expression?, dynamic?,
+// category?, premade_name? }. Returns the field node, or null + fills `err`.
+treenode applyListField(treenode list, const nlohmann::json& spec, std::string& err)
+{
+    treenode fields = listFieldsNode(list);
+    if (!fields) { err = "no_fields_node"; return nullptr; }
+    std::string source = spec.value("source", std::string(""));
+    bool        dyn    = spec.value("dynamic", false);
+
+    if (source == "premade") {
+        std::string category = spec.value("category", std::string(""));
+        std::string pname    = spec.value("premade_name", std::string(""));
+        treenode root = menuFieldsRoot();
+        treenode cat  = root ? root->find(category.c_str()) : nullptr;
+        treenode tmpl = cat  ? cat->find(pname.c_str())     : nullptr;
+        if (!tmpl) { err = "premade_not_found"; return nullptr; }
+        createcopy(tmpl, fields, 1);
+        treenode field = rank(fields, content(fields));   // last child = the copy
+        if (spec.contains("name") && spec["name"].is_string()
+            && !spec["name"].get<std::string>().empty())
+            setname(field, spec["name"].get<std::string>().c_str());
+        if (spec.contains("dynamic")) setFieldDynamic(field, dyn);
+        return field;
+    }
+
+    std::string name = spec.value("name", std::string(""));
+    if (name.empty()) { err = "field_name_required"; return nullptr; }
+    const char* type = (source == "expression") ? "ExpressionField"
+                     : (source == "label")      ? "LabelField" : nullptr;
+    if (!type) { err = "bad_source"; return nullptr; }
+
+    function_s(list, "addField", Variant(type));
+    treenode field = rank(fields, content(fields));   // last child = the new field
+    if (!field) { err = "addfield_failed"; return nullptr; }
+    setname(field, name.c_str());
+    if (source == "expression")
+        writeFieldExpression(field, spec.value("expression", std::string("0")));
+    setFieldDynamic(field, dyn);
+    return field;
+}
+
+// Resolve an initial-content target: a model object, else a Group by name.
+bool resolveContentTarget(const std::string& name, treenode& target)
+{
+    target = model()->find(name.c_str());
+    if (!objectexists(target)) target = model()->find(("Tools/Groups/" + name).c_str());
+    return objectexists(target);
+}
+
+// Parse param(1) as a JSON object; returns false if not a JSON object.
+bool parseListArg(const Variant& arg, nlohmann::json& j)
+{
+    if (arg.type != VariantType::String) return false;
+    try { j = nlohmann::json::parse(std::string(arg)); } catch (...) { return false; }
+    return j.is_object();
+}
+
+} // namespace
+
+modelerai_export Variant ModelerAi_createList(FLEXSIMINTERFACE)
+{
+    try {
+        nlohmann::json j;
+        if (!parseListArg(param(1), j))
+            return returnError("missing_args", "create_list requires { name }.");
+        std::string name = j.value("name", std::string(""));
+        if (name.empty()) return returnError("missing_args", "create_list requires a name.");
+
+        treenode existing = resolveListNode(name);
+        bool wasExisting  = objectexists(existing);
+        treenode list = existing;
+        if (!wasExisting) {
+            list = Tools::create("List");
+            if (!objectexists(list))
+                return returnError("create_list_failed", "Tools::create(\"List\") returned null.");
+            setname(list, name.c_str());
+        }
+
+        nlohmann::json fieldErrors = nlohmann::json::array();
+        if (j.contains("fields") && j["fields"].is_array()) {
+            for (auto& spec : j["fields"]) {
+                std::string err;
+                if (!applyListField(list, spec, err)) fieldErrors.push_back(err);
+            }
+        }
+
+        nlohmann::json unresolved = nlohmann::json::array();
+        nlohmann::json contentNames = nlohmann::json::array();
+        if (j.contains("initial_content") && j["initial_content"].is_array()) {
+            treenode cor = getvarnode(list, "contentsOnReset");
+            for (auto& it : j["initial_content"]) {
+                if (!it.is_string()) continue;
+                std::string nm = it.get<std::string>();
+                treenode tgt = nullptr;
+                if (cor && resolveContentTarget(nm, tgt)) {
+                    std::string tn = getname(tgt);
+                    assertsubnode(cor, tn.c_str(), 0)->pointTo(tgt);
+                    contentNames.push_back(tn);
+                } else unresolved.push_back(nm);
+            }
+        }
+
+        nlohmann::json out;
+        out["ok"]       = true;
+        out["list"]     = name;
+        out["existing"] = wasExisting;
+        if (const char* p = nodetomodelpath_cstr(list, 1)) out["path"] = std::string(p);
+        if (!contentNames.empty()) out["initial_content"] = std::move(contentNames);
+        if (!fieldErrors.empty())  out["field_errors"]    = std::move(fieldErrors);
+        if (!unresolved.empty())   out["unresolved"]      = std::move(unresolved);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("create_list", e.what()); }
+      catch (...)                     { return returnException("create_list", "unknown"); }
+}
+
+modelerai_export Variant ModelerAi_addListField(FLEXSIMINTERFACE)
+{
+    try {
+        nlohmann::json j;
+        if (!parseListArg(param(1), j))
+            return returnError("missing_args", "add_list_field requires { list, source, ... }.");
+        std::string listName = j.value("list", std::string(""));
+        treenode list = resolveListNode(listName);
+        if (!list) return returnError("not_found", "List '" + listName + "' not found.");
+
+        // Premade: pre-check so a bad name returns the available list (not a fault).
+        if (j.value("source", std::string("")) == "premade") {
+            std::string category = j.value("category", std::string(""));
+            std::string pname    = j.value("premade_name", std::string(""));
+            treenode root = menuFieldsRoot();
+            treenode cat  = root ? root->find(category.c_str()) : nullptr;
+            treenode tmpl = cat  ? cat->find(pname.c_str())     : nullptr;
+            if (!tmpl) {
+                nlohmann::json avail = nlohmann::json::array();
+                treenode listFrom = cat ? cat : root;
+                if (listFrom)
+                    for (int i = 1; i <= content(listFrom); ++i)
+                        avail.push_back(std::string(getname(rank(listFrom, i))));
+                nlohmann::json e;
+                e["ok"] = false; e["error"] = "premade_not_found";
+                e["message"] = cat
+                    ? ("No premade field '" + pname + "' in category '" + category + "'.")
+                    : ("No premade category '" + category + "'. See `available` for categories.");
+                e["available"] = std::move(avail);
+                return returnJson(e);
+            }
+        }
+
+        std::string err;
+        treenode field = applyListField(list, j, err);
+        if (!field) return returnError(err.c_str(), "add_list_field: " + err);
+
+        nlohmann::json out;
+        out["ok"]      = true;
+        out["list"]    = listName;
+        out["field"]   = std::string(getname(field));
+        out["type"]    = j.value("source", std::string(""));
+        out["dynamic"] = j.value("dynamic", false);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("add_list_field", e.what()); }
+      catch (...)                     { return returnException("add_list_field", "unknown"); }
+}
+
+modelerai_export Variant ModelerAi_listPremadeFields(FLEXSIMINTERFACE)
+{
+    try {
+        treenode mf = menuFieldsRoot();
+        if (!mf) return returnError("not_found", "List menuFields catalog not found.");
+        nlohmann::json categories = nlohmann::json::object();
+        for (int i = 1; i <= content(mf); ++i) {
+            treenode cat = rank(mf, i);
+            if (!cat) continue;
+            nlohmann::json arr = nlohmann::json::array();
+            for (int k = 1; k <= content(cat); ++k) {
+                treenode f = rank(cat, k);
+                if (f) arr.push_back(std::string(getname(f)));
+            }
+            categories[std::string(getname(cat))] = std::move(arr);
+        }
+        nlohmann::json out;
+        out["ok"] = true;
+        out["categories"] = std::move(categories);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("list_premade_fields", e.what()); }
+      catch (...)                     { return returnException("list_premade_fields", "unknown"); }
+}
+
+modelerai_export Variant ModelerAi_setListInitialContent(FLEXSIMINTERFACE)
+{
+    try {
+        nlohmann::json j;
+        if (!parseListArg(param(1), j))
+            return returnError("missing_args", "set_list_initial_content requires { list, objects }.");
+        std::string listName = j.value("list", std::string(""));
+        treenode list = resolveListNode(listName);
+        if (!list) return returnError("not_found", "List '" + listName + "' not found.");
+        treenode cor = getvarnode(list, "contentsOnReset");
+        if (!cor) return returnError("not_found", "List has no contentsOnReset node.");
+
+        // Validate all targets first (atomic — no half-applied content).
+        std::vector<std::pair<std::string, treenode>> targets;
+        nlohmann::json unresolved = nlohmann::json::array();
+        if (j.contains("objects") && j["objects"].is_array()) {
+            for (auto& it : j["objects"]) {
+                if (!it.is_string()) continue;
+                std::string nm = it.get<std::string>();
+                treenode tgt = nullptr;
+                if (resolveContentTarget(nm, tgt)) targets.push_back({ std::string(getname(tgt)), tgt });
+                else unresolved.push_back(nm);
+            }
+        }
+        if (!unresolved.empty()) {
+            nlohmann::json e;
+            e["ok"] = false; e["error"] = "object_not_found";
+            e["message"] = "Some initial-content names did not resolve as an object or group.";
+            e["unresolved"] = std::move(unresolved);
+            return returnJson(e);
+        }
+
+        if (j.value("replace", false))
+            while (content(cor) > 0) rank(cor, 1)->destroy();
+
+        nlohmann::json contentNames = nlohmann::json::array();
+        for (auto& t : targets) {
+            assertsubnode(cor, t.first.c_str(), 0)->pointTo(t.second);
+            contentNames.push_back(t.first);
+        }
+
+        nlohmann::json out;
+        out["ok"]   = true;
+        out["list"] = listName;
+        out["initial_content"] = std::move(contentNames);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("set_list_initial_content", e.what()); }
+      catch (...)                     { return returnException("set_list_initial_content", "unknown"); }
+}
+
+modelerai_export Variant ModelerAi_getListInfo(FLEXSIMINTERFACE)
+{
+    try {
+        nlohmann::json j;
+        if (!parseListArg(param(1), j))
+            return returnError("missing_args", "get_list_info requires { list }.");
+        std::string listName = j.value("list", std::string(""));
+        treenode list = resolveListNode(listName);
+        if (!list) return returnError("not_found", "List '" + listName + "' not found.");
+
+        nlohmann::json farr = nlohmann::json::array();
+        if (treenode fields = listFieldsNode(list)) {
+            for (int i = 1; i <= content(fields); ++i) {
+                treenode f = rank(fields, i);
+                if (!f) continue;
+                treenode expr = f->find("expression");
+                treenode d    = f->find("isDynamic");
+                nlohmann::json fj;
+                fj["name"]    = std::string(getname(f));
+                fj["type"]    = expr ? "expression" : "label";
+                fj["dynamic"] = (d && (double)d->value != 0.0);
+                if (expr) {
+                    std::string full = std::string(expr->value.toString());
+                    std::string hdr  = kListFieldHeader;
+                    fj["expression"] = (full.rfind(hdr, 0) == 0) ? full.substr(hdr.size()) : full;
+                }
+                farr.push_back(std::move(fj));
+            }
+        }
+
+        nlohmann::json carr = nlohmann::json::array();
+        if (treenode cor = getvarnode(list, "contentsOnReset"))
+            for (int i = 1; i <= content(cor); ++i)
+                carr.push_back(std::string(getname(rank(cor, i))));
+
+        nlohmann::json out;
+        out["ok"]   = true;
+        out["name"] = listName;
+        if (const char* p = nodetomodelpath_cstr(list, 1)) out["path"] = std::string(p);
+        out["field_count"]     = (int)farr.size();
+        out["fields"]          = std::move(farr);
+        out["initial_content"] = std::move(carr);
+        return returnJson(out);
+    } catch (const std::exception& e) { return returnException("get_list_info", e.what()); }
+      catch (...)                     { return returnException("get_list_info", "unknown"); }
+}
+
+// ============================================================================
 // ============================================================================
 //
 //   SHELLS — PENDING CONTEXT

@@ -86,6 +86,14 @@ modelerai_export Variant ModelerAi_resolvePropertyPicklist (FLEXSIMINTERFACE);
 // + picklist union per entry). Read-only discovery companion to list_picks.
 modelerai_export Variant ModelerAi_listObjectPicklists     (FLEXSIMINTERFACE);
 
+// Lists (create + configure) — global Lists under Tools/GlobalLists. Create the
+// list, add fields (expression/label/premade), set reset content; read back config.
+modelerai_export Variant ModelerAi_createList              (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_addListField            (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_listPremadeFields       (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_setListInitialContent   (FLEXSIMINTERFACE);
+modelerai_export Variant ModelerAi_getListInfo             (FLEXSIMINTERFACE);
+
 // Connections (Tools 4-8 of the redesign — semantic split by class-pair role)
 modelerai_export Variant ModelerAi_connectFixedResources                (FLEXSIMINTERFACE);
 modelerai_export Variant ModelerAi_connectTaskExecuterToNavigator       (FLEXSIMINTERFACE);
