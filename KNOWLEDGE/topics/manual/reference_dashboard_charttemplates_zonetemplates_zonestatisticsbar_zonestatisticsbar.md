@@ -1,0 +1,43 @@
+---
+id: reference_dashboard_charttemplates_zonetemplates_zonestatisticsbar_zonestatisticsbar
+name: "Zone Statistics Bar Template"
+kind: manual
+breadcrumb: ["Reference","Dashboard","ChartTemplates","ZoneTemplates","ZoneStatisticsBar","ZoneStatisticsBar"]
+tags: ["manual","reference","dashboard","charttemplates"]
+source: "manual/Reference/Dashboard/ChartTemplates/ZoneTemplates/ZoneStatisticsBar/ZoneStatisticsBar.html"
+---
+
+# Zone Statistics Bar Template
+
+## Overview and Key Concepts
+
+ 
+
+ 
+
+This template is a Zone template. It assumes that you already have a Zone in a process flow in your model, and that you want to create a chart based on statistics from that Zone, not including partition statistics.
+
+ 
+
+This template creates a bar chart. Each bar color shows the current, minimum, maximum, and average content for the specified Zone. If you choose a local Zone from an instanced Process Flow, there will be one set of bars per instance.
+
+ 
+
+ 
+
+ 
+
+## Properties Panels
+
+ 
+
+The Zone Statistics Bar template uses the following properties panels:
+
+ 
+
+- Options
+- Settings
+- Text
+- Colors
+- Sorting
+- Advanced
