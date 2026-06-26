@@ -854,11 +854,22 @@ modelerai_export Variant ModelerAi_setProperty(FLEXSIMINTERFACE)
             val = Variant(v);
         } else if (gotShape == "color_rgba") {
             valueKind = "Color";
+            double r = valueJson[0].get<double>();
+            double g = valueJson[1].get<double>();
+            double b = valueJson[2].get<double>();
+            double a = valueJson[3].get<double>();
+            // FlexSim color channels are 0..1. If any of R/G/B exceeds 1 the
+            // caller gave 0..255 (a common web-RGB / LLM mistake that otherwise
+            // clamps everything to white) — rescale. Alpha is rescaled only if
+            // it too is >1, so an opaque 0..255 color like [255,192,203,1] keeps
+            // a=1 instead of going near-transparent.
+            if (r > 1.0 || g > 1.0 || b > 1.0) { r /= 255.0; g /= 255.0; b /= 255.0; }
+            if (a > 1.0) a /= 255.0;
             Array v;
-            v.push(Variant(valueJson[0].get<double>()));
-            v.push(Variant(valueJson[1].get<double>()));
-            v.push(Variant(valueJson[2].get<double>()));
-            v.push(Variant(valueJson[3].get<double>()));
+            v.push(Variant(r));
+            v.push(Variant(g));
+            v.push(Variant(b));
+            v.push(Variant(a));
             val = Variant(v);
         } else {
             return returnError("unsupported_value_type",
