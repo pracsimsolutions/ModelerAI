@@ -56,7 +56,7 @@ The repo ships with a prebuilt `ModelerAI.dll` at its root — **no build step i
 
 ### 3. Build the knowledge base
 
-Double-click `setup.bat` (or `node tools/build-kb.js` from PowerShell). This regenerates the KB locally from your FlexSim install's API + command XML — nothing FlexSim-derived ships in this repo. Re-run any time FlexSim updates.
+Double-click `setup.bat` (or `node tools/build-kb.js` from PowerShell). This regenerates the FlexSim-derived layer of the KB locally from your install's API + command XML (nothing FlexSim-derived ships in this repo — see [`.gitignore`](.gitignore)) and indexes it together with the hand-written ModelerAI guides that *do* ship under `KNOWLEDGE/`, so `search_kb` covers both. Re-run any time FlexSim updates, or after pulling new ModelerAI guides.
 
 ### 4. Open the panel
 

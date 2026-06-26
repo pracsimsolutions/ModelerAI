@@ -1054,6 +1054,49 @@ function main() {
     console.log('No manual topics found (run tools/ingest-manual.js to scrape).');
   }
 
+  // ---- Hand-written ModelerAI guides — committed topics under topics/ that
+  // are NOT the auto-generated classes/commands or the manual scrape (e.g.
+  // topics/modelerai/lists.md, picklists.md, modelerai_*.md). They ship in the
+  // repo and are reachable by read_topic("<relpath>") directly, but without this
+  // pass they'd be invisible to search_kb. Index them so the documented build
+  // route yields a COMPLETE, searchable KB for anyone who clones + builds.
+  const topicsDir = path.join(kbRoot, 'topics');
+  const autoSubdirs = new Set(['classes', 'commands', 'manual']);
+  let handwrittenCount = 0;
+  if (fs.existsSync(topicsDir)) {
+    const hwFiles = [];
+    for (const ent of fs.readdirSync(topicsDir, { withFileTypes: true })) {
+      const full = path.join(topicsDir, ent.name);
+      if (ent.isDirectory() && !autoSubdirs.has(ent.name)) walkMarkdownRecursive(full, hwFiles);
+      else if (ent.isFile() && ent.name.toLowerCase().endsWith('.md')) hwFiles.push(full);
+    }
+    for (const hf of hwFiles) {
+      try {
+        const raw = fs.readFileSync(hf, 'utf8');
+        const { frontmatter, body } = splitFrontmatter(raw);
+        const fm = parseFrontmatterSimple(frontmatter);
+        // read_topic resolves by path relative to topics/ (e.g. "modelerai/lists").
+        const relId = path.relative(topicsDir, hf).replace(/\\/g, '/').replace(/\.md$/i, '');
+        const id = fm.id || relId;
+        let name = (fm.name || '').replace(/^"|"$/g, '');
+        if (!name) {
+          const h = body.match(/^#\s+(.+)$/m);   // first markdown heading
+          name = h ? h[1].trim() : path.basename(hf, '.md');
+        }
+        const tags = ['modelerai'].concat(parseJsonArray(fm.tags).filter(t => t !== 'modelerai'));
+        const description = body.replace(/\s+/g, ' ').trim().slice(0, 800);
+        indexTopics.push({
+          id, name, kind: 'guide', module: '',
+          signature: relId, tags, aliases: [], description, deprecated: false,
+        });
+        handwrittenCount++;
+      } catch (e) {
+        console.warn(`  hand-written topic load failed: ${path.relative(repoRoot, hf)}: ${e.message}`);
+      }
+    }
+    console.log(`Indexed ${handwrittenCount} hand-written topics (topics/ excl. classes/commands/manual)`);
+  }
+
   // Second pass — deprecation reverse-alias graph: the deprecated command's
   // name becomes an alias on the active topic it points at via replacedBy.
   const byId = new Map(indexTopics.map(t => [t.id, t]));
